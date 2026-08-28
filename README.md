@@ -55,17 +55,13 @@ Resolution order: `--cameras` → `--pod`/`$PODCONTROL_POD` → `./pod.json` →
 
 ## Platform parity (audit)
 
-The two firmware families expose different daemon vocabularies. The app targets
-the common set and degrades gracefully; closing these gaps is firmware work.
+The two firmware families expose different `:9600` daemon vocabularies. See **[docs/PARITY.md](docs/PARITY.md)** for the full empirical matrix (exposure/gain, telemetry, WB, encoder, ISP blocks, timing) and the prioritized parity work.
 
-| Capability          | IMX291 `hisp_ctl` | Goke `isp_ctl` |
-|---------------------|-------------------|----------------|
-| exposure/gain       | ✅ `manual`/`auto`/`gain`/`exp` | ✅ `manual`/`auto` |
-| brightness (AveLum) | ✗ (metered from frame) | ✅ in `query` |
-| chip temperature    | ✗ | ✅ in `query` |
-| white balance       | ✅ `wb` | ✗ (needs adding) |
-| QP / chroma QP      | ✅ `venc_qp`/`venc_cqp` | ✗ (needs adding) |
-| pipeline blocks     | ✅ `drc`/`nr`/`sharpen`/`dpc` | ✗ |
+TL;DR of the gaps that matter for the pod goals:
+- **Goke needs arbitrary WB gains in the daemon** (`wb <R> <G> <B>`) — blocks the cloud-gray calibrator.
+- **Goke needs the encoder in the daemon** (bitrate/GOP/QP/chroma-QP; today it's the separate `venc_ioctl`).
+- **IMX291 has no daemon AveLum/ChipTemp** — the app meters from the frame instead (already handled).
+- Control (`manual`/`auto`) and most ISP-block toggles exist on both; only the vocabulary differs.
 
 ## Roadmap
 
