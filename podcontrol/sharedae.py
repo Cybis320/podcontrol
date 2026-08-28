@@ -24,7 +24,8 @@ import math, time
 
 
 class AEConfig:
-    exp_min_us = 30
+    line_us = 29.63             # sensor LINE time (25 fps, VMAX~1350) -- exposure is
+                                # quantized to whole multiples of this on both platforms
     exp_max_us = 40000          # ~40 ms at 25 fps: meteor frame-time cap
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
     boost_max_x = 16.0          # secondary stage cap (IMX291 ISP-dig 16x; within Goke digital)
@@ -46,24 +47,32 @@ class SharedAE:
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
-        return math.log2(self.cfg.exp_max_us / self.cfg.exp_min_us)
+        return math.log2(self.cfg.exp_max_us / self.cfg.line_us)
 
     def _max_li(self):
         c = self.cfg
         return self._exp_stops() + math.log2(c.analog_max_x) + math.log2(c.boost_max_x)
 
     def _li_to_exp_gain(self, li):
-        """light_index -> (exp_us, analog_x, boost_x). Fill exp, then analog, then boost."""
+        """light_index (stops above 1 line @ 1x) -> (exp_us on a LINE boundary,
+        analog_x, boost_x). Exposure is quantized to whole lines; GAIN fills the
+        fractional line so total light stays finely controllable -- the sensor only
+        honors line-granular exposure, so fine µs steps otherwise did nothing then
+        jumped a whole line (the hunting you saw)."""
         c = self.cfg
         li = max(0.0, min(li, self._max_li()))
-        es = self._exp_stops()
-        if li <= es:
-            return int(c.exp_min_us * 2 ** li), 1.0, 1.0
-        g = li - es                                    # stops of gain
-        a_stops = math.log2(c.analog_max_x)
-        if g <= a_stops:
-            return c.exp_max_us, 2 ** g, 1.0
-        return c.exp_max_us, c.analog_max_x, min(c.boost_max_x, 2 ** (g - a_stops))
+        target = c.line_us * (2 ** li)                 # desired exp_us * total_gain_x
+        max_lines = max(1, round(c.exp_max_us / c.line_us))
+        exp_cap = max_lines * c.line_us
+        if target <= exp_cap:
+            n = min(max_lines, max(1, int(target / c.line_us + 1e-9)))
+            exp = n * c.line_us
+        else:
+            exp = exp_cap
+        g = max(1.0, target / exp)                      # gain makes up the rest
+        analog = min(g, c.analog_max_x)
+        boost = min(c.boost_max_x, max(1.0, g / analog))
+        return int(round(exp)), analog, boost
 
     # --- controller --------------------------------------------------------
     def step(self, metering):
