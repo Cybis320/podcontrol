@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podcontrol"
+version = "0.1.0"
+description = "Control a pod of RMS meteor cameras (IMX291 or Goke/IMX307) as one — unified preview, exposure/gain, and (WIP) white balance."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Luc Busquin"}]
+dependencies = ["opencv-python>=4.5", "Pillow>=9"]
+
+[project.scripts]
+podcontrol = "podcontrol.app:main"
+
+[tool.setuptools.packages.find]
+include = ["podcontrol*"]

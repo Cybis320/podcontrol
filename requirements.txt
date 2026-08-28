@@ -1,0 +1,5 @@
+opencv-python>=4.5
+Pillow>=9
+# System packages (not pip-installable):
+#   python3-tk   (Tkinter GUI)
+#   ffmpeg       (RTSP grab fallback, only used when RMS is idle)
