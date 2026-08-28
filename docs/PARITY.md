@@ -50,9 +50,10 @@ frame, so the shared-AE signal is uniform across platforms regardless of AveLum.
 | Capability | IMX291 | Goke |
 |---|---|---|
 | Read WB gains / op | ✅ `wb` | 🔶 `wb_ctl` (not in daemon) |
-| **Arbitrary manual R/G/B gains** | ✅ `wb <R> <G> <B>` | ✗ **← needed for cloud-gray** |
+| **Arbitrary manual R/G/B gains** | ✅ `wb <R> <G> <B>` | ✅ **now in daemon** `wb <R> <G> <B>` (was only in `wb_ctl`) |
 | Unity WB | ✅ `wb unity` | 🔶 `wb_ctl unity` |
-| Auto WB | ✅ `wb auto` | 🔶 `wb_ctl auto` / `bypass wb` |
+| Auto WB | ✅ `wb auto` | ✅ `wb auto` (daemon) |
+| daylight-cal / ISP saturation | 🔶 | 🔶 `wb_ctl daylight` / `satu` (fold in next) |
 | Unity base | 256 (Q4.8) | 128 |
 | Auto-persist / persist | ✅ `persist` + jffs2 | 🔶 config |
 
@@ -102,10 +103,15 @@ pregamma, meshshading, radialshading, ca, gcac`.
 
 ## Parity work items (to fully drive both from the app)
 
-1. **Goke — arbitrary WB gains in the daemon.** `wb_ctl` only does unity/auto/
-   bypass; the cloud-gray calibrator needs `wb <R> <G> <B>`. Add a set-gains
-   command (the `libgk_awb` / `GK_API_ISP_*WB*` infra is already in `wb_ctl`).
-   **Blocks Phase 3.**
+1. ✅ **DONE — Goke `wb` command in the daemon.** Added `wb [auto|unity|<R> <G>
+   <B>|<R> <Gr> <Gb> <B>|bypass on|off]` to `isp_ctl` (folds `wb_ctl`'s
+   `GK_API_ISP_Set/GetWBAttr` path; `-lgk_awb`). Report format + 256=1.0x unity
+   base match the IMX291 `hisp_ctl wb`, so one app parser serves both. Unblocks
+   the cloud-gray calibrator. ⚠ DEPLOYMENT: the current `isp_ctl` source uses
+   newer Goke ISP symbols (SetGammaAttr/GetPreGammaAttr/GetIspHlcAttr) than the
+   OLD .201-.206 pod's libs have (musl resolves all symbols at load), so it must
+   ship in a fresh Goke firmware build with matching libs — not retrofitted onto
+   that pod.
 2. **Goke — encoder in the daemon.** Fold `venc_ioctl` (bitrate/GOP/FIXQP) into
    `isp_ctl` as `venc_*` commands; add a chroma-QP-offset equivalent of
    `venc_cqp`. Needed for unified QP/GOP/color across a Goke pod.
