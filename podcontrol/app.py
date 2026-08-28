@@ -9,6 +9,11 @@ Run:  python -m podcontrol            (default pod 192.168.42.101-.106)
       python -m podcontrol --cameras 192.168.42.101-106
       python -m podcontrol --pod pod.json
 """
+
+if __name__ == "__main__" and not __package__:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import time, threading, queue, os
 import tkinter as tk
 import cv2

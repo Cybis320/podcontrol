@@ -15,6 +15,11 @@ tracks slow sky changes without hunting.
 Cross-platform: the ladder is in stops; the secondary gain stage maps to the
 right daemon knob per platform (IMX291 -> ISP-digital -i, Goke -> digital -d).
 """
+
+if __name__ == "__main__" and not __package__:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import math, time
 
 
