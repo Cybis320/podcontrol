@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
 from podcontrol.frames import frame_for, luma_stats
+from podcontrol.sharedae import SharedAE, _pod_platform
 
 TILE_W, TILE_H = 448, 252
 COLS = 3
@@ -88,6 +89,9 @@ class App(tk.Tk):
         self.stations = get_pod()
         self.pod = PodController(self.stations)
         self.allow_grab = allow_grab
+        self.ae = SharedAE(self.pod)
+        self.ae_on = False
+        self.ae_info = None
         self.q = queue.Queue()
         self.interval = tk.DoubleVar(value=5.0)
         self.running = True
@@ -102,6 +106,8 @@ class App(tk.Tk):
 
         bar = tk.Frame(self, bg="#0f0d08"); bar.pack(fill="x", padx=8, pady=(0, 8))
         tk.Button(bar, text="Auto All", command=self.auto_all).pack(side="left")
+        self.ae_btn = tk.Button(bar, text="Shared AE: OFF", command=self.toggle_ae)
+        self.ae_btn.pack(side="left", padx=6)
         tk.Label(bar, text="  refresh", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         tk.Spinbox(bar, from_=2, to=60, width=4, textvariable=self.interval).pack(side="left")
         tk.Label(bar, text="s", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
@@ -127,6 +133,15 @@ class App(tk.Tk):
                     img, src = None, "none"
                 frames[sid] = (img, src)
                 lumas[sid] = luma_stats(img)
+            if self.ae_on:
+                ctl = {sid: lumas[sid] for sid in lumas if poll.get(sid, {}).get("online")}
+                info = self.ae.step(ctl)
+                if info:
+                    try:
+                        self.ae.apply(platform=_pod_platform(poll))
+                    except Exception:
+                        pass
+                    self.ae_info = info
             self.q.put((frames, poll, lumas, time.time() - t0))
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
@@ -147,19 +162,35 @@ class App(tk.Tk):
                     if b is not None:
                         brights.append(b)
                 daemons = sum(1 for v in poll.values() if v.get("online"))
-                self.status.config(text="%d/%d daemon  bright %s  (%.1fs)  %s" % (
+                ae = ""
+                if self.ae_on and self.ae_info:
+                    i = self.ae_info
+                    ae = "  AE %s exp=%dus gain=%.1fx" % (i["reason"], i["exp_us"], i["total_gain_x"])
+                self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
                     daemons, len(self.stations),
                     ("%d–%d" % (int(min(brights)), int(max(brights)))) if brights else "—",
-                    dt, time.strftime("%H:%M:%S")))
+                    ae, dt, time.strftime("%H:%M:%S")))
         except queue.Empty:
             pass
         self.after(200, self._drain)
 
+    def toggle_ae(self):
+        self.ae_on = not self.ae_on
+        self.ae_btn.config(text="Shared AE: %s" % ("ON" if self.ae_on else "OFF"),
+                           fg=("#7fc776" if self.ae_on else "#000"))
+        if not self.ae_on:
+            threading.Thread(target=lambda: self.ae.release(), daemon=True).start()
+
     def auto_all(self):
+        self.ae_on = False
+        self.ae_btn.config(text="Shared AE: OFF", fg="#000")
         threading.Thread(target=lambda: self.pod.auto_all(), daemon=True).start()
 
     def _close(self):
         self.running = False
+        if self.ae_on:
+            try: self.ae.release()
+            except Exception: pass
         self.destroy()
 
 
