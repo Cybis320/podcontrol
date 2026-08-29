@@ -73,8 +73,10 @@ def luma_stats(bgr):
     if bgr is None:
         return None
     import numpy as np
+    import numpy as np
     y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return {"mean": float(y.mean()), "clip": float((y >= 250).mean())}
+    return {"mean": float(y.mean()), "clip": float((y >= 250).mean()),
+            "peak": float(np.percentile(y, 99.9))}
 
 
 if __name__ == "__main__":

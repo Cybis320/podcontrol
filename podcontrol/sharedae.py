@@ -29,9 +29,11 @@ class AEConfig:
     exp_max_us = 40000          # ~40 ms at 25 fps: meteor frame-time cap
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
     boost_max_x = 16.0          # secondary stage cap (IMX291 ISP-dig 16x; within Goke digital)
-    target_luma = 140.0         # brighten UP TO this mean when well clear of clipping
-    clip_limit = 0.002          # HIGHLIGHT PRIORITY: clip above this (0.2%) -> reduce
-    kp_clip = 0.5               # clip-reduction gain (stops per octave of excess clip)
+    target_luma = 170.0         # mean cap so a flat/featureless scene isn't over-amplified
+    clip_limit = 0.0001         # AIM FOR 0% CLIP: any clip above ~0 (a few stuck px) -> reduce
+    peak_ceiling = 236.0        # brighten only while the 99.9th-pctile luma is below this
+                                # (a margin under 250 so we approach but never cross into clip)
+    kp_clip = 30.0              # clip-reduction gain (stops per unit clip fraction)
     kp = 0.6                    # proportional gain (stops per stop of error)
     max_step = 0.5              # max stops changed per cycle (gentle)
     deadband = 0.15             # no change if |error| below this (stops)
@@ -85,18 +87,19 @@ class SharedAE:
             return None
         pod_lum = max(lums)          # brightest camera drives
         pod_clip = max(clips)
-        ct = c.clip_limit
-        if pod_clip > ct:
-            # HIGHLIGHT PRIORITY: reduce whenever clipping exceeds the tolerance.
-            # Log-proportional in the clip excess so it eases in and SETTLES at ct
-            # (instead of holding at a fixed threshold or hunting).
-            d = -min(c.max_step, c.kp_clip * math.log2(pod_clip / ct))
+        peaks = [m.get("peak") for m in metering.values() if m and m.get("peak") is not None]
+        pod_peak = max(peaks) if peaks else pod_lum
+        if pod_clip > c.clip_limit:
+            # AIM FOR 0% CLIP: any clipping -> reduce. Step scales with severity
+            # (gentle near zero so it settles, hard when badly blown out).
+            d = -min(c.max_step, max(0.05, pod_clip * c.kp_clip))
             reason = "clip\u2193"
-        elif pod_lum < c.target_luma and pod_clip < ct * 0.5:
-            # dark and well clear of clipping -> brighten toward the mean cap
-            err = math.log2(c.target_luma / max(pod_lum, 1)) / c.gamma
-            d = min(c.max_step, c.kp * err) if err > c.deadband else 0.0
-            reason = "brighten" if d > 0 else "hold"
+        elif pod_peak < c.peak_ceiling and pod_lum < c.target_luma:
+            # headroom below saturation AND not over-bright -> brighten gently,
+            # slowing as the peak nears the ceiling so it never oversteps into clip
+            room = (c.peak_ceiling - pod_peak) / c.peak_ceiling
+            d = min(c.max_step, c.kp * room)
+            reason = "brighten" if d > 0.01 else "hold"
         else:
             d, reason = 0.0, "hold"
         self.li = max(0.0, min(self.li + d, self._max_li()))
