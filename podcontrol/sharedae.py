@@ -30,8 +30,9 @@ class AEConfig:
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
     boost_max_x = 16.0          # secondary stage cap (IMX291 ISP-dig 16x; within Goke digital)
     target_luma = 170.0         # mean cap so a flat/featureless scene isn't over-amplified
-    clip_limit = 0.0001         # AIM FOR 0% CLIP: any clip above ~0 (a few stuck px) -> reduce
-    peak_ceiling = 236.0        # brighten only while the 99.9th-pctile luma is below this
+    clip_limit = 0.00005        # AIM FOR 0% CLIP: >~100 clipped px (>=CLIP_LEVEL) -> reduce
+                                # (small floor ignores a handful of stuck hot pixels)
+    peak_ceiling = 234.0        # brighten only while the 99.9th-pctile luma is below this
                                 # (a margin under 250 so we approach but never cross into clip)
     kp_clip = 30.0              # clip-reduction gain (stops per unit clip fraction)
     kp = 0.6                    # proportional gain (stops per stop of error)
