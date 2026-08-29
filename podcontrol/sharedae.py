@@ -29,8 +29,9 @@ class AEConfig:
     exp_max_us = 40000          # ~40 ms at 25 fps: meteor frame-time cap
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
     boost_max_x = 16.0          # secondary stage cap (IMX291 ISP-dig 16x; within Goke digital)
-    target_luma = 130.0         # brightest-camera mean-luma setpoint
-    clip_limit = 0.02           # >2% clipped pixels -> force a reduction
+    target_luma = 140.0         # brighten UP TO this mean when well clear of clipping
+    clip_limit = 0.002          # HIGHLIGHT PRIORITY: clip above this (0.2%) -> reduce
+    kp_clip = 0.5               # clip-reduction gain (stops per octave of excess clip)
     kp = 0.6                    # proportional gain (stops per stop of error)
     max_step = 0.5              # max stops changed per cycle (gentle)
     deadband = 0.15             # no change if |error| below this (stops)
@@ -84,16 +85,20 @@ class SharedAE:
             return None
         pod_lum = max(lums)          # brightest camera drives
         pod_clip = max(clips)
-        if pod_clip > c.clip_limit:                    # highlight priority
-            d = -min(1.0, pod_clip * 20.0)
-            reason = "clip"
+        ct = c.clip_limit
+        if pod_clip > ct:
+            # HIGHLIGHT PRIORITY: reduce whenever clipping exceeds the tolerance.
+            # Log-proportional in the clip excess so it eases in and SETTLES at ct
+            # (instead of holding at a fixed threshold or hunting).
+            d = -min(c.max_step, c.kp_clip * math.log2(pod_clip / ct))
+            reason = "clip\u2193"
+        elif pod_lum < c.target_luma and pod_clip < ct * 0.5:
+            # dark and well clear of clipping -> brighten toward the mean cap
+            err = math.log2(c.target_luma / max(pod_lum, 1)) / c.gamma
+            d = min(c.max_step, c.kp * err) if err > c.deadband else 0.0
+            reason = "brighten" if d > 0 else "hold"
         else:
-            err = math.log2(max(c.target_luma, 1) / max(pod_lum, 1)) / c.gamma
-            if abs(err) < c.deadband:
-                d, reason = 0.0, "hold"
-            else:
-                d = max(-c.max_step, min(c.max_step, c.kp * err))
-                reason = "brighten" if d > 0 else "darken"
+            d, reason = 0.0, "hold"
         self.li = max(0.0, min(self.li + d, self._max_li()))
         exp, analog, boost = self._li_to_exp_gain(self.li)
         self.last = {"pod_lum": pod_lum, "pod_clip": pod_clip, "d_stops": d,
