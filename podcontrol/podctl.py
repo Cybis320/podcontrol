@@ -127,6 +127,16 @@ class PodController:
     def auto_all(self, timeout=5.0):
         return self._bcast("auto", timeout)
 
+    def wb_all(self, R, G, B, timeout=5.0):
+        """Set the same manual WB (x256 gains, 256=1.0x) on every camera."""
+        return self._bcast("wb %d %d %d" % (int(R), int(G), int(B)), timeout)
+
+    def wb_auto_all(self, timeout=5.0):
+        return self._bcast("wb auto", timeout)
+
+    def wb_read(self, station_id, timeout=5.0):
+        return _parse_wb(self.one(station_id, "wb", timeout))
+
     def one(self, station_id, cmd, timeout=5.0):
         st = next((s for s in self.stations if s.id == station_id), None)
         return send(st.ip, cmd, timeout) if st else None
