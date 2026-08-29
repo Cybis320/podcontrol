@@ -31,11 +31,19 @@ SRC_COLOR = {"rms": "#7fc776", "stale": "#f0a830", "grab": "#5aa9e6", "none": "#
 
 
 class Tile(tk.Frame):
-    def __init__(self, master, station):
+    def __init__(self, master, station, on_select=None):
         super().__init__(master, bg="#14110c", bd=1, relief="solid")
         self.station = station
-        self.canvas = tk.Label(self, bg="#000", width=TILE_W, height=TILE_H)
+        self.on_select = on_select
+        self.canvas = tk.Canvas(self, width=TILE_W, height=TILE_H, bg="#000",
+                                highlightthickness=0, cursor="crosshair")
         self.canvas.pack()
+        self.frame_wh = (1920, 1080)
+        self.sel = None                     # selection box in tile coords
+        self._img_id = self._rect_id = self._txt_id = None
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
         head = tk.Frame(self, bg="#14110c"); head.pack(fill="x", padx=6, pady=(2, 0))
         self.title = tk.Label(head, text=station.id, fg="#f0a830", bg="#14110c",
                               font=("JetBrains Mono", 11, "bold"))
@@ -48,16 +56,58 @@ class Tile(tk.Frame):
         self.tele.pack(fill="x", padx=6, pady=(0, 4))
         self._photo = None
 
+    # --- region selection (drag a box on a grey cloud) --------------------
+    def _press(self, e):
+        self._x0, self._y0 = e.x, e.y
+
+    def _drag(self, e):
+        if self._rect_id:
+            self.canvas.delete(self._rect_id)
+        self._rect_id = self.canvas.create_rectangle(
+            self._x0, self._y0, e.x, e.y, outline="#f0a830", width=2)
+
+    def _release(self, e):
+        self.sel = (self._x0, self._y0, e.x, e.y)
+        if self.on_select:
+            self.on_select(self.station.id)
+
+    def clear_selection(self):
+        self.sel = None
+        if self._rect_id:
+            self.canvas.delete(self._rect_id); self._rect_id = None
+
+    def frame_box(self):
+        """Selected box in full-frame pixel coords, or None."""
+        if not self.sel:
+            return None
+        fw, fh = self.frame_wh
+        sx, sy = fw / TILE_W, fh / TILE_H
+        x0, y0, x1, y1 = self.sel
+        return (int(min(x0, x1) * sx), int(min(y0, y1) * sy),
+                int(max(x0, x1) * sx), int(max(y0, y1) * sy))
+
     def render(self, img, source, tel, luma):
-        # image
+        # image (Canvas: keep image + selection rectangle)
         if img is None:
-            self.canvas.config(image="", text="no frame", fg="#726650",
-                               font=("JetBrains Mono", 16))
+            if self._img_id:
+                self.canvas.delete(self._img_id); self._img_id = None
+            if not self._txt_id:
+                self._txt_id = self.canvas.create_text(
+                    TILE_W // 2, TILE_H // 2, text="no frame", fill="#726650",
+                    font=("JetBrains Mono", 16))
         else:
+            if self._txt_id:
+                self.canvas.delete(self._txt_id); self._txt_id = None
+            self.frame_wh = (img.shape[1], img.shape[0])
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             im = Image.fromarray(rgb).resize((TILE_W, TILE_H), Image.BILINEAR)
             self._photo = ImageTk.PhotoImage(im)
-            self.canvas.config(image=self._photo, text="")
+            if self._img_id:
+                self.canvas.itemconfig(self._img_id, image=self._photo)
+            else:
+                self._img_id = self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+            if self._rect_id:
+                self.canvas.tag_raise(self._rect_id)
         self.badge.config(text=source, fg=SRC_COLOR.get(source, "#726650"))
         # telemetry
         if not tel or not tel.get("online"):
@@ -97,6 +147,8 @@ class App(tk.Tk):
         self.ae = SharedAE(self.pod)
         self.ae_on = False
         self.ae_info = None
+        self.selected = None      # station id with an active region selection
+        self.calibrating = False
         self.q = queue.Queue()
         self.interval = tk.DoubleVar(value=5.0)
         self.running = True
@@ -105,7 +157,7 @@ class App(tk.Tk):
         grid = tk.Frame(self, bg="#0f0d08"); grid.pack(padx=8, pady=8)
         self.tiles = {}
         for i, s in enumerate(self.stations):
-            t = Tile(grid, s)
+            t = Tile(grid, s, on_select=self._on_select)
             t.grid(row=i // COLS, column=i % COLS, padx=4, pady=4)
             self.tiles[s.id] = t
 
@@ -113,6 +165,8 @@ class App(tk.Tk):
         tk.Button(bar, text="Auto All", command=self.auto_all).pack(side="left")
         self.ae_btn = tk.Button(bar, text="Shared AE: OFF", command=self.toggle_ae)
         self.ae_btn.pack(side="left", padx=6)
+        self.cal_btn = tk.Button(bar, text="Calibrate WB (cloud)", command=self.calibrate_wb)
+        self.cal_btn.pack(side="left", padx=6)
         tk.Label(bar, text="  refresh", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         tk.Spinbox(bar, from_=2, to=60, width=4, textvariable=self.interval).pack(side="left")
         tk.Label(bar, text="s", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
@@ -190,6 +244,48 @@ class App(tk.Tk):
         self.ae_on = False
         self.ae_btn.config(text="Shared AE: OFF", fg="#000")
         threading.Thread(target=lambda: self.pod.auto_all(), daemon=True).start()
+
+    def _on_select(self, station_id):
+        # single active selection: clear the others
+        for sid, t in self.tiles.items():
+            if sid != station_id:
+                t.clear_selection()
+        self.selected = station_id
+        self.status.config(text="selected %s region — click Calibrate WB" % station_id)
+
+    def calibrate_wb(self):
+        if self.calibrating:
+            return
+        tile = self.tiles.get(self.selected)
+        box = tile.frame_box() if tile else None
+        if not box:
+            self.status.config(text="draw a box on a grey cloud in one camera first")
+            return
+        poll = self.pod.poll_all(timeout=4)
+        if not (poll.get(self.selected) or {}).get("online"):
+            self.status.config(text="%s has no daemon — pick a controllable camera" % self.selected)
+            return
+        self.calibrating = True
+        self.cal_btn.config(text="Calibrating…", state="disabled")
+
+        def worker():
+            from podcontrol.wbcal import run_pod_calibration
+            def on_step(i, rgb, g, err):
+                self.status.config(text="WB cal %s: iter %d err=%.3f gains=%.2f/%.2f/%.2fx" % (
+                    self.selected, i, err, g[0]/256, g[1]/256, g[2]/256))
+            try:
+                gains, err, n = run_pod_calibration(
+                    self.pod, self.selected, box,
+                    lambda st: frame_for(st, self.allow_grab)[0], on_step=on_step)
+                self.status.config(text="WB pushed to pod: %.2f/%.2f/%.2fx  err=%.3f (%d iters)" % (
+                    gains[0]/256, gains[1]/256, gains[2]/256, err, n))
+            except Exception as e:
+                self.status.config(text="WB cal failed: %s" % e)
+            finally:
+                self.calibrating = False
+                self.cal_btn.config(text="Calibrate WB (cloud)", state="normal")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _close(self):
         self.running = False

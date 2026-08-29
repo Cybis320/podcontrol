@@ -63,16 +63,25 @@ TL;DR of the gaps that matter for the pod goals:
 - **IMX291 has no daemon AveLum/ChipTemp** — the app meters from the frame instead (already handled).
 - Control (`manual`/`auto`) and most ISP-block toggles exist on both; only the vocabulary differs.
 
+## Shared AE + WB calibration (in the app)
+
+- **Shared AE** (`Shared AE: ON`) — a slow loop meters every camera from the
+  frame and drives ONE exposure+gain onto all of them; if the brightest clips,
+  everyone backs off. Exposure moves in whole sensor lines with gain filling the
+  fractional line (smooth, no hunting). Headless: `python -m podcontrol.sharedae`.
+- **WB cloud-gray** (`Calibrate WB (cloud)`) — drag a box over a grey cloud in
+  one camera, click the button; it iterates the WB gains until that region is
+  neutral (~3 iters) and pushes the same WB to the whole pod. Clouds go grey,
+  the sky keeps its chroma. Headless:
+  `python -m podcontrol.wbcal --camera cam101 --box x0,y0,x1,y1`
+
 ## Roadmap
 
-- **Phase 2 — shared-AE engine.** Slow loop: meter all cameras, and when the
-  brightest clips, step exposure/gain down on **all** of them so the pod acts
-  as one photometric instrument.
-- **Phase 3 — WB cloud-gray calibrator.** Box a cloud in one FOV → compute the
-  gains that make it neutral → push the same WB to all cameras (clouds gray,
-  sky keeps its chroma).
-- **Parity work.** Add `wb`/`venc_qp`/metering to the Goke daemon so both
-  platforms are fully controllable.
+- ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).
+- **Parity work.** The Goke daemon now has `wb`; still to fold in: the encoder
+  (bitrate/GOP/QP) and optional metering. See [docs/PARITY.md](docs/PARITY.md).
+- ⚠ The Goke `wb` addition must ship in a fresh Goke firmware build (current
+  libs) — the old .201–.206 pod runs older libs (see PARITY.md).
 
 ## Layout
 
