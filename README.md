@@ -176,16 +176,17 @@ roughly constant angular size. Measured on US05B1 (2026-09-14, 14:10 to
 15:57): one pale disc ~5° in radius at k = −0.57, 60–90 luma above the sky;
 with the sun ~10° outside the field (US05F1) a smaller ghost at k ≈ −0.20.
 
-Its distance from the principal point is not a fixed fraction of the sun's:
-measured on B1 (sun 11–17° out) it is ~0.52× the sun's distance, and on F1
-and C1 with the sun 32–49° out it saturates around 10°. The model excludes
-**one** ghost disc at that measured distance curve (`sunmask.GHOST_TABLE`),
-radius **flare r°** (6°, spinbox, 0 disables) shrinking as the sun moves
-out, while the sun is within 30° of the field, plus a 3° half-width
-**corridor** along the whole axis while the sun is inside the frame. Violet
-in the overlay. Other lenses: `python -m podcontrol.sunmask --measure
-STATION` lists the bright blobs with their *k* and off-axis angle; edit the
-table.
+Two distinct ghosts, each at a fixed fraction *k* of the sun's distance from
+the principal point, on the mirrored side: **A** at k = −0.55 (B1, sun 11–17°
+out; a pale disc ~5° in radius that is gone once the sun is ~30° out) and
+**B** at k = −0.20 (F1/C1, sun 32–49° out; ~4° radius; near the axis it falls
+inside the sun zone anyway). The model excludes a disc for each (radius
+**flare r°** = 6° × 1.0 / 0.7, spinbox, 0 disables; A only while the sun is
+within 22° of the principal point) while the sun is within 30° of the field,
+plus a 3° half-width **corridor** along the whole axis while the sun is
+inside the frame. Violet in the overlay. Other lenses: `python -m
+podcontrol.sunmask --measure STATION` lists the bright blobs with their *k*
+and off-axis angle; edit `sunmask.FLARE_GHOSTS` (k, radius scale, max D).
 
 ## What is driving the exposure (GUI)
 
