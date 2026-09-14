@@ -272,7 +272,7 @@ def static_mask_for(station, img):
 
 
 # Sun exclusion radius (deg) around the sun; the app's spinbox sets it.
-SUN_RADIUS_DEG = [20.0]
+SUN_RADIUS_DEG = [25.0]
 
 
 def set_sun_radius(deg):
@@ -359,7 +359,13 @@ def stats_for_path(station, path, t):
     if hit is not None:
         return hit
     img = _imread_ok(path)
-    st = luma_stats(img, mask_for(station, img, t)) if img is not None else None
+    st = None
+    if img is not None:
+        keep, lay = mask_for(station, img, t, layers=True)
+        st = luma_stats(img, keep)
+        if st is not None:
+            si = (lay or {}).get("sun_info") or {}
+            st["sun_in_fov"] = bool(si.get("in_fov"))
     if len(_STATS_CACHE) > 400:
         _STATS_CACHE.clear()
     _STATS_CACHE[key] = st
@@ -383,10 +389,27 @@ def meter_set(stations, allow_grab=False):
                 out[st.id] = dict(s, t=slot, path=paths[st.id])
         elif allow_grab and not rms_active(st):
             img = grab_rtsp(st.ip)
-            s = luma_stats(img, mask_for(st, img))
+            keep, lay = mask_for(st, img, layers=True)
+            s = luma_stats(img, keep)
             if s is not None:
-                out[st.id] = dict(s, t=time.time())
+                si = (lay or {}).get("sun_info") or {}
+                out[st.id] = dict(s, t=time.time(), sun_in_fov=bool(si.get("in_fov")))
     return out, slot
+
+
+def highlight_maps(bgr, keep, peak_value=None, clip_level=250):
+    """(clipped, hot): full-res bool maps of the UNMASKED pixels that are
+    clipped (>= clip_level) and that sit at/above the 99.9th-percentile peak
+    (the pixels the highlight-priority AE reacts to)."""
+    if bgr is None:
+        return None, None
+    y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    k = np.ones(y.shape, bool) if keep is None else keep
+    clipped = (y >= clip_level) & k
+    if peak_value is None:
+        peak_value = float(np.percentile(y[k], 99.9)) if k.any() else 255.0
+    hot = (y >= peak_value) & k & ~clipped
+    return clipped, hot
 
 
 def luma_stats(bgr, mask=None):

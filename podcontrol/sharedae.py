@@ -59,6 +59,9 @@ class AEConfig:
     period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
     settle_s = 1.5              # an apply is in effect this long after it was sent
     slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
+    sun_cam_votes = False       # a camera with the sun in its FOV takes the pod
+                                # exposure but does not limit it (its unmasked
+                                # glare ring otherwise pins the whole pod dark)
     history_s = 300.0           # how long we remember our applies (frame latency)
 
 
@@ -75,6 +78,10 @@ class SharedAE:
         self.waiting = 0                     # cycles with no usable frame
         self.restore = None                  # {cam: cmd} taken at takeover
         self._applied_li = None
+        self.needs = {}                      # cam -> (li_needed, why) from the last set
+        self.followers = {}                  # cam -> (li_needed, why) not voting (sun in FOV)
+        self.driver = None                   # cam whose need set the target
+        self.driver_why = None               # 'clipping' | 'headroom' | 'at target'
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -168,25 +175,41 @@ class SharedAE:
         if clip > c.clip_limit:
             # AIM FOR 0% CLIP: any clipping -> less light. Scales with severity
             # (gentle near zero so it settles, hard when badly blown out).
-            d = -min(c.max_step, max(0.05, clip * c.kp_clip))
+            d, why = -min(c.max_step, max(0.05, clip * c.kp_clip)), "clipping"
         elif peak < c.peak_ceiling and mean < c.target_luma:
             # headroom below saturation AND not over-bright -> more light,
             # tapering as the peak nears the ceiling
-            d = min(c.max_step, c.kp * (c.peak_ceiling - peak) / c.peak_ceiling)
+            d, why = min(c.max_step, c.kp * (c.peak_ceiling - peak) / c.peak_ceiling), "headroom"
         else:
-            d = 0.0
-        return li_f + d
+            d, why = 0.0, "at target"
+        return li_f + d, why
 
     def evaluate(self, metering):
         """Update the pod target from whatever frames we have: the darkest need
-        wins (highlight priority). Returns the target, or None if no frame was
-        usable (target unchanged)."""
-        needs = [n for n in (self._need(m) for m in metering.values() if m) if n is not None]
+        wins (highlight priority) and that camera is the DRIVER. Returns the
+        target, or None if no frame was usable (target unchanged)."""
+        needs, followers = {}, {}
+        for cam, m in metering.items():
+            if not m:
+                continue
+            r = self._need(m)
+            if r is None:
+                continue
+            if m.get("sun_in_fov") and not self.cfg.sun_cam_votes:
+                followers[cam] = (r[0], "sun in FOV, following")
+            else:
+                needs[cam] = r
+        if not needs and followers:          # every camera sees the sun: vote anyway
+            needs, followers = followers, {}
+        self.followers = followers
         if not needs:
             self.waiting += 1
             return None
         self.waiting = 0
-        self.target = max(0.0, min(min(needs), self._max_li()))
+        self.needs = needs
+        self.driver = min(needs, key=lambda k: needs[k][0])
+        self.driver_why = needs[self.driver][1]
+        self.target = max(0.0, min(needs[self.driver][0], self._max_li()))
         return self.target
 
     def step(self, metering):
@@ -205,7 +228,14 @@ class SharedAE:
         prev = self.li
         self.li = max(0.0, min(self.li + d, self._max_li()))
         exp, analog, boost = self._li_to_exp_gain(self.li)
-        reason = ("slew\u2191" if d > 0 else "slew\u2193") if d else ("hold" if not self.waiting else "no frames")
+        if d:
+            reason = "slew\u2191" if d > 0 else "slew\u2193"
+        elif self.waiting and not self.needs:
+            reason = "awaiting first post-takeover set"   # sets so far predate our control
+        elif self.waiting:
+            reason = "hold (no usable set)"
+        else:
+            reason = "hold"
         self.last = {"pod_lum": max(lums) if lums else None,
                      "pod_clip": max(clips) if clips else None,
                      "pod_peak": max(peaks) if peaks else None,
@@ -213,6 +243,9 @@ class SharedAE:
                      "target": self.target, "to_go": self.target - self.li,
                      "exp_us": exp, "analog_x": analog, "boost_x": boost,
                      "total_gain_x": analog * boost,
+                     "driver": self.driver, "driver_why": self.driver_why,
+                     "needs": {k: (v[0] - self.li, v[1]) for k, v in
+                               list(self.needs.items()) + list(self.followers.items())},
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None}
         return self.last
 

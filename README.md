@@ -130,10 +130,11 @@ is excluded — exactly like the static mask, and combined with it. It applies
 whenever the circle can touch the sky (sun altitude above minus the radius),
 so the glow around a just-set sun is excluded as well.
 
-- GUI: **mask overlay** checkbox tints the excluded zones on the tiles
+- GUI: the **overlay** checkbox tints the excluded zones on the tiles
   (red = RMS mask, orange = sun zone, small white circle = the sun) and the
-  **sun r°** spinbox sets the radius live (0 disables it). The telemetry line
-  shows `maskNN%` (static + sun) and `sun 23° IN FOV` when it is in the frame.
+  **sun r°** spinbox sets the radius live (0 disables it; default **25°**).
+  The telemetry line shows `maskNN%` (static + sun) and `sun 23° IN FOV` when
+  it is in the frame.
 - The right radius depends on the lens, haze and exposure. Measure it on real
   frames — it prints the mean luma and clipped fraction per 2° annulus around
   the sun and suggests a radius:
@@ -144,10 +145,34 @@ so the glow around a just-set sun is excluded as well.
   ```
 
   First measurement (US05B1, sun only 6° up, 2026-09-14): clipping reached
-  12–14° from the sun, so the default is **20°**; re-measure with the sun high
+  12–14° from the sun; the default is **25°** (chosen after watching the
+  live pod); re-measure with the sun high
   (B1 ~15:40 UTC, F1 ~19:20 UTC, D1 ~23:20 UTC at this site) and raise it if
   the halo is larger. Lens-flare ghosts elsewhere in the frame are not covered
   by the circle; the overlay and the clip% show whether anything leaks.
+
+## What is driving the exposure (GUI)
+
+With Shared AE on, the tile of the camera whose need set the pod target gets
+a coloured border and a `◀ DRIVING: clipping | headroom | at target` badge;
+every tile shows its own `need ±x.xx stop (why)` so you can see who is
+limiting and by how much. With the overlay on, **clipped** unmasked pixels
+are tinted magenta on every tile (the highlight-priority rule reacts to
+these), and on the driving camera the **peak** pixels (top 0.1 %, what the
+headroom rule looks at) are tinted cyan. The window is resizable; tiles keep
+16:9 and scale with it.
+
+**Sun camera follows, does not vote (default).** A camera with the sun in its
+field takes the pod exposure like the others but is left out of the target:
+even with a 25° zone, the bright ring of sky just outside the circle sits at
+the 99.9th-percentile ceiling and would pin the whole pod dark for hours
+("DRIVING: at target" on the sun camera with 0% clipping was exactly that).
+Its badge reads `☀ following (no vote)`; the **sun cam votes** checkbox
+re-enables it. If every camera sees the sun they all vote.
+
+`PODCONTROL_DRY=1 podcontrol --no-grab` runs the whole loop (metering,
+targets, driver display) without ever sending an exposure command — for
+demos and UI testing on a live pod.
 
 ## Roadmap
 

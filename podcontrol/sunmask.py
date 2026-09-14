@@ -26,7 +26,7 @@ import os, math, time, glob, datetime
 import numpy as np
 import cv2
 
-DEFAULT_RADIUS_DEG = 20.0
+DEFAULT_RADIUS_DEG = 25.0
 GRID_STEP = 8            # px between alt/az samples; upsampled nearest to the frame
 
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
