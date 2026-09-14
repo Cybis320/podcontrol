@@ -12,12 +12,19 @@ analog gain, then a digital boost -- so a single scalar spans day to night and
 steps stay smooth. Adjustments are gentle (small stops/cycle, deadband) so it
 tracks slow sky changes without hunting.
 
-Loop discipline: a step is only taken on frames CAPTURED after the previous
-change landed (each metering entry may carry its capture epoch as "t"). On a
-capturing pod the frames come from RMS's saved blocks and can be ~50 s old;
-stepping every few seconds on such frames cuts exposure ~10 times before
-any effect is visible and rails the pod to the floor (seen live 2026-09-14).
-With the gate, the loop runs at the frame cadence and stays stable.
+Loop discipline (frames are late, output must be smooth): on a capturing pod
+the frames come from RMS's saved blocks, up to ~50 s old and flushed at a
+different moment per camera. Stepping on "whatever is fresh" made a different
+camera drive every 5 s and the pod chased up and down. Instead:
+
+  * every frame is used with the light index that was IN EFFECT when it was
+    captured (a short history of our own applies), so a late frame yields an
+    ABSOLUTE target ("at li 4.3 this camera needed -0.3 stop"), not a relative
+    nudge that piles up while the loop is blind;
+  * the pod target is the darkest need across cameras (highlight priority);
+  * the pod SLEWS toward the target by at most `slew` stops per cycle (5 s,
+    the RMS frame cadence): the default 0.05 stop is a 3.5% brightness change
+    per frame, invisible in a 30 fps timelapse of 5 s frames.
 
 Cross-platform: the ladder is in stops; the secondary gain stage is the ISP
 digital gain (-i) on BOTH platforms. The sensor digital gain (-d) is left at
@@ -46,11 +53,13 @@ class AEConfig:
                                 # (a margin under 250 so we approach but never cross into clip)
     kp_clip = 30.0              # clip-reduction gain (stops per unit clip fraction)
     kp = 0.6                    # proportional gain (stops per stop of error)
-    max_step = 0.5              # max stops changed per cycle (gentle)
+    max_step = 0.5              # max stops a single frame may move the TARGET
     deadband = 0.15             # no change if |error| below this (stops)
     gamma = 0.5                 # sensor gamma: luma ~ light**gamma
-    period_s = 6.0              # loop cadence (a step still waits for fresh frames)
-    settle_s = 1.5              # frames must be captured this long after an apply
+    period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
+    settle_s = 1.5              # an apply is in effect this long after it was sent
+    slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
+    history_s = 300.0           # how long we remember our applies (frame latency)
 
 
 class SharedAE:
@@ -58,10 +67,14 @@ class SharedAE:
         self.pod = pod
         self.cfg = cfg or AEConfig()
         self.li = self._exp_stops() * 0.5   # start mid-exposure, gain=1x
+        self.target = self.li                # where the pod is heading
         self.last = {}
         self.t_apply = 0.0                   # epoch of the last change pushed
-        self.waiting = 0                     # consecutive cycles held for fresh frames
+        self.t_seed = 0.0                    # epoch of the takeover
+        self.hist = []                       # [(epoch, li)] of our applies
+        self.waiting = 0                     # cycles with no usable frame
         self.restore = None                  # {cam: cmd} taken at takeover
+        self._applied_li = None
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -108,60 +121,99 @@ class SharedAE:
             lis.append(math.log2(max(1.0, d["exp_us"] / c.line_us) * max(1.0, g)))
         if not lis:
             return None
-        self.li = max(0.0, min(min(lis), self._max_li()))
+        self.li = self.target = max(0.0, min(min(lis), self._max_li()))
         self.last = {}
+        self.t_seed = time.time()
+        self.hist = [(self.t_seed, self.li)]
+        self._applied_li = None
         return self.li
+
+    def li_at(self, t):
+        """Light index in effect when a frame was captured at epoch t (our last
+        apply that had settled by then), or None if before the takeover."""
+        if t is None:
+            return self.li
+        if self.t_seed and t < self.t_seed:
+            return None
+        li = None
+        for ta, l in self.hist:
+            if ta + self.cfg.settle_s <= t:
+                li = l
+        return li if li is not None else (self.hist[0][1] if self.hist else self.li)
 
     def takeover(self, poll):
         """Seed the ladder AND remember how to hand every camera back."""
         self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
         return self.seed(poll)
 
-    # --- freshness gate ----------------------------------------------------
+    # --- freshness (kept for callers; the controller no longer needs it) ----
     def fresh(self, metering):
-        """Subset of metering captured after the last apply (+settle). Entries
-        without a "t" (direct grabs, sims) count as fresh. None if nothing is
-        fresh yet -> the caller must HOLD (no step, no apply)."""
-        need = self.t_apply + self.cfg.settle_s
+        """Entries with a usable capture time (after the takeover) or none."""
         out = {k: m for k, m in metering.items()
-               if m and (m.get("t") is None or m["t"] >= need)}
-        if not out:
+               if m and (m.get("t") is None or self.li_at(m["t"]) is not None)}
+        return out or None
+
+    # --- controller --------------------------------------------------------
+    def _need(self, m):
+        """Stops of change THIS frame asks for, judged at the light index that
+        was in effect when it was captured. None if the frame is unusable."""
+        c = self.cfg
+        t = m.get("t")
+        li_f = self.li_at(t)
+        if li_f is None:
+            return None
+        if t is not None and t < time.time() - c.history_s:
+            return None
+        clip, peak, mean = m["clip"], m.get("peak", m["mean"]), m["mean"]
+        if clip > c.clip_limit:
+            # AIM FOR 0% CLIP: any clipping -> less light. Scales with severity
+            # (gentle near zero so it settles, hard when badly blown out).
+            d = -min(c.max_step, max(0.05, clip * c.kp_clip))
+        elif peak < c.peak_ceiling and mean < c.target_luma:
+            # headroom below saturation AND not over-bright -> more light,
+            # tapering as the peak nears the ceiling
+            d = min(c.max_step, c.kp * (c.peak_ceiling - peak) / c.peak_ceiling)
+        else:
+            d = 0.0
+        return li_f + d
+
+    def evaluate(self, metering):
+        """Update the pod target from whatever frames we have: the darkest need
+        wins (highlight priority). Returns the target, or None if no frame was
+        usable (target unchanged)."""
+        needs = [n for n in (self._need(m) for m in metering.values() if m) if n is not None]
+        if not needs:
             self.waiting += 1
             return None
         self.waiting = 0
-        return out
+        self.target = max(0.0, min(min(needs), self._max_li()))
+        return self.target
 
-    # --- controller --------------------------------------------------------
     def step(self, metering):
-        """metering: {cam_id: {'mean':.., 'clip':..} or None}. Returns info dict or None."""
+        """One cycle: fold the frames into the target, then SLEW the pod one
+        small step toward it. Always returns the state; 'changed' says whether
+        apply() has something new to push."""
         c = self.cfg
         lums = [m["mean"] for m in metering.values() if m]
         clips = [m["clip"] for m in metering.values() if m]
-        if not lums:
-            return None
-        pod_lum = max(lums)          # brightest camera drives
-        pod_clip = max(clips)
         peaks = [m.get("peak") for m in metering.values() if m and m.get("peak") is not None]
-        pod_peak = max(peaks) if peaks else pod_lum
-        if pod_clip > c.clip_limit:
-            # AIM FOR 0% CLIP: any clipping -> reduce. Step scales with severity
-            # (gentle near zero so it settles, hard when badly blown out).
-            d = -min(c.max_step, max(0.05, pod_clip * c.kp_clip))
-            reason = "clip\u2193"
-        elif pod_peak < c.peak_ceiling and pod_lum < c.target_luma:
-            # headroom below saturation AND not over-bright -> brighten gently,
-            # slowing as the peak nears the ceiling so it never oversteps into clip
-            room = (c.peak_ceiling - pod_peak) / c.peak_ceiling
-            d = min(c.max_step, c.kp * room)
-            reason = "brighten" if d > 0.01 else "hold"
-        else:
-            d, reason = 0.0, "hold"
+        self.evaluate(metering)
+        err = self.target - self.li
+        d = max(-c.slew, min(c.slew, err))
+        if abs(err) < 1e-3:
+            d = 0.0
+        prev = self.li
         self.li = max(0.0, min(self.li + d, self._max_li()))
         exp, analog, boost = self._li_to_exp_gain(self.li)
-        self.last = {"pod_lum": pod_lum, "pod_clip": pod_clip, "d_stops": d,
-                     "reason": reason, "li": self.li, "exp_us": exp,
-                     "analog_x": analog, "boost_x": boost,
-                     "total_gain_x": analog * boost}
+        reason = ("slew\u2191" if d > 0 else "slew\u2193") if d else ("hold" if not self.waiting else "no frames")
+        self.last = {"pod_lum": max(lums) if lums else None,
+                     "pod_clip": max(clips) if clips else None,
+                     "pod_peak": max(peaks) if peaks else None,
+                     "d_stops": self.li - prev, "reason": reason, "li": self.li,
+                     "target": self.target, "to_go": self.target - self.li,
+                     "exp_us": exp, "analog_x": analog, "boost_x": boost,
+                     "total_gain_x": analog * boost,
+                     "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None}
         return self.last
 
     def apply(self, platform="imx291", timeout=5.0):
@@ -176,6 +228,11 @@ class SharedAE:
         kw = {"again": analog, "dgain": 1024, "ispdgain": boost, "exp_us": exp}
         r = self.pod.manual_all(timeout=timeout, **kw)
         self.t_apply = time.time()
+        self._applied_li = self.li
+        self.hist.append((self.t_apply, self.li))
+        cutoff = self.t_apply - self.cfg.history_s
+        while len(self.hist) > 2 and self.hist[1][0] < cutoff:
+            self.hist.pop(0)
         return r
 
     def release(self, timeout=5.0):
@@ -203,12 +260,11 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
         while not stop():
             poll = pod.poll_all(timeout=4)
             m = {sid: v for sid, v in meter_fn().items() if poll.get(sid, {}).get("online")}
-            m = ae.fresh(m)                  # hold until frames post-date the last change
-            info = ae.step(m) if m else None
-            if info:
+            info = ae.step(m)
+            if info["changed"]:
                 ae.apply(platform=_pod_platform(poll))
-                if on_tick:
-                    on_tick(info, poll)
+            if on_tick:
+                on_tick(info, poll)
             for _ in range(int(cfg.period_s * 10)):
                 if stop():
                     break
@@ -240,9 +296,11 @@ if __name__ == "__main__":
         return out
 
     def tick(info, poll):
-        print("li=%.2f  lum=%.0f clip=%.1f%%  -> exp=%dus gain=%.1fx  (%s %+.2f)" % (
-            info["li"], info["pod_lum"], info["pod_clip"] * 100, info["exp_us"],
-            info["total_gain_x"], info["reason"], info["d_stops"]))
+        print("li=%.2f target=%.2f  lum=%s clip=%s  -> exp=%dus gain=%.2fx  (%s %+.3f)" % (
+            info["li"], info["target"],
+            "-" if info["pod_lum"] is None else "%.0f" % info["pod_lum"],
+            "-" if info["pod_clip"] is None else "%.2f%%" % (100 * info["pod_clip"]),
+            info["exp_us"], info["total_gain_x"], info["reason"], info["d_stops"]))
 
     print("shared-AE headless (Ctrl-C to stop, releases to auto)…")
     try:

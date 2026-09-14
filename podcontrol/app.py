@@ -205,6 +205,11 @@ class App(tk.Tk):
         tk.Label(bar, text="  refresh", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         tk.Spinbox(bar, from_=2, to=60, width=4, textvariable=self.interval).pack(side="left")
         tk.Label(bar, text="s", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
+        tk.Label(bar, text="  slew", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
+        self.slew = tk.DoubleVar(value=self.ae.cfg.slew)
+        tk.Spinbox(bar, from_=0.01, to=0.5, increment=0.01, width=5, textvariable=self.slew,
+                   format="%.2f").pack(side="left")
+        tk.Label(bar, text="stop/cycle", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         tk.Checkbutton(bar, text="mask overlay", variable=self.overlay, fg="#c8bfa8", bg="#0f0d08",
                        selectcolor="#0f0d08", activebackground="#0f0d08").pack(side="left", padx=(12, 0))
         tk.Label(bar, text="sun r", fg="#c8bfa8", bg="#0f0d08").pack(side="left", padx=(8, 0))
@@ -223,6 +228,7 @@ class App(tk.Tk):
             t0 = time.time()
             try:
                 F.set_sun_radius(self.sun_radius.get())
+                self.ae.cfg.slew = max(0.005, float(self.slew.get()))
             except Exception:
                 pass
             poll = self.pod.poll_all(timeout=4)
@@ -240,18 +246,15 @@ class App(tk.Tk):
                 lumas[sid] = luma_stats(img, keep)
                 if lumas[sid] is not None:
                     lumas[sid]["t"] = tcap
-            if self.ae_on:
+            if self.ae_on and self.ae.t_seed:
                 ctl = {sid: lumas[sid] for sid in lumas if poll.get(sid, {}).get("online")}
-                ctl = self.ae.fresh(ctl)       # only frames newer than the last change
-                info = self.ae.step(ctl) if ctl else None
-                if info:
+                info = self.ae.step(ctl)       # target from frames, one small slew step
+                if info.get("changed"):
                     try:
                         self.ae.apply(platform=_pod_platform(poll))
                     except Exception:
                         pass
-                    self.ae_info = info
-                elif self.ae_info:
-                    self.ae_info = dict(self.ae_info, reason="waiting for fresh frames")
+                self.ae_info = info
             self.q.put((frames, poll, lumas, layers, time.time() - t0))
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
@@ -276,7 +279,8 @@ class App(tk.Tk):
                 ae = ""
                 if self.ae_on and self.ae_info:
                     i = self.ae_info
-                    ae = "  AE %s exp=%dus gain=%.1fx" % (i["reason"], i["exp_us"], i["total_gain_x"])
+                    ae = "  AE %s exp=%dus gain=%.2fx (to go %+.2f stop)" % (
+                        i["reason"], i["exp_us"], i["total_gain_x"], i.get("to_go", 0.0))
                 self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
                     daemons, len(self.stations),
                     ("%d–%d" % (int(min(brights)), int(max(brights)))) if brights else "—",

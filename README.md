@@ -158,12 +158,19 @@ so the glow around a just-set sun is excluded as well.
   runs it on OpenIPC. `podctl` polls the encoder state on both and exposes
   `venc_qp_all` / `venc_cqp_all` / `venc_gop_all`. See [docs/PARITY.md](docs/PARITY.md).
 - **Shared-AE loop discipline (2026-09-14, after railing the live pod to the
-  30 µs floor):** a step is taken only on frames captured after the previous
-  change (RMS frames are up to ~50 s old, so the loop runs at that cadence),
-  and switching Shared AE on seeds the ladder from the cameras' current
-  darkest exposure instead of a fixed mid-ladder guess. A SIGTERM/SIGINT
-  releases the cameras to auto like a window close. If an app dies hard, run
-  `Auto All` or `python -m podcontrol.podctl` + `auto` per camera.
+  30 µs floor and then chasing every 5 s):** RMS frames are up to ~50 s old
+  and each station flushes its block at a different moment, so any loop that
+  steps on "whatever is fresh" is driven by a different camera every cycle.
+  The controller now remembers its own applies and judges every frame at the
+  light index that was in effect when it was captured, giving an *absolute*
+  target per camera (darkest need wins); the pod then **slews** toward the
+  target by at most `slew` stops per 5 s cycle (default 0.05 stop = 3.5% per
+  frame, invisible in a 30 fps timelapse of 5 s frames; GUI spinbox). No
+  step is ever larger than the slew, latency cannot pile steps up, and a late
+  frame is still useful. Switching Shared AE on seeds the ladder from the
+  cameras' current darkest exposure. A SIGTERM/SIGINT releases the cameras
+  like a window close; if an app dies hard, click `Auto All` (sends the RMS
+  day line).
 - **All four exposure stages are pinned** on every shared-AE push (`manual -a
   … -d 1024 -i … -e …`). A stage left in AUTO keeps floating per camera: live
   on 2026-09-14 the sensor DGain sat at 1.0x on one camera and 1.7–3.4x on the
