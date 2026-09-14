@@ -89,6 +89,10 @@ class AEConfig:
     wb_min_scale = 0.25         # safety floor; the real bottom is 1/max(R,G,B) gains:
                                 # once every channel is below 1.0x nothing gain-induced
                                 # is left to recover, only uniform darkening of raw data
+    wb_rung_raw_sat_max = 0.0002  # the rung is used only while raw (green) saturation is
+                                # below this fraction: attenuated WB turns raw-saturated
+                                # zones magenta (R 1.8s, G s, B 1.9s no longer clip to
+                                # white), so with a blown-out halo we stay at s = 1
 
     def set_night_line(self, cmd):
         """Derive the ladder caps from RMS's night line so the top rung IS the
@@ -321,6 +325,11 @@ class SharedAE:
             # at/below the exposure floor only WB attenuation is left: it fixes
             # gain-induced R/B clipping but not raw (green) saturation
             rb, rs = m.get("rb_only", clip), m.get("raw_sat", 0.0)
+            if rs > c.wb_rung_raw_sat_max:
+                # raw-saturated zones would go magenta under attenuation: stay
+                # (or go back) to s = 1 where they clip to white
+                return max(0.0, li_f), ("raw-saturated: leaving WB rung" if li_f < -1e-6
+                                        else "raw-saturated at the floor")
             if rb > c.clip_limit:
                 return min(li_f, 0.0) - min(c.max_step, max(0.05, rb * c.kp_clip)), "R/B gain clipping (WB rung)"
             if rs > c.clip_limit:

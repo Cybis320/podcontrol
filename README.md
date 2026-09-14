@@ -261,7 +261,12 @@ controller goes down for `rb_only`, holds for `raw_sat`, and does not climb
 back until there is clear headroom. The base WB is captured at takeover
 (manual WB only), the attenuated `wb` is pushed with each step, restored on
 release, re-asserted if RMS rewrites WB, and the History records `wb_scale`.
-`wb_lever = False` disables it.
+**Magenta guard.** A raw-saturated pixel is R 1.8s / G 1.0s / B 1.9s after
+WB: at s = 1 it clips to white, at any s < 1 it turns magenta (the classic
+raw-highlight problem; the gain-clipped pixels have that cast *today* and the
+rung removes it). So the rung is only used while raw saturation is below
+`wb_rung_raw_sat_max` (0.02% of the frame), and the pod climbs back to s = 1
+as soon as a raw-saturated zone appears. `wb_lever = False` disables it.
 
 ## Point sources at twilight and night
 
