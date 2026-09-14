@@ -3,8 +3,13 @@
 A pod can come from (in resolution order):
   1. an explicit IP list         (CLI --cameras, or from_ips)
   2. a pod JSON file             (--pod pod.json, or $PODCONTROL_POD)
-  3. an RMS Stations directory   (--stations-dir, or $PODCONTROL_STATIONS_DIR)
+  3. an RMS Stations directory   (--stations-dir, or $PODCONTROL_STATIONS_DIR,
+                                  else ~/source/Stations if it holds .config files)
   4. the built-in default        (192.168.42.101 .. .106)
+
+Preferring the RMS Stations directory matters: it carries each camera's
+data_dir, which is what lets the frame source read RMS's own saved frames
+instead of opening a second RTSP session on a capturing camera.
 
 A camera has an id, an ip (for the :9600 daemon + RTSP), and an optional
 data_dir (where RMS writes FramesFiles we can read for previews/metering).
@@ -90,6 +95,11 @@ def get_pod(ips=None, pod_file=None, stations_dir=None):
     stations_dir = stations_dir or os.environ.get("PODCONTROL_STATIONS_DIR")
     if stations_dir and os.path.isdir(os.path.expanduser(stations_dir)):
         return discover_stations(stations_dir)
+    for cand in (os.path.expanduser("~/source/Stations"),):
+        if os.path.isdir(cand):
+            pod = discover_stations(cand)
+            if pod:
+                return pod
     return from_ips(DEFAULT_IPS)
 
 

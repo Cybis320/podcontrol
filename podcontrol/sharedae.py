@@ -12,8 +12,10 @@ analog gain, then a digital boost -- so a single scalar spans day to night and
 steps stay smooth. Adjustments are gentle (small stops/cycle, deadband) so it
 tracks slow sky changes without hunting.
 
-Cross-platform: the ladder is in stops; the secondary gain stage maps to the
-right daemon knob per platform (IMX291 -> ISP-digital -i, Goke -> digital -d).
+Cross-platform: the ladder is in stops; the secondary gain stage is the ISP
+digital gain (-i) on BOTH platforms. The sensor digital gain (-d) is left at
+unity: on the IMX291 it is inert, and on the Goke science config it is a
+mode-independent invariant (sensor DGain 1x) -- the night config uses -i 2048.
 """
 
 if __name__ == "__main__" and not __package__:
@@ -26,9 +28,10 @@ import math, time
 class AEConfig:
     line_us = 29.63             # sensor LINE time (25 fps, VMAX~1350) -- exposure is
                                 # quantized to whole multiples of this on both platforms
-    exp_max_us = 40000          # ~40 ms at 25 fps: meteor frame-time cap
+    exp_max_us = 39941          # 1348 lines at 25 fps = the max both daemons accept
+                                # (Goke auto range tops at 39970; night configs use 39941)
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
-    boost_max_x = 16.0          # secondary stage cap (IMX291 ISP-dig 16x; within Goke digital)
+    boost_max_x = 16.0          # ISP-digital cap (IMX291 16x; Goke science night uses 2x)
     target_luma = 170.0         # mean cap so a flat/featureless scene isn't over-amplified
     clip_limit = 0.00005        # AIM FOR 0% CLIP: >~100 clipped px (>=CLIP_LEVEL) -> reduce
                                 # (small floor ignores a handful of stuck hot pixels)
@@ -120,10 +123,7 @@ class SharedAE:
         boost = int(round(self.last["boost_x"] * 1024))
         kw = {"again": analog, "exp_us": exp}
         if self.last["boost_x"] > 1.001:
-            if platform == "goke":
-                kw["dgain"] = boost          # Goke big secondary = digital (-d)
-            else:
-                kw["ispdgain"] = boost       # IMX291 secondary = ISP-digital (-i)
+            kw["ispdgain"] = boost           # ISP-digital (-i) on both platforms
         return self.pod.manual_all(timeout=timeout, **kw)
 
     def release(self, timeout=5.0):

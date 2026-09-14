@@ -53,7 +53,7 @@ frame, so the shared-AE signal is uniform across platforms regardless of AveLum.
 | **Arbitrary manual R/G/B gains** | ✅ `wb <R> <G> <B>` | ✅ **now in daemon** `wb <R> <G> <B>` (was only in `wb_ctl`) |
 | Unity WB | ✅ `wb unity` | 🔶 `wb_ctl unity` |
 | Auto WB | ✅ `wb auto` | ✅ `wb auto` (daemon) |
-| daylight-cal / ISP saturation | 🔶 | 🔶 `wb_ctl daylight` / `satu` (fold in next) |
+| daylight-cal / ISP saturation | 🔶 | ✅ `satu` in daemon (`wb_ctl daylight` not folded) |
 | Unity base | 256 (Q4.8) | 128 |
 | Auto-persist / persist | ✅ `persist` + jffs2 | 🔶 config |
 
@@ -112,16 +112,22 @@ pregamma, meshshading, radialshading, ca, gcac`.
    OLD .201-.206 pod's libs have (musl resolves all symbols at load), so it must
    ship in a fresh Goke firmware build with matching libs — not retrofitted onto
    that pod.
-2. **Goke — encoder in the daemon.** Fold `venc_ioctl` (bitrate/GOP/FIXQP) into
-   `isp_ctl` as `venc_*` commands; add a chroma-QP-offset equivalent of
-   `venc_cqp`. Needed for unified QP/GOP/color across a Goke pod.
-3. **App — ISP-block abstraction.** Map one vocabulary to both: e.g. `block drc
-   off` → IMX291 `drc off` / Goke `bypass drc on`. (Different names, same intent.)
-4. **IMX291 — optional metering command.** Add AveLum/clip (ISP AE stats) to
-   `hisp_ctl` for daemon-side metering parity with Goke's `query`. Optional —
-   frame metering already covers it.
-5. **Units normalization (app-side).** WB unity base differs (256 vs 128); gains
-   are ×1024 both. The controller must scale per platform.
+2. ✅ **DONE (2026-09-01/02) — Goke encoder in the daemon.** `venc_qp [chn]
+   [<qp>|cap <max> <min>|auto]`, `venc_gop <chn> [<gop> [<kbps>]]`, `venc_cqp
+   [chn] [offset]` (chroma_qp_index_offset, same H.264 PPS field as the Hi),
+   plus `persist`/`ae_restore` (reboot persistence, `/mnt/mtd/isp_persist`).
+   Mirrors the Hi syntax exactly. Live on the whole .201–.206 fleet (OpenIPC
+   builds, verified 2026-09-14: `venc_qp` 51/15, `venc_cqp` -12, `venc_gop`
+   1/61440 on all six). Note the Goke encoder is **chn 1**; `0` is accepted as
+   "the channel".
+3. ✅ **DONE in firmware — ISP-block aliases.** The Goke daemon accepts the Hi
+   vocabulary (`drc off`, `nr off`, `sharpen off`, `dpc off`, …) as aliases of
+   `bypass <block> on`, so one `camera_settings.json` vocabulary drives both.
+4. **IMX291 — optional metering command.** Unchanged (optional; frame metering
+   covers it). The mirror gap now matters more: a daemon-side **clip fraction /
+   histogram** on the Goke would let shared AE run without ~50 s-old RMS frames.
+5. ✅ **Units — no normalization needed.** Both daemons report/accept WB as ×256
+   (256 = 1.0x) and gains as ×1024; one parser (`podctl`) serves both.
 
-Priority for the pod goals: **#1 (WB) and #2 (encoder)** are the real firmware
-gaps; #3 is app code; #4/#5 are polish.
+Remaining podcontrol-side items: Goke shared-AE validation (bench-validated on
+the IMX291 only), and the optional daemon-side metering (#4).

@@ -5,7 +5,9 @@ and Auto/Manual control across all cameras. Frame source is RMS-safe (reads
 saved FramesFiles while RMS captures; grabs only when RMS is idle). The
 shared-AE engine and WB cloud-gray calibrator plug in on top (podctl).
 
-Run:  python -m podcontrol            (default pod 192.168.42.101-.106)
+Run:  python -m podcontrol            (pod from ~/source/Stations if present,
+                                       else 192.168.42.101-.106)
+      python -m podcontrol --stations-dir ~/source/Stations
       python -m podcontrol --cameras 192.168.42.101-106
       python -m podcontrol --pod pod.json
 """
@@ -22,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
-from podcontrol.frames import frame_for, luma_stats
+from podcontrol.frames import frame_for, fresh_frame, luma_stats
 from podcontrol.sharedae import SharedAE, _pod_platform
 
 TILE_W, TILE_H = 448, 252
@@ -271,12 +273,12 @@ class App(tk.Tk):
         def worker():
             from podcontrol.wbcal import run_pod_calibration
             def on_step(i, rgb, g, err):
-                self.status.config(text="WB cal %s: iter %d err=%.3f gains=%.2f/%.2f/%.2fx" % (
+                self.status.config(text="WB cal %s: iter %d err=%.3f gains=%.2f/%.2f/%.2fx (waiting for next RMS frame…)" % (
                     self.selected, i, err, g[0]/256, g[1]/256, g[2]/256))
             try:
                 gains, err, n = run_pod_calibration(
-                    self.pod, self.selected, box,
-                    lambda st: frame_for(st, self.allow_grab)[0], on_step=on_step)
+                    self.pod, self.selected, box, on_step=on_step,
+                    fresh_fn=lambda st, after: fresh_frame(st, after, self.allow_grab)[0])
                 self.status.config(text="WB pushed to pod: %.2f/%.2f/%.2fx  err=%.3f (%d iters)" % (
                     gains[0]/256, gains[1]/256, gains[2]/256, err, n))
             except Exception as e:

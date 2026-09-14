@@ -76,20 +76,29 @@ def calibrate(measure, apply_wb, gains0=(UNITY, UNITY, UNITY),
     return gains, last_err, i + 1
 
 
-def run_pod_calibration(pod, ref_id, box, frame_fn, settle_s=2.5, start_unity=True,
-                        on_step=None, **kw):
+def run_pod_calibration(pod, ref_id, box, frame_fn=None, settle_s=2.5, start_unity=True,
+                        on_step=None, fresh_fn=None, **kw):
     """Calibrate on ref camera's `box`, push the WB to the whole pod.
-    frame_fn(station) -> BGR frame (fresh)."""
+
+    fresh_fn(station, after_epoch) -> BGR frame captured AFTER the last WB push
+        (preferred; see frames.fresh_frame -- on a capturing camera this waits
+        for RMS's next saved block, ~50 s, instead of measuring a pre-change frame)
+    frame_fn(station) -> BGR frame, sampled settle_s after the push (legacy)."""
     import time
     ref = next(s for s in pod.stations if s.id == ref_id)
+    state = {"t_apply": 0.0}
 
     def measure():
-        time.sleep(settle_s)                 # let the WB + a fresh frame land
-        img = frame_fn(ref)
+        if fresh_fn is not None:
+            img = fresh_fn(ref, state["t_apply"])
+        else:
+            time.sleep(settle_s)             # let the WB + a fresh frame land
+            img = frame_fn(ref)
         return region_mean_rgb(img, box) if img is not None else None
 
     def apply_wb(R, G, B):
         pod.wb_all(R, G, B)
+        state["t_apply"] = time.time()
 
     g0 = (UNITY, UNITY, UNITY)
     if not start_unity:
@@ -108,7 +117,7 @@ if __name__ == "__main__":
     import argparse
     from podcontrol.stations import get_pod
     from podcontrol.podctl import PodController
-    from podcontrol.frames import frame_for
+    from podcontrol.frames import fresh_frame
     ap = argparse.ArgumentParser(description="Cloud-gray WB calibration (pushes to whole pod).")
     ap.add_argument("--camera", required=True, help="reference station id (e.g. cam101)")
     ap.add_argument("--box", required=True, help="x0,y0,x1,y1 region (full-frame px) that should be grey")
@@ -122,7 +131,8 @@ if __name__ == "__main__":
               % (i, rgb[0], rgb[1], rgb[2], err, g[0], g[1], g[2]))
 
     print("calibrating on %s box=%s ..." % (args.camera, box))
-    gains, err, n = run_pod_calibration(pod, args.camera, box,
-                                        lambda s: frame_for(s)[0], tol=args.tol, on_step=step)
+    gains, err, n = run_pod_calibration(
+        pod, args.camera, box, tol=args.tol, on_step=step,
+        fresh_fn=lambda s, after: fresh_frame(s, after, allow_grab=False)[0])
     print("DONE: gains R=%d G=%d B=%d (%.2f/%.2f/%.2fx)  err=%.3f  in %d iters -> pushed to pod"
           % (gains[0], gains[1], gains[2], gains[0] / 256, gains[1] / 256, gains[2] / 256, err, n))

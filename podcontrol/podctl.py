@@ -1,15 +1,15 @@
 """PodController: talk to every camera's :9600 ISP daemon, platform-agnostically.
 
-Two firmware families, one control layer:
-  * Goke GK7205V200 (isp_ctl):  query / manual -a/-d/-i/-e / auto
-        query -> rich telemetry incl. AveLum + ChipTemp; NO wb/venc in daemon.
-  * Hi3516CV300 IMX291 (hisp_ctl): ae / wb / venc_qp / venc_cqp / gain / exp /
-        drc / nr / ... plus the SAME query/manual/auto vocab for parity.
-        Rich control, but query has NO AveLum/ChipTemp -> meter from the frame.
+Two firmware families, one control layer, ONE command vocabulary:
+  * Goke GK7205V200 (isp_ctl, OpenIPC fleet .201-.206): query / manual
+        -a/-d/-i/-e / auto / wb / venc_qp / venc_cqp / venc_gop / persist ...
+        query -> rich telemetry incl. AveLum (+ChipTemp on XM builds).
+  * Hi3516CV300 IMX291 (hisp_ctl, .101-.106): ae / wb / venc_qp / venc_cqp /
+        gain / exp / drc / nr / ... plus the SAME query/manual/auto vocab.
+        query has NO AveLum/ChipTemp -> meter from the frame.
 
-We detect the platform per camera and normalize telemetry into one schema.
-Control uses manual/auto (both families support it); wb/qp are IMX291-only for
-now (see the parity audit -- adding them to the Goke daemon closes the gap).
+Since the 2026-09 parity port both daemons speak the same wb/venc_* syntax
+(x256 WB gains, 256 = 1.0x), so telemetry and control are parsed identically.
 
 One command per connection; an offline camera returns None and reconnects next
 cycle -- naturally resilient to the day/night SwitchMode reboots.
@@ -85,7 +85,35 @@ def _parse_qp(text):
     if not text:
         return None
     mn = _f(text, r"MinQp=(\d+)"); mx = _f(text, r"MaxQp=(\d+)")
-    return {"minqp": int(mn) if mn else None, "maxqp": int(mx) if mx else None}
+    rc = _f(text, r"rc=(\d+)")
+    return {"minqp": int(mn) if mn else None, "maxqp": int(mx) if mx else None,
+            "rc": int(rc) if rc else None}
+
+
+def _parse_cqp(text):
+    if not text:
+        return None
+    v = _f(text, r"chroma_qp_index_offset=(-?\d+)")
+    return int(v) if v is not None else None
+
+
+def _parse_gop(text):
+    if not text:
+        return None
+    g = _f(text, r"Gop=(\d+)"); br = _f(text, r"BitRate=(\d+)")
+    return {"gop": int(g) if g else None, "bitrate_kbps": int(br) if br else None,
+            "rcmode": _f(text, r"RcMode=(\w+)")}
+
+
+def _encoder_telemetry(ip, timeout):
+    """wb / venc_qp / venc_cqp / venc_gop -- same syntax on both daemons.
+    A daemon without one of them just returns an ERROR line -> None field."""
+    return {
+        "wb": _parse_wb(send(ip, "wb", timeout)),
+        "qp": _parse_qp(send(ip, "venc_qp", timeout)),
+        "cqp": _parse_cqp(send(ip, "venc_cqp", timeout)),
+        "gop": _parse_gop(send(ip, "venc_gop", timeout)),
+    }
 
 
 def poll(ip, timeout=5.0):
@@ -93,13 +121,12 @@ def poll(ip, timeout=5.0):
     q = send(ip, "query", timeout)
     if q is None:
         return {"online": False, "platform": None}
-    if "Exposure Info" in q:                     # Goke
-        return {"online": True, "platform": "goke", "wb": None, "qp": None, **_parse_goke(q)}
+    if "Exposure Info" in q:                     # Goke isp_ctl
+        return {"online": True, "platform": "goke", **_parse_goke(q),
+                **_encoder_telemetry(ip, timeout)}
     if "ae:" in q or "AGain=" in q:              # IMX291 hisp_ctl
-        t = {"online": True, "platform": "imx291", **_parse_ae_line(q)}
-        t["wb"] = _parse_wb(send(ip, "wb", timeout))
-        t["qp"] = _parse_qp(send(ip, "venc_qp", timeout))
-        return t
+        return {"online": True, "platform": "imx291", **_parse_ae_line(q),
+                **_encoder_telemetry(ip, timeout)}
     return {"online": True, "platform": "unknown", "raw": q}
 
 
@@ -137,6 +164,21 @@ class PodController:
     def wb_read(self, station_id, timeout=5.0):
         return _parse_wb(self.one(station_id, "wb", timeout))
 
+    # --- encoder (same syntax both platforms; chn 0 = "the" channel) --------
+    def venc_qp_all(self, maxqp, minqp, timeout=5.0):
+        """Luma QP window on every camera (min==max pins a constant QP)."""
+        return self._bcast("venc_qp 0 cap %d %d" % (int(maxqp), int(minqp)), timeout)
+
+    def venc_cqp_all(self, offset, timeout=5.0):
+        """Chroma QP index offset [-12..12] on every camera."""
+        return self._bcast("venc_cqp 0 %d" % int(offset), timeout)
+
+    def venc_gop_all(self, gop, bitrate_kbps=None, timeout=5.0):
+        cmd = "venc_gop 0 %d" % int(gop)
+        if bitrate_kbps is not None:
+            cmd += " %d" % int(bitrate_kbps)
+        return self._bcast(cmd, timeout)
+
     def one(self, station_id, cmd, timeout=5.0):
         st = next((s for s in self.stations if s.id == station_id), None)
         return send(st.ip, cmd, timeout) if st else None
@@ -145,10 +187,16 @@ class PodController:
 if __name__ == "__main__":
     from podcontrol.stations import get_pod
     pod = PodController(get_pod())
-    print("%-8s %-7s %6s %6s %7s %5s %s" % ("cam","plat","again","expus","avelum","iso","op/temp"))
+    print("%-8s %-7s %6s %6s %7s %5s %-6s %-16s %-9s %-4s %s" % (
+        "cam","plat","again","expus","avelum","iso","op","wb(R/G/B)","qp","cqp","gop/kbps"))
     for sid, d in pod.poll_all(timeout=4).items():
         if not d.get("online"):
             print("%-8s OFFLINE" % sid); continue
-        print("%-8s %-7s %6s %6s %7s %5s %s" % (
-            sid, d.get("platform"), d.get("again_x"), d.get("exp_us"),
-            d.get("avelum"), d.get("iso"), d.get("optype") or d.get("chiptemp")))
+        wb = d.get("wb") or {}; qp = d.get("qp") or {}; gop = d.get("gop") or {}
+        g = wb.get("gains") or []
+        wbs = ("%s %s" % (wb.get("op"), "/".join("%.2f" % x for x in (g[0], g[1], g[-1])) if len(g) >= 3 else "")).strip()
+        print("%-8s %-7s %6.2f %6s %7s %5s %-6s %-16s %-9s %-4s %s" % (
+            sid, d.get("platform"), d.get("again_x") or 0, d.get("exp_us"),
+            d.get("avelum"), d.get("iso"), d.get("optype") or d.get("chiptemp") or "",
+            wbs, "%s/%s" % (qp.get("maxqp"), qp.get("minqp")), d.get("cqp"),
+            "%s/%s" % (gop.get("gop"), gop.get("bitrate_kbps"))))

@@ -5,8 +5,10 @@ every camera, coordinated exposure/gain (the shared-AE engine), and a white-bala
 "cloud-gray" calibrator. Runs **parallel to RMS** and works on both camera
 platforms — **Hi3516CV300 / IMX291** and **Goke GK7205V200 / IMX307**.
 
-> Status: **Phase 1** — preview tiles + unified telemetry + Auto/Manual control.
-> Phase 2 (shared-AE engine) and Phase 3 (WB cloud-gray) are on the roadmap below.
+> Status: Phases 1–3 done (preview + telemetry, shared AE, WB cloud-gray).
+> 2026-09-14: re-targeted at the production Goke/OpenIPC pod (.201–.206), whose
+> daemon now speaks the same `wb` / `venc_qp` / `venc_cqp` / `venc_gop` vocabulary
+> as the IMX291 one — see the roadmap below.
 
 ## How it works
 
@@ -75,13 +77,40 @@ TL;DR of the gaps that matter for the pod goals:
   the sky keeps its chroma. Headless:
   `python -m podcontrol.wbcal --camera cam101 --box x0,y0,x1,y1`
 
+## Frame source (RMS-safe) — what changed 2026-09-14
+
+- RMS now saves **PNG** frames in 10-frame blocks (`<id>_YYYYMMDD_HHMMSS_mmm_d.png`,
+  flushed every ~50 s). The frame source reads PNG or JPG, and treats a frame as
+  fresh for 60 s (the block period), so previews on a capturing pod are RMS's
+  own frames, up to ~50 s old, at zero extra camera load.
+- A second guard: a running `RMS.StartCapture` whose command line names the
+  station means RMS is ACTIVE even if no saved frame is found — the app will
+  never open a second RTSP session on such a camera.
+- `frames.fresh_frame(station, after)` waits for a frame **captured after** a
+  given time (from the filename's UTC stamp). The WB calibrator uses it so each
+  iteration measures a frame taken after the WB push (up to ~1 min per iteration
+  on a capturing pod; instant when RMS is idle and a grab is allowed).
+- The pod is discovered from `~/source/Stations` (RMS `.config` → camera IP +
+  `data_dir`) when present, so the production pod works out of the box.
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).
-- **Parity work.** The Goke daemon now has `wb`; still to fold in: the encoder
-  (bitrate/GOP/QP) and optional metering. See [docs/PARITY.md](docs/PARITY.md).
-- ⚠ The Goke `wb` addition must ship in a fresh Goke firmware build (current
-  libs) — the old .201–.206 pod runs older libs (see PARITY.md).
+- ✅ **Parity closed in firmware (2026-09).** Both daemons speak the same
+  `wb` / `venc_qp` / `venc_cqp` / `venc_gop` / `persist` / `manual -a/-i/-e` /
+  `auto --min/max-exptime` syntax (x256 WB gains, 256 = 1.0x); the Goke fleet
+  runs it on OpenIPC. `podctl` polls the encoder state on both and exposes
+  `venc_qp_all` / `venc_cqp_all` / `venc_gop_all`. See [docs/PARITY.md](docs/PARITY.md).
+- Shared AE on the Goke pod: validated on the IMX291 bench only. On the Goke
+  science config, night exposure/gain is already pinned identically by
+  `camera_settings.json`; shared AE matters at twilight/day where the cameras'
+  own AE diverges (e.g. AGain 1.0–4.6x across the pod at dawn). The secondary
+  gain stage is the ISP digital gain (`-i`) on both platforms (sensor DGain
+  stays 1x, a science invariant).
+- Next: (a) run the GUI against the production pod and exercise shared AE at
+  twilight on the test unit first; (b) WB cloud-gray on the Goke pod to refine
+  the fixed day WB (460/256/490); (c) daemon-side clip metering (ISP histogram)
+  so AE does not depend on ~50 s-old saved frames.
 
 ## Layout
 
