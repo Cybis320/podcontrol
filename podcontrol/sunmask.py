@@ -29,24 +29,35 @@ import cv2
 DEFAULT_RADIUS_DEG = 25.0
 GRID_STEP = 8            # px between alt/az samples; upsampled nearest to the frame
 
-# Lens flare. Internal-reflection ghosts lie on the line through the sun's
-# image and the optical centre (a radial distortion keeps that line straight)
-# at FIXED fractions k of the sun-to-centre distance: k = 1 is the sun, 0 the
-# centre, k < 0 the mirrored side; their angular size is ~constant. Measured
-# on US05B1 (2026-09-14, sun 11-17 deg from the centre, 7 clean frames): a
-# pale disc, radius 2-5 deg (larger as the sun nears the centre), centred at
-# k = -0.52..-0.58, 60-90 luma above the sky, within 2 deg of the axis. With
-# the sun ~12 deg OUTSIDE the field (US05F1) a smaller ghost shows at
-# k ~ -0.20 (mirrored, ~10 deg from the centre). Model = ghost DISCS at
-# (k, radius scale) x ghost_radius_deg, applied while the sun is within
-# FLARE_MAX_SEP_DEG of the pixel grid, plus a narrow corridor along the whole
-# axis (rim streaks) only while the sun is inside the field.
-# (k, radius scale, max sun separation from the field in deg for this ghost)
-FLARE_GHOSTS = [(-0.55, 1.0, 5.0), (-0.20, 1.0, 30.0)]
+# Lens flare. Internal-reflection ghosts are images mirrored through the
+# lens's PRINCIPAL POINT on the sensor = the platepar's fitted radial
+# distortion centre (optical_centre()), not the geometric image centre (on
+# US05B1 it is 36 px lower; the ghost drifted off the image-centre line as
+# the sun moved exactly as that offset predicts). A radial distortion keeps
+# the sun-to-principal-point line straight, so the ghost sits on it, on the
+# mirrored side. Its distance g from the principal point is NOT a fixed
+# fraction of the sun's distance D: measured 2026-09-14 on US05B1 (D 11-17
+# deg, 7 clean frames) g ~ 0.52 D, and on US05F1/C1 with the sun far out
+# (D 32-49 deg) g saturates around 10 deg (GHOST_TABLE, interpolated). Its
+# radius shrinks as the sun moves out (~5 deg at D=11, ~2.5 deg at D=17).
+# Model = ONE ghost disc at g(D) with radius ghost_radius_deg*11/D clamped
+# to [0.7 knob, knob], applied while the sun is within FLARE_MAX_SEP_DEG of
+# the field, plus a narrow corridor along the whole axis (rim streaks) only
+# while the sun is inside the frame.
+GHOST_TABLE = [(11.1, 6.2), (11.7, 6.8), (12.8, 7.4), (14.1, 7.2), (15.7, 8.5),
+               (17.5, 9.1), (32.0, 9.5), (48.7, 10.0)]     # (D deg, g deg)
 DEFAULT_GHOST_RADIUS_DEG = 6.0
 FLARE_K_MIN, FLARE_K_MAX = -1.6, 1.0
 FLARE_CORRIDOR_HALF_WIDTH_DEG = 3.0
 FLARE_MAX_SEP_DEG = 30.0                      # ghosts appear with the sun well outside the field
+
+
+def ghost_distance_deg(D):
+    """Ghost distance from the principal point (deg) for a sun D deg from it."""
+    xs = [d for d, g in GHOST_TABLE]; ys = [g for d, g in GHOST_TABLE]
+    if D <= xs[0]:
+        return ys[0] * D / xs[0]
+    return float(np.interp(D, xs, ys))
 
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
 _CACHE = {}              # (station, 30 s bucket, radius, shape) -> (excl, info)
@@ -177,11 +188,13 @@ def optical_centre(station):
 
 def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
               corridor_half_width_deg=FLARE_CORRIDOR_HALF_WIDTH_DEG,
-              ghosts=FLARE_GHOSTS, k_min=FLARE_K_MIN, k_max=FLARE_K_MAX, sun_sep_deg=0.0):
+              k_min=FLARE_K_MIN, k_max=FLARE_K_MAX, sun_sep_deg=0.0):
     """Bool map (True = excluded) of the lens-flare model for a sun imaged at
-    (sx, sy) (may be outside the frame): ghost discs at k * (sun - centre)
-    with radius ghost_radius_deg * scale, plus a corridor (capsule) along the
-    axis from k_min to k_max, corridor_half_width_deg wide. F_scale px/deg."""
+    (sx, sy) (may be outside the frame): one ghost disc on the mirrored axis
+    at ghost_distance_deg(D) from the principal point, radius
+    ghost_radius_deg*11/D clamped to [knob/2, knob], plus a corridor (capsule)
+    along the axis from k_min to k_max, corridor_half_width_deg wide (only
+    when the sun is inside the frame). F_scale px/deg."""
     pp = _load(station)["pp"]
     cx, cy = optical_centre(station)
     h, w = shape
@@ -193,11 +206,14 @@ def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
         p2 = (int(round(cx + k_max * (sx - cx))), int(round(cy + k_max * (sy - cy))))
         cv2.line(m, p1, p2, 1, max(1, int(round(2 * corridor_half_width_deg * Fs))))
     if ghost_radius_deg > 0:
-        for k, scale, max_sep in ghosts:
-            if sun_sep_deg > max_sep:
-                continue
-            c = (int(round(cx + k * (sx - cx))), int(round(cy + k * (sy - cy))))
-            cv2.circle(m, c, max(1, int(round(ghost_radius_deg * scale * Fs))), 1, -1)
+        dpx = math.hypot(sx - cx, sy - cy)
+        if dpx > 1:
+            D = dpx / Fs
+            g = ghost_distance_deg(D)
+            ux, uy = (sx - cx) / dpx, (sy - cy) / dpx
+            c = (int(round(cx - g * Fs * ux)), int(round(cy - g * Fs * uy)))
+            r = min(ghost_radius_deg, max(0.7 * ghost_radius_deg, ghost_radius_deg * 11.0 / D))
+            cv2.circle(m, c, max(1, int(round(r * Fs))), 1, -1)
     return m.astype(bool)
 
 
