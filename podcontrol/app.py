@@ -431,6 +431,7 @@ class App(tk.Tk):
         try:
             while True:
                 frames, poll, lumas, layers, dt = self.q.get_nowait()
+                self._hist_dirty = True
                 brights = []
                 info = self.ae_info if self.ae_on else None
                 driver = (info or {}).get("driver")
@@ -463,6 +464,10 @@ class App(tk.Tk):
                     ae, dt, time.strftime("%H:%M:%S")))
         except queue.Empty:
             pass
+        # live chart: redraw once per completed cycle (the queue drained)
+        if getattr(self, "_hist_dirty", False):
+            self._hist_dirty = False
+            self._draw_history()
         self.after(200, self._drain)
 
     def toggle_history(self):
@@ -471,7 +476,7 @@ class App(tk.Tk):
             return
         w = tk.Toplevel(self); w.title("Pod Control \u2014 last 12 h"); w.configure(bg=BG)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w.geometry("%dx%d+0+%d" % (sw - 20, int(sh * 0.45), int(sh * 0.52)))   # full width, lower half
+        w.geometry("%dx%d" % (min(1200, sw - 40), min(420, int(sh * 0.4))))    # modest; resizable
         w.minsize(600, 320)
         c = tk.Canvas(w, bg=BG, highlightthickness=0); c.pack(fill="both", expand=True, padx=6, pady=6)
         self.hist_win, self.hist_canvas = w, c
