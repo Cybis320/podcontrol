@@ -161,9 +161,13 @@ so the glow around a just-set sun is excluded as well.
   30 µs floor and then chasing every 5 s):** RMS frames are up to ~50 s old
   and each station flushes its block at a different moment, so any loop that
   steps on "whatever is fresh" is driven by a different camera every cycle.
-  The controller now remembers its own applies and judges every frame at the
-  light index that was in effect when it was captured, giving an *absolute*
-  target per camera (darkest need wins); the pod then **slews** toward the
+  RMS saves every camera on the same aligned 5 s slots, so each cycle the
+  app meters the **newest complete set** (the newest slot for which every
+  active camera has a frame; the six frames are within ~20 ms of each other),
+  one coherent measurement with one capture time. The controller remembers
+  its own applies and judges that set at the light index that was in effect
+  when it was captured, giving an *absolute* target per camera (darkest need
+  wins); the pod then **slews** toward the
   target by at most `slew` stops per 5 s cycle (default 0.05 stop = 3.5% per
   frame, invisible in a 30 fps timelapse of 5 s frames; GUI spinbox). No
   step is ever larger than the slew, latency cannot pile steps up, and a late

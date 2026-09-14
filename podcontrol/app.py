@@ -180,6 +180,7 @@ class App(tk.Tk):
         self.ae = SharedAE(self.pod)
         self.ae_on = False
         self.ae_info = None
+        self.ae_slot = None
         self.selected = None      # station id with an active region selection
         self.calibrating = False
         self.q = queue.Queue()
@@ -247,8 +248,12 @@ class App(tk.Tk):
                 if lumas[sid] is not None:
                     lumas[sid]["t"] = tcap
             if self.ae_on and self.ae.t_seed:
-                ctl = {sid: lumas[sid] for sid in lumas if poll.get(sid, {}).get("online")}
-                info = self.ae.step(ctl)       # target from frames, one small slew step
+                # meter the pod on the newest COMPLETE frame set (one capture
+                # instant for all cameras), not six frames of different ages
+                met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab)
+                ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
+                self.ae_slot = slot
+                info = self.ae.step(ctl)       # target from the set, one small slew step
                 if info.get("changed"):
                     try:
                         self.ae.apply(platform=_pod_platform(poll))
@@ -279,8 +284,9 @@ class App(tk.Tk):
                 ae = ""
                 if self.ae_on and self.ae_info:
                     i = self.ae_info
-                    ae = "  AE %s exp=%dus gain=%.2fx (to go %+.2f stop)" % (
-                        i["reason"], i["exp_us"], i["total_gain_x"], i.get("to_go", 0.0))
+                    ae = "  AE %s exp=%dus gain=%.2fx (to go %+.2f stop; set %s)" % (
+                        i["reason"], i["exp_us"], i["total_gain_x"], i.get("to_go", 0.0),
+                        ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
                 self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
                     daemons, len(self.stations),
                     ("%d–%d" % (int(min(brights)), int(max(brights)))) if brights else "—",

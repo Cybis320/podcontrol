@@ -300,6 +300,95 @@ def mask_for(station, img, t=None, layers=False):
     return keep
 
 
+# ---------------------------------------------------------------------------
+# Complete frame SETS: RMS saves every camera on the same aligned 5 s slots
+# (frame_save_aligned_interval), so the frames sharing a slot were captured
+# together (sub-second offsets of ~10 ms). Metering the pod on the newest
+# COMPLETE slot gives one coherent measurement with one capture time, instead
+# of six frames of different ages (each station flushes its 10-frame block at
+# a different moment).
+SET_SLOT_S = 5.0
+SET_MAX_AGE_S = 180.0
+_STATS_CACHE = {}          # path -> luma stats (frames are immutable once written)
+
+
+def recent_rms_frames(station, max_age=SET_MAX_AGE_S):
+    """[(capture_epoch, path)] newest first, within max_age, for this station."""
+    if not station.data_dir or not os.path.isdir(station.frames_dir):
+        return []
+    root = station.frames_dir
+    days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
+    now = time.time(); out = []
+    for d in days:
+        for ext in FRAME_EXTS:
+            for f in glob.glob(os.path.join(d, "**", station.id + "_" + ext), recursive=True):
+                t = frame_capture_time(f)
+                if t is None:
+                    try:
+                        t = os.path.getmtime(f) - _BLOCK_SPAN_S
+                    except OSError:
+                        continue
+                if now - t <= max_age:
+                    out.append((t, f))
+    out.sort(reverse=True)
+    return out
+
+
+def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
+    """(slot_epoch, {station_id: path}) for the newest slot where EVERY active
+    station (one with any frame within max_age) has a frame; (None, {}) if
+    no such slot. Stations without saved frames are not part of sets."""
+    per = {}
+    for st in stations:
+        fr = recent_rms_frames(st, max_age)
+        if fr:
+            per[st.id] = {round(t / slot_s) * slot_s: p for t, p in fr}
+    if not per:
+        return None, {}
+    common = set.intersection(*(set(d.keys()) for d in per.values()))
+    if not common:
+        return None, {}
+    slot = max(common)
+    return slot, {sid: per[sid][slot] for sid in per}
+
+
+def stats_for_path(station, path, t):
+    """luma_stats of a saved frame (masked, sun at t), cached by path."""
+    key = (path, round(F_SUN_RADIUS(), 2))
+    hit = _STATS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    img = _imread_ok(path)
+    st = luma_stats(img, mask_for(station, img, t)) if img is not None else None
+    if len(_STATS_CACHE) > 400:
+        _STATS_CACHE.clear()
+    _STATS_CACHE[key] = st
+    return st
+
+
+def F_SUN_RADIUS():
+    return SUN_RADIUS_DEG[0]
+
+
+def meter_set(stations, allow_grab=False):
+    """Pod metering on the newest complete frame set: ({station_id: stats+t},
+    slot_epoch). Stations that save no frames (RMS idle) are metered from a
+    one-shot grab (t = now) only if allow_grab; otherwise skipped."""
+    slot, paths = newest_complete_set(stations)
+    out = {}
+    for st in stations:
+        if st.id in paths:
+            s = stats_for_path(st, paths[st.id], slot)
+            if s is not None:
+                out[st.id] = dict(s, t=slot, path=paths[st.id])
+        elif allow_grab and not rms_active(st):
+            img = grab_rtsp(st.ip)
+            s = luma_stats(img, mask_for(st, img))
+            if s is not None:
+                out[st.id] = dict(s, t=time.time())
+    return out, slot
+
+
 def luma_stats(bgr, mask=None):
     """Metering from a frame: mean luma (0-255), clipped-pixel fraction (0-1)
     and the 99.9th-percentile peak -- over the UNMASKED pixels only when a mask
@@ -322,10 +411,15 @@ if __name__ == "__main__":
     from podcontrol.stations import get_pod
     import sys
     allow = "--grab" in sys.argv          # default: never open RTSP from the CLI
-    for s in get_pod():
+    pod = get_pod()
+    for s in pod:
         img, src = frame_for(s, allow_grab=allow)
         st = luma_stats(img, mask_for(s, img))
         print("%-8s %-15s %-6s %s  luma=%s" % (
             s.id, s.ip, src, None if img is None else img.shape,
             None if st is None else "mean=%.0f clip=%.4f peak=%.0f masked=%.0f%%" % (
                 st["mean"], st["clip"], st["peak"], 100 * st["masked"])))
+    met, slot = meter_set(pod, allow_grab=allow)
+    if slot:
+        print("newest complete set: slot %s (%.0fs old), %d/%d cameras" % (
+            time.strftime("%H:%M:%S", time.gmtime(slot)), time.time() - slot, len(met), len(pod)))

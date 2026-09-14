@@ -277,23 +277,14 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
 if __name__ == "__main__":
     from podcontrol.stations import get_pod
     from podcontrol.podctl import PodController
-    from podcontrol.frames import frame_for, luma_stats, mask_for
-    from concurrent.futures import ThreadPoolExecutor
     pod = PodController(get_pod())
-    pool = ThreadPoolExecutor(max_workers=8)
 
     def meter():
-        sts = pod.stations
-        got = dict(zip(sts, pool.map(lambda s: frame_for(s, with_time=True), sts)))
-        out = {}
-        for s, (img, src, t) in got.items():
-            # masked pixels (RMS mask + sun zone) never count -- a lamp behind
-            # the mask or the sun's glare cannot pull the pod's exposure down
-            st = luma_stats(img, mask_for(s, img, t))
-            if st is not None:
-                st["t"] = t                  # capture epoch -> freshness gate
-            out[s.id] = st
-        return out
+        # the newest COMPLETE frame set (one capture instant for all cameras);
+        # masked pixels (RMS mask + sun zone) never count
+        from podcontrol.frames import meter_set
+        met, slot = meter_set(pod.stations, allow_grab=False)
+        return met
 
     def tick(info, poll):
         print("li=%.2f target=%.2f  lum=%s clip=%s  -> exp=%dus gain=%.2fx  (%s %+.3f)" % (
