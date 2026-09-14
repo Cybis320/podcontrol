@@ -81,6 +81,14 @@ class AEConfig:
                                 # votes like any other; the sun zone radius is
                                 # the operator's lever. False = it follows only.
     history_s = 300.0           # how long we remember our applies (frame latency)
+    wb_lever = True             # below the exposure floor, attenuate the WB gains
+                                # (R,G,B together, balance kept): the gains (1.8-1.9x)
+                                # are applied in 12-bit before demosaic, so clipping
+                                # they cause is recoverable; raw (green) saturation
+                                # is not, and the controller holds instead
+    wb_min_scale = 0.25         # safety floor; the real bottom is 1/max(R,G,B) gains:
+                                # once every channel is below 1.0x nothing gain-induced
+                                # is left to recover, only uniform darkening of raw data
 
     def set_night_line(self, cmd):
         """Derive the ladder caps from RMS's night line so the top rung IS the
@@ -119,6 +127,8 @@ class SharedAE:
         self._applied_li = None
         self.needs = {}                      # cam -> (li_needed, why) from the last set
         self.followers = {}                  # cam -> (li_needed, why) not voting (sun in FOV)
+        self.wb_base = None                  # (R,G,B) multipliers the pod had at takeover
+        self._applied_wb_scale = 1.0
         self.latched = False                 # night: pinned at the night line, silent
         self.sun_alt = None                  # deg, updated by update_sun()
         self.sun_rising = None
@@ -133,6 +143,21 @@ class SharedAE:
     def _max_li(self):
         c = self.cfg
         return self._exp_stops() + math.log2(c.analog_max_x) + math.log2(c.boost_max_x)
+
+    def _min_li(self):
+        """Ladder bottom: 0 = the exposure floor; below it the WB rung, down to
+        the scale that brings the LARGEST WB gain to 1.0x (1/max gain)."""
+        c = self.cfg
+        if c.wb_lever and self.wb_base:
+            return math.log2(max(c.wb_min_scale, 1.0 / max(self.wb_base)))
+        return 0.0
+
+    def wb_scale_for(self, li):
+        return 2.0 ** min(0.0, li) if (self.cfg.wb_lever and self.wb_base) else 1.0
+
+    def wb_scale_at(self, t):
+        li = self.li_at(t)
+        return self.wb_scale_for(self.li if li is None else li)
 
     def _li_to_exp_gain(self, li):
         """light_index (stops above 1 line @ 1x) -> (exp_us on a LINE boundary,
@@ -199,6 +224,14 @@ class SharedAE:
         night (sun below the RMS switch) we latch immediately and touch
         nothing: RMS's night line is in place and is exactly our top rung."""
         self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
+        self.wb_base = None
+        for d in poll.values():
+            wb = d.get("wb") or {}
+            g = wb.get("gains") or []
+            if d.get("online") and wb.get("op") == "manual" and len(g) >= 3 and min(g) > 0:
+                self.wb_base = (float(g[0]), float(g[1]), float(g[-1]))
+                break
+        self._applied_wb_scale = 1.0
         li = self.seed(poll)
         if self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg:
             self.li = self.target = self._max_li()
@@ -283,6 +316,19 @@ class SharedAE:
         if t is not None and t < time.time() - c.history_s:
             return None
         clip, peak, mean = m["clip"], m.get("peak", m["mean"]), m["mean"]
+        at_floor = li_f < 0.1                  # 1 line and analog gain within ~7% of 1x
+        if at_floor and self.cfg.wb_lever and self.wb_base:
+            # at/below the exposure floor only WB attenuation is left: it fixes
+            # gain-induced R/B clipping but not raw (green) saturation
+            rb, rs = m.get("rb_only", clip), m.get("raw_sat", 0.0)
+            if rb > c.clip_limit:
+                return min(li_f, 0.0) - min(c.max_step, max(0.05, rb * c.kp_clip)), "R/B gain clipping (WB rung)"
+            if rs > c.clip_limit:
+                return max(0.0, li_f), "raw-saturated at the floor"
+            if li_f < -1e-6 and peak >= c.peak_ceiling - 20:
+                # on the rung with the clipping just gone: hold (hysteresis),
+                # climbing back would only re-clip the R/B channels
+                return li_f, "at target (WB rung)"
         if clip > c.clip_limit:
             # AIM FOR 0% CLIP: any clipping -> less light. Scales with severity
             # (gentle near zero so it settles, hard when badly blown out).
@@ -320,7 +366,7 @@ class SharedAE:
         self.needs = needs
         self.driver = min(needs, key=lambda k: needs[k][0])
         self.driver_why = needs[self.driver][1]
-        self.target = max(0.0, min(needs[self.driver][0], self._max_li()))
+        self.target = max(self._min_li(), min(needs[self.driver][0], self._max_li()))
         return self.target
 
     def step(self, metering):
@@ -364,7 +410,7 @@ class SharedAE:
         if abs(err) < 1e-3:
             d = 0.0
         self._against = against and d != 0.0
-        self.li = max(0.0, min(self.li + d, self._max_li()))
+        self.li = max(self._min_li(), min(self.li + d, self._max_li()))
         just_latched = self._maybe_latch()
         exp, analog, boost = self._li_to_exp_gain(self.li)
         if just_latched:
@@ -391,7 +437,7 @@ class SharedAE:
                      "driver": self.driver, "driver_why": self.driver_why,
                      "needs": {k: (v[0] - self.li, v[1]) for k, v in
                                list(self.needs.items()) + list(self.followers.items())},
-                     "state": self.state, "ramp": ramp,
+                     "state": self.state, "ramp": ramp, "wb_scale": self.wb_scale_for(self.li),
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
 
@@ -403,11 +449,17 @@ class SharedAE:
         if self.latched or self._applied_li is None:
             return False
         exp, analog, boost = self._li_to_exp_gain(self._applied_li)
+        ws = self._applied_wb_scale
         for d in poll.values():
             if not d.get("online"):
                 continue
             if (d.get("optype") or "").upper() == "AUTO":
                 return True
+            if ws < 0.999 and self.wb_base:
+                g = (d.get("wb") or {}).get("gains") or []
+                if len(g) >= 3 and abs(g[0] - self.wb_base[0] * ws) > 0.05 * max(0.1, self.wb_base[0] * ws):
+                    self._applied_wb_scale = 1.0     # force the WB push on the next apply
+                    return True
             e, a = d.get("exp_us"), d.get("again_x")
             if e is not None and abs(e - exp) > max(30, tol * exp):
                 return True
@@ -426,6 +478,12 @@ class SharedAE:
         # (sensor DGain went 1.0x..3.4x across the pod at the same -a/-e)
         kw = {"again": analog, "dgain": 1024, "ispdgain": boost, "exp_us": exp}
         r = self.pod.manual_all(timeout=timeout, **kw)
+        ws = self.wb_scale_for(self.li)
+        if abs(ws - self._applied_wb_scale) > 0.01 and hasattr(self.pod, "wb_all"):
+            R, G, B = self.wb_base
+            self.pod.wb_all(int(round(R * ws * 256)), int(round(G * ws * 256)), int(round(B * ws * 256)),
+                            timeout=timeout)
+            self._applied_wb_scale = ws
         self.t_apply = time.time()
         self._applied_li = self.li
         self.hist.append((self.t_apply, self.li))
@@ -436,7 +494,12 @@ class SharedAE:
 
     def release(self, timeout=5.0):
         """Hand the cameras back exactly as they were (snapshot), never a bare
-        'auto' (it resets the Goke AE ranges, e.g. sensor DGain max -> 126x)."""
+        'auto' (it resets the Goke AE ranges, e.g. sensor DGain max -> 126x).
+        A WB attenuation in force is undone first."""
+        if self._applied_wb_scale < 0.999 and self.wb_base and hasattr(self.pod, "wb_all"):
+            R, G, B = self.wb_base
+            self.pod.wb_all(int(round(R * 256)), int(round(G * 256)), int(round(B * 256)), timeout=timeout)
+            self._applied_wb_scale = 1.0
         if hasattr(self.pod, "release"):
             return self.pod.release(self.restore, timeout=timeout)
         return self.pod.auto_all(timeout=timeout)

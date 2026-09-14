@@ -241,6 +241,28 @@ Still open: a lease in the camera daemon so a dead podcontrol can never
 strand the pod (today a hard kill leaves it pinned until the next switch), and
 daemon-side metering to drop the ~50 s frame latency.
 
+## The WB rung: a lever below the exposure floor
+
+At the 30 µs / 1x floor the sensor cannot be darkened further, but the WB
+gains (R 1.8x, B 1.9x, G 1.0x) are applied in the 12-bit stage before
+demosaic, so clipping *they* cause is recoverable: scaling R, G, B together
+keeps the balance and lowers the values. Measured 2026-09-14: in the late
+afternoon 88–99% of the clipped pixels had green below saturation with red
+and blue at 255 (gain-induced), while under direct-sun clouds green itself
+was at 254 (raw saturation, unrecoverable).
+
+So the ladder extends below the floor with a **WB rung**: light index < 0 is
+a WB attenuation of 2^li, bottoming where the largest gain reaches 1.0x
+(1/1.914 here, −0.94 stop): below that every channel is under 1x and only
+raw data would be darkened. The metering splits clipped pixels into
+`rb_only` (red/blue at 255 with green below its plateau) and `raw_sat`
+(green at its plateau, 255·√scale when attenuated). On the rung the
+controller goes down for `rb_only`, holds for `raw_sat`, and does not climb
+back until there is clear headroom. The base WB is captured at takeover
+(manual WB only), the attenuated `wb` is pushed with each step, restored on
+release, re-asserted if RMS rewrites WB, and the History records `wb_scale`.
+`wb_lever = False` disables it.
+
 ## Point sources at twilight and night
 
 Checked on real frames (night of 2026-09-12/13 at the night line, and the

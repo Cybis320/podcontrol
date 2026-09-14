@@ -442,7 +442,8 @@ class App(tk.Tk):
             if self.ae_on and self.ae.t_seed:
                 # meter the pod on the newest COMPLETE frame set (one capture
                 # instant for all cameras), not six frames of different ages
-                met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab)
+                met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab,
+                                        wb_scale_fn=self.ae.wb_scale_at)
                 ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
                 self.ae_slot = slot
                 info = self.ae.step(ctl)       # target from the set, one small slew step
@@ -498,8 +499,9 @@ class App(tk.Tk):
                             break
                 ae = ""
                 if info:
-                    ae = "  AE[%s] %s exp=%dus gain=%.2fx (to go %+.2f stop; set %s)" % (
+                    ae = "  AE[%s] %s exp=%dus gain=%.2fx%s (to go %+.2f stop; set %s)" % (
                         info.get("state", "?"), info["reason"], info["exp_us"], info["total_gain_x"],
+                        (" wb\u00d7%.2f" % info["wb_scale"]) if info.get("wb_scale", 1.0) < 0.999 else "",
                         info.get("to_go", 0.0),
                         ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
                 self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
@@ -528,6 +530,9 @@ class App(tk.Tk):
         except Exception:
             return
         self.status.config(text="WB %d %d %d pushed to the pod" % (r, g, b))
+        if self.ae_on and self.ae.wb_base:
+            self.ae.wb_base = (r / 256.0, g / 256.0, b / 256.0)     # new base for the WB rung
+            self.ae._applied_wb_scale = 1.0
         threading.Thread(target=lambda: self.pod.wb_all(r, g, b), daemon=True).start()
 
     def wb_auto(self):

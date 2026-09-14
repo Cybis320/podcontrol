@@ -99,7 +99,7 @@ def make_record(poll, info, metering, sun, ae_on, max_li=None, slot=None):
         rec.update({"li": info.get("li"), "target": info.get("target"), "exp_us": info.get("exp_us"),
                     "gain": info.get("total_gain_x"), "state": info.get("state"),
                     "reason": info.get("reason"), "driver": info.get("driver"),
-                    "why": info.get("driver_why")})
+                    "why": info.get("driver_why"), "wb_scale": info.get("wb_scale", 1.0)})
     return rec
 
 

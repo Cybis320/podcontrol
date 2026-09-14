@@ -10,7 +10,7 @@ and a second RTSP session can reset RMS's own session. So:
 We decide per camera from frame recency, so the app self-adjusts as RMS starts
 or stops. A hard 'allow_grab=False' forces read-only no matter what.
 """
-import os, re, glob, time, calendar, subprocess, cv2
+import os, re, glob, time, math, calendar, subprocess, cv2
 import numpy as np
 
 SCRATCH = "/tmp/podcontrol"
@@ -424,10 +424,10 @@ def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
     return slot, {sid: per[sid][slot] for sid in per}
 
 
-def stats_for_path(station, path, t):
+def stats_for_path(station, path, t, wb_scale=1.0):
     """luma_stats of a saved frame (masked, sun at t), cached by path."""
     key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2), CLIP_MIN_BLOB_PX[0],
-           round(MOON_RADIUS_DEG[0], 2))
+           round(MOON_RADIUS_DEG[0], 2), round(float(wb_scale), 3))
     hit = _STATS_CACHE.get(key)
     if hit is not None:
         return hit
@@ -435,7 +435,7 @@ def stats_for_path(station, path, t):
     st = None
     if img is not None:
         keep, lay = mask_for(station, img, t, layers=True)
-        st = luma_stats(img, keep)
+        st = luma_stats(img, keep, wb_scale=wb_scale)
         if st is not None:
             si = (lay or {}).get("sun_info") or {}
             st["sun_in_fov"] = bool(si.get("in_fov"))
@@ -449,15 +449,23 @@ def F_SUN_RADIUS():
     return SUN_RADIUS_DEG[0]
 
 
-def meter_set(stations, allow_grab=False):
+def meter_set(stations, allow_grab=False, wb_scale_fn=None):
     """Pod metering on the newest complete frame set: ({station_id: stats+t},
     slot_epoch). Stations that save no frames (RMS idle) are metered from a
-    one-shot grab (t = now) only if allow_grab; otherwise skipped."""
+    one-shot grab (t = now) only if allow_grab; otherwise skipped.
+    wb_scale_fn(slot_epoch) -> the WB attenuation in effect when the set was
+    captured (shared AE's WB rung), for channel-aware clipping."""
     slot, paths = newest_complete_set(stations)
+    ws = 1.0
+    if slot and wb_scale_fn:
+        try:
+            ws = float(wb_scale_fn(slot))
+        except Exception:
+            ws = 1.0
     out = {}
     for st in stations:
         if st.id in paths:
-            s = stats_for_path(st, paths[st.id], slot)
+            s = stats_for_path(st, paths[st.id], slot, ws)
             if s is not None:
                 out[st.id] = dict(s, t=slot, path=paths[st.id])
         elif allow_grab and not rms_active(st):
@@ -513,7 +521,7 @@ def set_clip_min_blob(px):
     CLIP_MIN_BLOB_PX[0] = max(0, int(px))
 
 
-def luma_stats(bgr, mask=None, min_blob_px=None):
+def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
     """Metering from a frame: mean luma (0-255), clipped-pixel fraction (0-1)
     and the 99.9th-percentile peak -- over the UNMASKED pixels only when a mask
     (True = count) of the same size is given. The universal exposure signal:
@@ -540,8 +548,24 @@ def luma_stats(bgr, mask=None, min_blob_px=None):
         big = sum(int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= mb)
         clip = float(big) / n_keep
     v = y if keep is None else y[keep]
-    return {"mean": float(v.mean()), "clip": clip, "clip_raw": clip_raw,
-            "peak": float(np.percentile(v, 99.9)), "masked": masked}
+    out = {"mean": float(v.mean()), "clip": clip, "clip_raw": clip_raw,
+           "peak": float(np.percentile(v, 99.9)), "masked": masked,
+           "raw_sat": 0.0, "rb_only": 0.0}
+    if bgr.ndim == 3:
+        # Which stage clipped? Green carries WB gain ~1.0, so green at its
+        # plateau means the SENSOR saturated (unrecoverable downstream); red
+        # or blue at 255 while green is below means the WB gain (1.8-1.9x,
+        # applied in 12-bit before demosaic) clipped it -- recoverable by
+        # attenuating the WB gains. With a WB attenuation wb_scale < 1 the
+        # green plateau of a raw-saturated pixel sits at 255*sqrt(wb_scale).
+        g_level = max(60.0, 255.0 * math.sqrt(min(1.0, max(1e-3, float(wb_scale)))) - 4.0)
+        G = bgr[:, :, 1]; R = bgr[:, :, 2]; B = bgr[:, :, 0]
+        if keep is not None:
+            G, R, B = G[keep], R[keep], B[keep]
+        gs = G >= g_level
+        out["raw_sat"] = float(gs.mean())
+        out["rb_only"] = float((((R >= 250) | (B >= 250)) & ~gs).mean())
+    return out
 
 
 if __name__ == "__main__":
