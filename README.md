@@ -265,11 +265,13 @@ Every cycle is logged to `~/.local/share/podcontrol/history.jsonl`
 (`$PODCONTROL_HISTORY` overrides; the last 12 h are kept and reloaded on
 start): shared-AE state (light index, target, exposure, gain, state, driver),
 pod metering (mean, peak, clip), sun altitude, and every camera's own
-exposure/gain. The **History** button opens a window with three strips over
-the last 12 h: the pod light index (green) with the cameras' own band (blue),
-the night-line top rung, latched/night and AE-on shading and the sun altitude;
-pod mean and 99.9% peak luma against the 234 ceiling; clipped fraction with a
-tick in the driving camera's colour. Plain Tk canvas, no extra dependencies.
+exposure/gain. The **History** button opens a window with four strips over
+the last 12 h: exposure time per camera (log scale, 30 µs to 40 ms; green =
+the pod while Shared AE drives) with night/latched/AE-on shading and the sun
+altitude on the right axis; total gain per camera (log, analog × sensor-digital
+× ISP-digital) with ISO = 100 × gain on the right axis; pod mean and 99.9%
+peak luma against the 234 ceiling; clipped fraction with a tick in the driving
+camera's colour. Plain Tk canvas, no extra dependencies.
 
 ## Footprint
 

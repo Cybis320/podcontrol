@@ -9,13 +9,14 @@ each camera's own exposure/gain (so the chart is meaningful with Shared AE
 off as well: the per-camera band shows how far apart the cameras' own AEs
 sit).
 
-draw_history() renders three strips on a tk.Canvas with no extra
+draw_history() renders four strips on a tk.Canvas with no extra
 dependencies:
-  1. light index (stops above 1 line @ 1x): the pod (when driven) and the
-     per-camera min/max band, the night-line top rung, latched/night shading,
-     plus the sun altitude on a second axis;
-  2. pod mean and 99.9th-percentile peak luma against the 234 ceiling;
-  3. clipped fraction (%), with a tick in the driving camera's colour.
+  1. exposure time per camera (log, 30 us .. 40 ms), the pod line when
+     Shared AE drives, night/latched/AE-on shading, sun altitude (right axis);
+  2. total gain per camera (log, 1x .. 64x; = analog x sensor-digital x
+     ISP-digital) with ISO = 100 x gain on the right axis, and the pod line;
+  3. pod mean and 99.9th-percentile peak luma against the 234 ceiling;
+  4. clipped fraction (%), with a tick in the driving camera's colour.
 """
 import os, json, math, time
 from collections import deque
@@ -112,8 +113,8 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
     recs = [r for r in records if r.get("t", 0) >= t0]
     L, R, T, B = 58, 58, 16, 30
     gap = 14
-    ph = (H - T - B - 2 * gap) / 3.0
-    panels = [(T + i * (ph + gap), T + i * (ph + gap) + ph) for i in range(3)]
+    ph = (H - T - B - 3 * gap) / 4.0
+    panels = [(T + i * (ph + gap), T + i * (ph + gap) + ph) for i in range(4)]
     fg, dim, grid = "#c8bfa8", "#726650", "#2a2418"
     cams = cam_order or sorted({sid for r in recs for sid in (r.get("cams") or {})})
     colors = {sid: CAM_COLORS[i % len(CAM_COLORS)] for i, sid in enumerate(cams)}
@@ -152,42 +153,58 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
     shade(lambda r: r.get("state") == "night", "#1a1430")
     shade(lambda r: r.get("ae_on"), "#10200f")
 
-    # ---- panel 1: light index + sun altitude ----
+    # ---- panel 1: exposure time (log) + sun altitude ----
     y0, y1 = panels[0]
-    max_li = max([r.get("max_li") or 0 for r in recs] + [16.0])
-    def Y1(li): return y1 - (li / max_li) * (y1 - y0)
-    for v in range(0, int(max_li) + 1, 4):
-        canvas.create_line(L, Y1(v), W - R, Y1(v), fill=grid); canvas.create_text(L - 6, Y1(v), text="%d" % v, fill=dim, anchor="e", font=("JetBrains Mono", 8))
-    canvas.create_text(L - 6, y0 + 2, text="stops", fill=dim, anchor="ne", font=("JetBrains Mono", 8))
-    top = [r.get("max_li") for r in recs if r.get("max_li")]
-    if top:
-        canvas.create_line(L, Y1(top[-1]), W - R, Y1(top[-1]), fill="#4a3f2a", dash=(3, 3))
-        canvas.create_text(W - R - 4, Y1(top[-1]) - 6, text="night line", fill="#7a6a4a", anchor="e", font=("JetBrains Mono", 8))
-    # per-camera band (own exposure)
-    band_lo = [(r["t"], min(v["li"] for v in r["cams"].values() if v.get("li") is not None)) for r in recs if r.get("cams") and any(v.get("li") is not None for v in r["cams"].values())]
-    band_hi = [(r["t"], max(v["li"] for v in r["cams"].values() if v.get("li") is not None)) for r in recs if r.get("cams") and any(v.get("li") is not None for v in r["cams"].values())]
-    if len(band_lo) > 1:
-        pts = [(X(t), Y1(v)) for t, v in band_lo] + [(X(t), Y1(v)) for t, v in reversed(band_hi)]
-        canvas.create_polygon(*[c for p in pts for c in p], fill="#2c3a4a", outline="")
-    # pod li when driven
+    def Ye(us): return y1 - (math.log2(max(30.0, us) / 30.0) / math.log2(40000.0 / 30.0)) * (y1 - y0)
+    for us, lab in ((30, "30us"), (100, "100"), (300, "300"), (1000, "1ms"), (3000, "3ms"), (10000, "10ms"), (40000, "40ms")):
+        canvas.create_line(L, Ye(us), W - R, Ye(us), fill=grid)
+        canvas.create_text(L - 6, Ye(us), text=lab, fill=dim, anchor="e", font=("JetBrains Mono", 8))
+    for sid in cams:
+        pts = [(X(r["t"]), Ye(r["cams"][sid]["exp_us"])) for r in recs
+               if r.get("cams") and r["cams"].get(sid) and r["cams"][sid].get("exp_us")]
+        if len(pts) > 1:
+            canvas.create_line(*[c for p in pts for c in p], fill=colors[sid], width=1)
     seg = []
     for r in recs:
-        if r.get("ae_on") and r.get("li") is not None:
-            seg.append((X(r["t"]), Y1(r["li"])))
+        if r.get("ae_on") and r.get("exp_us"):
+            seg.append((X(r["t"]), Ye(r["exp_us"])))
         else:
             if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill="#7fc776", width=2)
             seg = []
     if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill="#7fc776", width=2)
-    # sun altitude (right axis, -30..90)
     def Ys(a): return y1 - ((a + 30.0) / 120.0) * (y1 - y0)
     for a in (-9, 0, 30, 60):
-        canvas.create_text(W - R + 6, Ys(a), text="%d°" % a, fill="#5a6a7a", anchor="w", font=("JetBrains Mono", 8))
+        canvas.create_text(W - R + 6, Ys(a), text="%d\u00b0" % a, fill="#5a6a7a", anchor="w", font=("JetBrains Mono", 8))
     sp = [(X(r["t"]), Ys(r["sun_alt"])) for r in recs if r.get("sun_alt") is not None]
     if len(sp) > 1: canvas.create_line(*[c for p in sp for c in p], fill="#e8c060", dash=(2, 3))
-    canvas.create_text(L + 6, y0 + 2, text="pod light index (green) · cameras' own (blue band) · sun altitude (dashed)", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
+    canvas.create_text(L + 6, y0 + 2, text="exposure time (per camera; green = pod when Shared AE drives) \u00b7 sun altitude (dashed, right)", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
+
+    # ---- panel 1b: total gain (log) / ISO ----
+    y0, y1 = panels[1]
+    gmax = 64.0
+    def Yg(g): return y1 - (math.log2(max(1.0, g)) / math.log2(gmax)) * (y1 - y0)
+    for g in (1, 2, 4, 8, 16, 32, 64):
+        canvas.create_line(L, Yg(g), W - R, Yg(g), fill=grid)
+        canvas.create_text(L - 6, Yg(g), text="%dx" % g, fill=dim, anchor="e", font=("JetBrains Mono", 8))
+        canvas.create_text(W - R + 6, Yg(g), text="ISO %d" % (100 * g), fill="#5a6a7a", anchor="w", font=("JetBrains Mono", 8))
+    def cam_gain(v):
+        return (v.get("again_x") or 1.0) * (v.get("dgain_x") or 1.0) * (v.get("ispdgain_x") or 1.0)
+    for sid in cams:
+        pts = [(X(r["t"]), Yg(cam_gain(r["cams"][sid]))) for r in recs if r.get("cams") and r["cams"].get(sid)]
+        if len(pts) > 1:
+            canvas.create_line(*[c for p in pts for c in p], fill=colors[sid], width=1)
+    seg = []
+    for r in recs:
+        if r.get("ae_on") and r.get("gain"):
+            seg.append((X(r["t"]), Yg(r["gain"])))
+        else:
+            if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill="#7fc776", width=2)
+            seg = []
+    if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill="#7fc776", width=2)
+    canvas.create_text(L + 6, y0 + 2, text="total gain = analog \u00d7 sensor-digital \u00d7 ISP-digital (per camera; green = pod) \u00b7 ISO = 100 \u00d7 gain", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
 
     # ---- panel 2: luma ----
-    y0, y1 = panels[1]
+    y0, y1 = panels[2]
     def Y2(v): return y1 - (v / 255.0) * (y1 - y0)
     for v in (0, 64, 128, 192, 255):
         canvas.create_line(L, Y2(v), W - R, Y2(v), fill=grid); canvas.create_text(L - 6, Y2(v), text="%d" % v, fill=dim, anchor="e", font=("JetBrains Mono", 8))
@@ -198,7 +215,7 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
     canvas.create_text(L + 6, y0 + 2, text="pod mean luma (white) · 99.9% peak (orange) · 234 ceiling", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
 
     # ---- panel 3: clip % + driver ----
-    y0, y1 = panels[2]
+    y0, y1 = panels[3]
     cmax = max([r.get("clip") or 0 for r in recs] + [0.005])
     cmax = min(5.0, max(0.05, cmax * 100 * 1.2))
     def Y3(pct): return y1 - min(1.0, pct / cmax) * (y1 - y0)
