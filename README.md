@@ -207,13 +207,14 @@ boundary on purpose. podcontrol never touches WB, CCM, saturation or IR-cut;
 it owns **exposure only, and only while the sun is above the switch**:
 
 - **Day**: Shared AE slews the pod as described above.
-- **Dusk**: the ladder's top rung is made byte-identical to RMS's night line
-  (from camera_settings). Because the twilight sky needs far less light than
-  that line, the AE would not reach it by −9° on its own and RMS's switch would
-  be a multi-stop jump; so over the last `dusk_ramp_deg` (6°, ~30 min) the pod
-  is ramped up to the night line at the slew rate and **latches** exactly at the
-  switch. RMS then writes the same values: no exposure step, only the intended
-  colour→mono cut.
+- **Dusk**: the AE keeps driving through RMS's −9° switch (which is still
+  twilight): RMS writes its night line there, podcontrol notices the changed
+  values and re-pins within a cycle, so only the colour→mono cut happens at the
+  boundary. The ladder's top rung is made byte-identical to RMS's night line
+  (from camera_settings) and the pod **latches** there when the AE reaches it
+  or when the sun passes `latch_deg` (−12°), whichever comes first. With
+  `dusk_ramp_deg` = 0 (default) that latch is a step of whatever gap remains;
+  set it to e.g. 3° to ramp the last degrees so the latch is seamless.
 - **Night**: latched and silent. Nothing podcontrol sees (moon, lit clouds,
   headlights) can move the pod; RMS owns it.
 - **Dawn**: unlatch once the sun is rising above −12° and a fresh set asks for

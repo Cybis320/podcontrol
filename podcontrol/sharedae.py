@@ -59,12 +59,13 @@ class AEConfig:
     period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
     settle_s = 1.5              # an apply is in effect this long after it was sent
     slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
-    night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n)
+    night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n);
+                                # RMS writes its night line here -- we re-pin and keep driving
+    latch_deg = -12.0           # dusk: latch at the night line here or when the ladder reaches
+                                # the top rung, whichever comes first (operator: -9 is still twilight)
     dawn_unlatch_deg = -12.0    # may unlatch once the sun is rising above this
-    dusk_ramp_deg = 6.0         # over the last N deg before the night switch, force the
-                                # pod up to the night line so the hand-over has no jump
-                                # (the twilight sky needs far less light than the night
-                                # line; 0 = no ramp, i.e. RMS's hard cut at the switch)
+    dusk_ramp_deg = 0.0         # >0: over the last N deg before latch_deg force the pod up to the
+                                # night line so the latch has no jump; 0 = pure AE until the latch
     night_line = None           # RMS night exposure line, e.g. "manual -a 22924 -i 2048 -e 39941";
                                 # the ladder's top rung is made identical to it
     sun_cam_votes = True        # EVERY unmasked pixel on EVERY camera counts
@@ -196,7 +197,7 @@ class SharedAE:
         self.sun_alt, self.sun_rising = alt_deg, bool(rising)
         c = self.cfg
         if self.latched:
-            self.state = "night" if alt_deg < c.night_switch_deg else "dawn"
+            self.state = "night" if alt_deg < c.latch_deg else "dawn"
         elif alt_deg < 0:
             self.state = "dawn" if rising else "dusk"
         else:
@@ -209,7 +210,7 @@ class SharedAE:
         c = self.cfg
         if c.dusk_ramp_deg <= 0 or self.sun_alt is None or self.sun_rising:
             return None
-        start = c.night_switch_deg + c.dusk_ramp_deg
+        start = c.latch_deg + c.dusk_ramp_deg
         if self.sun_alt > start:
             self._ramp_from = None
             return None
@@ -225,8 +226,8 @@ class SharedAE:
         if self.latched or self.sun_alt is None:
             return False
         at_top = self.li >= self._max_li() - 1e-6
-        rms_night = self.sun_alt < c.night_switch_deg and not self.sun_rising
-        if at_top or rms_night:
+        deep = self.sun_alt < c.latch_deg and not self.sun_rising
+        if at_top or deep:
             self.li = self.target = self._max_li()
             self.latched = True
             self.state = "night"
@@ -366,14 +367,25 @@ class SharedAE:
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
 
-    def repin_needed(self, poll):
-        """True if RMS (or anything) put a camera back in AUTO while we are
-        driving and not latched -- e.g. RMS's dawn day-switch. The caller
-        re-applies so at most one frame sees the camera's own AE."""
+    def repin_needed(self, poll, tol=0.06):
+        """True if a camera no longer holds what we last applied while we are
+        driving (not latched): RMS's -9 deg night write (MANUAL, night line),
+        its dawn `auto`, a reboot... The caller re-applies so at most one frame
+        deviates. Compares op type AND live exposure/gain values."""
         if self.latched or self._applied_li is None:
             return False
-        return any(d.get("online") and (d.get("optype") or "").upper() == "AUTO"
-                   for d in poll.values())
+        exp, analog, boost = self._li_to_exp_gain(self._applied_li)
+        for d in poll.values():
+            if not d.get("online"):
+                continue
+            if (d.get("optype") or "").upper() == "AUTO":
+                return True
+            e, a = d.get("exp_us"), d.get("again_x")
+            if e is not None and abs(e - exp) > max(30, tol * exp):
+                return True
+            if a is not None and abs(a - analog) > tol * max(analog, 1.0):
+                return True
+        return False
 
     def apply(self, platform="imx291", timeout=5.0):
         """Push the last-computed exp+gain to all cameras (platform-aware split)."""
