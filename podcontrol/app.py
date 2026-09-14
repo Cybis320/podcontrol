@@ -34,6 +34,7 @@ from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, hig
                                highlight_maps_cached, stats_for_path)
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 from podcontrol.history import HistoryLog, make_record, draw_history
+from podcontrol import settings as SETTINGS
 
 COLS = 3
 BG, PANEL = "#0f0d08", "#14110c"
@@ -262,6 +263,12 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.geometry("1400x820")
         self.minsize(720, 460)
+        try:
+            g = SETTINGS.load().get("geometry")
+            if isinstance(g, str) and "x" in g:
+                self.geometry(g)
+        except Exception:
+            pass
         self.stations = get_pod()
         self.by_id = {s.id: s for s in self.stations}
         self.pod = PodController(self.stations)
@@ -282,15 +289,24 @@ class App(tk.Tk):
         self.selected = None      # station id with an active region selection
         self.calibrating = False
         self.q = queue.Queue()
-        self.interval = tk.DoubleVar(value=5.0)
-        self.overlay = tk.BooleanVar(value=True)
-        self.sun_radius = tk.DoubleVar(value=F.SUN_RADIUS_DEG[0])
-        self.slew = tk.DoubleVar(value=self.ae.cfg.slew)
-        self.sun_votes = tk.BooleanVar(value=self.ae.cfg.sun_cam_votes)
-        self.flare_w = tk.DoubleVar(value=F.FLARE_HALF_WIDTH_DEG[0])
-        self.min_blob = tk.IntVar(value=F.CLIP_MIN_BLOB_PX[0])
-        self.moon_radius = tk.DoubleVar(value=F.MOON_RADIUS_DEG[0])
-        self.clip_pct = tk.DoubleVar(value=100.0 * self.ae.cfg.clip_limit)
+        saved = SETTINGS.load()
+        def sv(key, default):
+            v = saved.get(key, default)
+            return v if isinstance(v, (int, float, bool)) else default
+        self.interval = tk.DoubleVar(value=sv("refresh_s", 5.0))
+        self.overlay = tk.BooleanVar(value=sv("overlay", True))
+        self.sun_radius = tk.DoubleVar(value=sv("sun_radius_deg", F.SUN_RADIUS_DEG[0]))
+        self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
+        self.sun_votes = tk.BooleanVar(value=sv("sun_cam_votes", self.ae.cfg.sun_cam_votes))
+        self.flare_w = tk.DoubleVar(value=sv("flare_radius_deg", F.FLARE_HALF_WIDTH_DEG[0]))
+        self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
+        self.moon_radius = tk.DoubleVar(value=sv("moon_radius_deg", F.MOON_RADIUS_DEG[0]))
+        self.clip_pct = tk.DoubleVar(value=sv("clip_limit_pct", 100.0 * self.ae.cfg.clip_limit))
+        self._saved = saved
+        self._save_job = None
+        for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.sun_votes,
+                    self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
+            var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -364,6 +380,11 @@ class App(tk.Tk):
         if self.dry:
             self.after(800, self.toggle_ae)
             self.after(1200, self.toggle_history)
+        elif self._saved.get("ae_on"):
+            # armed at last exit -> resume driving after the first poll
+            self.after(1500, self.toggle_ae)
+        if self._saved.get("history_open") and not self.dry:
+            self.after(1800, self.toggle_history)
 
     def _updater(self):
         while self.running:
@@ -470,6 +491,30 @@ class App(tk.Tk):
             self._draw_history()
         self.after(200, self._drain)
 
+    def _settings_dict(self):
+        d = {"refresh_s": float(self.interval.get()), "overlay": bool(self.overlay.get()),
+             "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
+             "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
+             "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
+             "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
+             "history_open": bool(self.hist_win and self.hist_win.winfo_exists()),
+             "geometry": self.geometry()}
+        if self.hist_win and self.hist_win.winfo_exists():
+            d["history_geometry"] = self.hist_win.geometry()
+        return d
+
+    def _schedule_save(self):
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(800, self._save_settings)
+
+    def _save_settings(self):
+        self._save_job = None
+        try:
+            SETTINGS.save(self._settings_dict())
+        except Exception:
+            pass
+
     def toggle_history(self):
         if self.hist_win and self.hist_win.winfo_exists():
             self.hist_win.destroy(); self.hist_win = None; self.hist_canvas = None
@@ -477,6 +522,9 @@ class App(tk.Tk):
         w = tk.Toplevel(self); w.title("Pod Control \u2014 last 12 h"); w.configure(bg=BG)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w.geometry("%dx%d" % (min(1200, sw - 40), min(420, int(sh * 0.4))))    # modest; resizable
+        hg = self._saved.get("history_geometry")
+        if isinstance(hg, str) and "x" in hg:
+            w.geometry(hg)
         w.minsize(600, 320)
         c = tk.Canvas(w, bg=BG, highlightthickness=0); c.pack(fill="both", expand=True, padx=6, pady=6)
         self.hist_win, self.hist_canvas = w, c
@@ -502,6 +550,7 @@ class App(tk.Tk):
 
     def toggle_ae(self):
         self.ae_on = not self.ae_on
+        self._schedule_save()
         self.ae_btn.config(text="Shared AE: %s" % ("ON" if self.ae_on else "OFF"),
                            fg=("#7fc776" if self.ae_on else "#000"))
         if self.ae_on:
@@ -517,6 +566,7 @@ class App(tk.Tk):
 
     def auto_all(self):
         self.ae_on = False
+        self._schedule_save()
         self.ae_btn.config(text="Shared AE: OFF", fg="#000")
         threading.Thread(target=lambda: self.pod.auto_all(), daemon=True).start()
 
@@ -565,6 +615,10 @@ class App(tk.Tk):
 
     def _close(self):
         self.running = False
+        try:
+            SETTINGS.save(self._settings_dict())
+        except Exception:
+            pass
         if self.ae_on:
             try: self.ae.release()
             except Exception: pass

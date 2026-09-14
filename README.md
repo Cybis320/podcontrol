@@ -259,6 +259,16 @@ A1 lamp's verdict from "darker" into "headroom" without touching the mask; it
 also stops headlights or a planet from dipping the pod. The peak metric is
 unaffected (a lamp is far below 0.1% of the frame).
 
+## Settings
+
+Toolbar values (refresh, slew, clip threshold, point-source tolerance,
+overlay, sun / moon / flare radii, sun-cam-votes), the Shared AE on/off state
+and the window geometries are saved to `~/.config/podcontrol/settings.json`
+(`$PODCONTROL_SETTINGS` overrides) on every change and on close, and restored
+at start. If Shared AE was on at the last exit the pod is taken over again
+after the first poll, so an armed pod survives a restart; the History window
+reopens if it was open.
+
 ## History
 
 Every cycle is logged to `~/.local/share/podcontrol/history.jsonl`
