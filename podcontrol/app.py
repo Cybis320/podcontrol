@@ -16,7 +16,7 @@ if __name__ == "__main__" and not __package__:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-import time, threading, queue, os
+import time, threading, queue, os, signal
 import tkinter as tk
 import cv2
 import numpy as np
@@ -25,12 +25,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
+from podcontrol import frames as F
 from podcontrol.frames import frame_for, fresh_frame, luma_stats, mask_for
 from podcontrol.sharedae import SharedAE, _pod_platform
 
 TILE_W, TILE_H = 448, 252
 COLS = 3
 SRC_COLOR = {"rms": "#7fc776", "stale": "#f0a830", "grab": "#5aa9e6", "none": "#726650"}
+# translucent overlay tints (RGB) for the excluded zones
+TINT_STATIC, TINT_SUN = (220, 60, 60), (255, 190, 40)
+OVERLAY_ALPHA = 0.45
 
 
 class Tile(tk.Frame):
@@ -89,9 +93,10 @@ class Tile(tk.Frame):
         return (int(min(x0, x1) * sx), int(min(y0, y1) * sy),
                 int(max(x0, x1) * sx), int(max(y0, y1) * sy))
 
-    def render(self, img, source, tel, luma, mask=None):
-        # image (Canvas: keep image + selection rectangle); masked (excluded)
-        # pixels are dimmed so what the metering ignores is visible
+    def render(self, img, source, tel, luma, layers=None, overlay=True):
+        # image (Canvas: keep image + selection rectangle); with overlay on,
+        # excluded zones are tinted (red = RMS mask, orange = sun zone) so
+        # what the metering ignores is visible
         if img is None:
             if self._img_id:
                 self.canvas.delete(self._img_id); self._img_id = None
@@ -105,10 +110,19 @@ class Tile(tk.Frame):
             self.frame_wh = (img.shape[1], img.shape[0])
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             small = cv2.resize(rgb, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
-            if mask is not None:
-                m = cv2.resize(mask.astype(np.uint8), (TILE_W, TILE_H),
-                               interpolation=cv2.INTER_NEAREST).astype(bool)
-                small[~m] = (small[~m] * 0.35).astype(np.uint8)
+            if overlay and layers:
+                for key, tint in (("static", TINT_STATIC), ("sun", TINT_SUN)):
+                    ex = layers.get(key)
+                    if ex is None:
+                        continue
+                    m = cv2.resize(ex.astype(np.uint8), (TILE_W, TILE_H),
+                                   interpolation=cv2.INTER_NEAREST).astype(bool)
+                    small[m] = ((1 - OVERLAY_ALPHA) * small[m] + OVERLAY_ALPHA * np.array(tint)).astype(np.uint8)
+                si = layers.get("sun_info")
+                if si and si.get("in_fov") and si.get("x") is not None:
+                    fw, fh = self.frame_wh
+                    cx, cy = int(si["x"] * TILE_W / fw), int(si["y"] * TILE_H / fh)
+                    cv2.circle(small, (cx, cy), 6, (255, 255, 255), 1)
             im = Image.fromarray(small)
             self._photo = ImageTk.PhotoImage(im)
             if self._img_id:
@@ -138,6 +152,9 @@ class Tile(tk.Frame):
         if qp and qp.get("maxqp") is not None:
             line2 += "qp %s" % qp["maxqp"]
         masked = (" mask%.0f%%" % (100 * luma["masked"])) if luma and luma.get("masked") else ""
+        si = (layers or {}).get("sun_info")
+        if si and si.get("alt") is not None and si["alt"] > -si["radius_deg"]:
+            masked += "  sun %.0f\u00b0%s" % (si["alt"], " IN FOV" if si.get("in_fov") else "")
         self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\nAGain %.2fx  ISO %s  %s\n%s" % (
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
             (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
@@ -162,6 +179,8 @@ class App(tk.Tk):
         self.calibrating = False
         self.q = queue.Queue()
         self.interval = tk.DoubleVar(value=5.0)
+        self.overlay = tk.BooleanVar(value=True)
+        self.sun_radius = tk.DoubleVar(value=F.SUN_RADIUS_DEG[0])
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -181,6 +200,11 @@ class App(tk.Tk):
         tk.Label(bar, text="  refresh", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         tk.Spinbox(bar, from_=2, to=60, width=4, textvariable=self.interval).pack(side="left")
         tk.Label(bar, text="s", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
+        tk.Checkbutton(bar, text="mask overlay", variable=self.overlay, fg="#c8bfa8", bg="#0f0d08",
+                       selectcolor="#0f0d08", activebackground="#0f0d08").pack(side="left", padx=(12, 0))
+        tk.Label(bar, text="sun r", fg="#c8bfa8", bg="#0f0d08").pack(side="left", padx=(8, 0))
+        tk.Spinbox(bar, from_=0, to=45, increment=1, width=4, textvariable=self.sun_radius).pack(side="left")
+        tk.Label(bar, text="\u00b0", fg="#c8bfa8", bg="#0f0d08").pack(side="left")
         self.status = tk.Label(bar, text="starting…", fg="#a4967c", bg="#0f0d08",
                                font=("JetBrains Mono", 9), anchor="e")
         self.status.pack(side="right")
@@ -192,27 +216,38 @@ class App(tk.Tk):
     def _updater(self):
         while self.running:
             t0 = time.time()
+            try:
+                F.set_sun_radius(self.sun_radius.get())
+            except Exception:
+                pass
             poll = self.pod.poll_all(timeout=4)
-            futs = {self._pool.submit(frame_for, s, self.allow_grab): s.id for s in self.stations}
-            frames, lumas = {}, {}
+            futs = {self._pool.submit(frame_for, s, self.allow_grab, True): s.id
+                    for s in self.stations}
+            frames, lumas, layers = {}, {}, {}
             for f in futs:
                 sid = futs[f]
                 try:
-                    img, src = f.result(timeout=18)
+                    img, src, tcap = f.result(timeout=18)
                 except Exception:
-                    img, src = None, "none"
+                    img, src, tcap = None, "none", None
                 frames[sid] = (img, src)
-                lumas[sid] = luma_stats(img, mask_for(self.by_id[sid], img))
+                keep, layers[sid] = mask_for(self.by_id[sid], img, tcap, layers=True)
+                lumas[sid] = luma_stats(img, keep)
+                if lumas[sid] is not None:
+                    lumas[sid]["t"] = tcap
             if self.ae_on:
                 ctl = {sid: lumas[sid] for sid in lumas if poll.get(sid, {}).get("online")}
-                info = self.ae.step(ctl)
+                ctl = self.ae.fresh(ctl)       # only frames newer than the last change
+                info = self.ae.step(ctl) if ctl else None
                 if info:
                     try:
                         self.ae.apply(platform=_pod_platform(poll))
                     except Exception:
                         pass
                     self.ae_info = info
-            self.q.put((frames, poll, lumas, time.time() - t0))
+                elif self.ae_info:
+                    self.ae_info = dict(self.ae_info, reason="waiting for fresh frames")
+            self.q.put((frames, poll, lumas, layers, time.time() - t0))
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
                     return
@@ -221,12 +256,12 @@ class App(tk.Tk):
     def _drain(self):
         try:
             while True:
-                frames, poll, lumas, dt = self.q.get_nowait()
+                frames, poll, lumas, layers, dt = self.q.get_nowait()
                 brights = []
                 for sid, t in self.tiles.items():
                     img, src = frames.get(sid, (None, "none"))
                     t.render(img, src, poll.get(sid), lumas.get(sid),
-                             mask_for(self.by_id[sid], img))
+                             layers.get(sid), self.overlay.get())
                     b = (poll.get(sid) or {}).get("avelum")
                     if b is None and lumas.get(sid):
                         b = lumas[sid]["mean"]
@@ -249,7 +284,13 @@ class App(tk.Tk):
         self.ae_on = not self.ae_on
         self.ae_btn.config(text="Shared AE: %s" % ("ON" if self.ae_on else "OFF"),
                            fg=("#7fc776" if self.ae_on else "#000"))
-        if not self.ae_on:
+        if self.ae_on:
+            # start from the cameras' current (darkest) exposure, not a fixed
+            # mid-ladder guess that blows out a daytime scene
+            self.ae_info = None
+            threading.Thread(target=lambda: self.ae.seed(self.pod.poll_all(timeout=4)),
+                             daemon=True).start()
+        else:
             threading.Thread(target=lambda: self.ae.release(), daemon=True).start()
 
     def auto_all(self):
@@ -326,7 +367,13 @@ def main():
     # stash CLI ip spec for get_pod via env
     if args.cameras:
         os.environ["PODCONTROL_CAMERAS"] = args.cameras
-    App(allow_grab=not args.no_grab).mainloop()
+    app = App(allow_grab=not args.no_grab)
+    # a SIGTERM/SIGINT must release the cameras to auto like a window close
+    # does; otherwise a killed app leaves the pod pinned at whatever exposure
+    # the shared AE last set
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: app.after(0, app._close))
+    app.mainloop()
 
 
 if __name__ == "__main__":

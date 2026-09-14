@@ -70,16 +70,28 @@ def rms_process_active(station):
     return False
 
 
-def _newest(paths):
-    best, bt = None, -1.0
+def _newest(paths, n=1):
+    """Newest path (n=1) or the n newest, newest first."""
+    ts = []
     for f in paths:
         try:
-            t = os.path.getmtime(f)
+            ts.append((os.path.getmtime(f), f))
         except OSError:
             continue
-        if t > bt:
-            best, bt = f, t
-    return best
+    ts.sort(reverse=True)
+    if n == 1:
+        return ts[0][1] if ts else None
+    return [f for _, f in ts[:n]]
+
+
+def _imread_ok(path):
+    """cv2.imread that treats a half-written file (RMS is still flushing the
+    block) as missing instead of raising in cvtColor later."""
+    try:
+        img = cv2.imread(path)
+    except Exception:
+        return None
+    return img if img is not None and img.size else None
 
 
 def latest_rms_path(station):
@@ -98,6 +110,24 @@ def latest_rms_path(station):
         for ext in FRAME_EXTS:
             cands += glob.glob(os.path.join(root, "**", station.id + "_" + ext), recursive=True)
     return _newest(cands)
+
+
+def latest_rms_frame(station):
+    """(bgr, path) of the newest READABLE saved frame; falls back to the
+    previous file if the newest is still being written."""
+    if not station.data_dir or not os.path.isdir(station.frames_dir):
+        return None, None
+    root = station.frames_dir
+    days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
+    cands = []
+    for d in days:
+        for ext in FRAME_EXTS:
+            cands += glob.glob(os.path.join(d, "**", station.id + "_" + ext), recursive=True)
+    for p in _newest(cands, n=3) if cands else []:
+        img = _imread_ok(p)
+        if img is not None:
+            return img, p
+    return None, None
 
 
 def rms_frame_age(station):
@@ -131,8 +161,9 @@ def rms_active(station):
     return rms_process_active(station)
 
 
-def frame_for(station, allow_grab=True):
-    """(bgr_or_None, source) where source in {'rms','grab','stale','none'}.
+def frame_for(station, allow_grab=True, with_time=False):
+    """(bgr_or_None, source) where source in {'rms','grab','stale','none'};
+    with_time=True appends the frame's CAPTURE epoch (None if unknown).
 
     'stale' = RMS is active but its latest frame is older than we'd like (or
     it saves no frames at all); we return what we have and DO NOT grab
@@ -140,12 +171,18 @@ def frame_for(station, allow_grab=True):
     """
     age = rms_frame_age(station)
     if rms_active(station):
-        p = latest_rms_path(station)
-        img = cv2.imread(p) if p else None
-        return img, ("rms" if (age is not None and age < RMS_FRESH_WINDOW) else "stale")
+        img, p = latest_rms_frame(station)
+        src = "rms" if (age is not None and age < RMS_FRESH_WINDOW) else "stale"
+        t = None
+        if p:
+            t = frame_capture_time(p)
+            if t is None:
+                t = os.path.getmtime(p) - _BLOCK_SPAN_S        # pessimistic
+        return (img, src, t) if with_time else (img, src)
     if allow_grab:
-        return grab_rtsp(station.ip), "grab"
-    return None, "none"
+        img = grab_rtsp(station.ip)
+        return (img, "grab", time.time()) if with_time else (img, "grab")
+    return (None, "none", None) if with_time else (None, "none")
 
 
 # RMS frame names carry the UTC capture time: <id>_YYYYMMDD_HHMMSS_mmm_<d|n>.png
@@ -175,13 +212,13 @@ def fresh_frame(station, after, allow_grab=True, settle_s=2.5, max_wait=120.0, p
     deadline = time.time() + max_wait
     while True:
         if rms_active(station):
-            p = latest_rms_path(station)
+            img, p = latest_rms_frame(station)
             if p:
                 ct = frame_capture_time(p)
                 if ct is None:
                     ct = os.path.getmtime(p) - _BLOCK_SPAN_S     # pessimistic
                 if ct >= after + settle_s:
-                    return cv2.imread(p), "rms", ct
+                    return img, "rms", ct
         elif allow_grab:
             time.sleep(settle_s)
             return grab_rtsp(station.ip), "grab", time.time()
@@ -222,8 +259,8 @@ def load_mask(station):
     return keep
 
 
-def mask_for(station, img):
-    """The station mask sized to img (nearest-neighbour), or None."""
+def static_mask_for(station, img):
+    """The station's RMS mask sized to img (True = keep), or None."""
     keep = load_mask(station)
     if keep is None or img is None:
         return None
@@ -231,6 +268,35 @@ def mask_for(station, img):
     if keep.shape != (h, w):
         keep = cv2.resize(keep.astype(np.uint8), (w, h),
                           interpolation=cv2.INTER_NEAREST).astype(bool)
+    return keep
+
+
+# Sun exclusion radius (deg) around the sun; the app's spinbox sets it.
+SUN_RADIUS_DEG = [20.0]
+
+
+def set_sun_radius(deg):
+    SUN_RADIUS_DEG[0] = max(0.0, float(deg))
+
+
+def mask_for(station, img, t=None, layers=False):
+    """Combined measurement mask for img (True = pixel counts), or None when
+    nothing is excluded: the station's static RMS mask AND the sun exclusion
+    zone (platepar + ephemeris, radius SUN_RADIUS_DEG) at time t (now if None).
+    With layers=True returns (keep, {"static": excluded_bool_or_None,
+    "sun": excluded_bool_or_None, "sun_info": dict_or_None})."""
+    if img is None:
+        return (None, None) if layers else None
+    keep = static_mask_for(station, img)
+    static_excl = None if keep is None else ~keep
+    sun_excl, sun_info = None, None
+    if SUN_RADIUS_DEG[0] > 0:
+        from podcontrol import sunmask
+        sun_excl, sun_info = sunmask.exclusion(station, t, SUN_RADIUS_DEG[0], img.shape[:2])
+    if sun_excl is not None:
+        keep = ~sun_excl if keep is None else (keep & ~sun_excl)
+    if layers:
+        return keep, {"static": static_excl, "sun": sun_excl, "sun_info": sun_info}
     return keep
 
 

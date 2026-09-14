@@ -12,6 +12,13 @@ analog gain, then a digital boost -- so a single scalar spans day to night and
 steps stay smooth. Adjustments are gentle (small stops/cycle, deadband) so it
 tracks slow sky changes without hunting.
 
+Loop discipline: a step is only taken on frames CAPTURED after the previous
+change landed (each metering entry may carry its capture epoch as "t"). On a
+capturing pod the frames come from RMS's saved blocks and can be ~50 s old;
+stepping every few seconds on such frames cuts exposure ~10 times before
+any effect is visible and rails the pod to the floor (seen live 2026-09-14).
+With the gate, the loop runs at the frame cadence and stays stable.
+
 Cross-platform: the ladder is in stops; the secondary gain stage is the ISP
 digital gain (-i) on BOTH platforms. The sensor digital gain (-d) is left at
 unity: on the IMX291 it is inert, and on the Goke science config it is a
@@ -42,7 +49,8 @@ class AEConfig:
     max_step = 0.5              # max stops changed per cycle (gentle)
     deadband = 0.15             # no change if |error| below this (stops)
     gamma = 0.5                 # sensor gamma: luma ~ light**gamma
-    period_s = 6.0              # loop cadence
+    period_s = 6.0              # loop cadence (a step still waits for fresh frames)
+    settle_s = 1.5              # frames must be captured this long after an apply
 
 
 class SharedAE:
@@ -51,6 +59,8 @@ class SharedAE:
         self.cfg = cfg or AEConfig()
         self.li = self._exp_stops() * 0.5   # start mid-exposure, gain=1x
         self.last = {}
+        self.t_apply = 0.0                   # epoch of the last change pushed
+        self.waiting = 0                     # consecutive cycles held for fresh frames
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -80,6 +90,40 @@ class SharedAE:
         analog = min(g, c.analog_max_x)
         boost = min(c.boost_max_x, max(1.0, g / analog))
         return int(round(exp)), analog, boost
+
+    # --- seeding -----------------------------------------------------------
+    def seed(self, poll):
+        """Start the ladder at the DARKEST current setting among the online
+        cameras (poll = PodController.poll_all()). The camera whose own AE
+        chose the least light sees the brightest scene, so starting there
+        cannot blow anything out; the loop then brightens gently if allowed.
+        Returns the seeded light index, or None if nothing usable."""
+        c = self.cfg
+        lis = []
+        for d in poll.values():
+            if not d.get("online") or not d.get("exp_us"):
+                continue
+            g = (d.get("again_x") or 1.0) * (d.get("ispdgain_x") or 1.0)
+            lis.append(math.log2(max(1.0, d["exp_us"] / c.line_us) * max(1.0, g)))
+        if not lis:
+            return None
+        self.li = max(0.0, min(min(lis), self._max_li()))
+        self.last = {}
+        return self.li
+
+    # --- freshness gate ----------------------------------------------------
+    def fresh(self, metering):
+        """Subset of metering captured after the last apply (+settle). Entries
+        without a "t" (direct grabs, sims) count as fresh. None if nothing is
+        fresh yet -> the caller must HOLD (no step, no apply)."""
+        need = self.t_apply + self.cfg.settle_s
+        out = {k: m for k, m in metering.items()
+               if m and (m.get("t") is None or m["t"] >= need)}
+        if not out:
+            self.waiting += 1
+            return None
+        self.waiting = 0
+        return out
 
     # --- controller --------------------------------------------------------
     def step(self, metering):
@@ -124,7 +168,9 @@ class SharedAE:
         kw = {"again": analog, "exp_us": exp}
         if self.last["boost_x"] > 1.001:
             kw["ispdgain"] = boost           # ISP-digital (-i) on both platforms
-        return self.pod.manual_all(timeout=timeout, **kw)
+        r = self.pod.manual_all(timeout=timeout, **kw)
+        self.t_apply = time.time()
+        return r
 
     def release(self, timeout=5.0):
         return self.pod.auto_all(timeout=timeout)
@@ -142,11 +188,13 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
     """Headless shared-AE loop. meter_fn() -> {cam:{mean,clip}}. Releases to auto on exit."""
     ae = SharedAE(pod, cfg)
     cfg = ae.cfg
+    ae.seed(pod.poll_all(timeout=4))         # start from where the cameras are
     try:
         while not stop():
             poll = pod.poll_all(timeout=4)
             m = {sid: v for sid, v in meter_fn().items() if poll.get(sid, {}).get("online")}
-            info = ae.step(m)
+            m = ae.fresh(m)                  # hold until frames post-date the last change
+            info = ae.step(m) if m else None
             if info:
                 ae.apply(platform=_pod_platform(poll))
                 if on_tick:
@@ -170,10 +218,16 @@ if __name__ == "__main__":
 
     def meter():
         sts = pod.stations
-        imgs = dict(zip(sts, pool.map(lambda s: frame_for(s)[0], sts)))
-        # masked pixels (RMS mask.bmp) never count -- a lamp behind the mask
-        # cannot pull the pod's exposure down
-        return {s.id: luma_stats(img, mask_for(s, img)) for s, img in imgs.items()}
+        got = dict(zip(sts, pool.map(lambda s: frame_for(s, with_time=True), sts)))
+        out = {}
+        for s, (img, src, t) in got.items():
+            # masked pixels (RMS mask + sun zone) never count -- a lamp behind
+            # the mask or the sun's glare cannot pull the pod's exposure down
+            st = luma_stats(img, mask_for(s, img, t))
+            if st is not None:
+                st["t"] = t                  # capture epoch -> freshness gate
+            out[s.id] = st
+        return out
 
     def tick(info, poll):
         print("li=%.2f  lum=%.0f clip=%.1f%%  -> exp=%dus gain=%.1fx  (%s %+.2f)" % (

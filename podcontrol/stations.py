@@ -23,11 +23,13 @@ DEFAULT_IPS = ["192.168.42.%d" % n for n in range(101, 107)]
 
 
 class Station:
-    def __init__(self, station_id, ip, data_dir="", mask_path=""):
+    def __init__(self, station_id, ip, data_dir="", mask_path="", platepar_path=""):
         self.id = station_id
         self.ip = ip
         self.data_dir = os.path.expanduser(data_dir) if data_dir else ""
         self.mask_path = os.path.expanduser(mask_path) if mask_path else ""
+        # RMS platepar: lets us place the sun in the frame (sun exclusion mask)
+        self.platepar_path = os.path.expanduser(platepar_path) if platepar_path else ""
 
     @property
     def frames_dir(self):
@@ -66,7 +68,8 @@ def parse_ip_spec(spec):
 def from_pod_file(path):
     """JSON: {"cameras":[{"id":..,"ip":..,"data_dir":..}, ...]}."""
     data = json.load(open(os.path.expanduser(path)))
-    return [Station(c.get("id") or c["ip"], c["ip"], c.get("data_dir", ""), c.get("mask", ""))
+    return [Station(c.get("id") or c["ip"], c["ip"], c.get("data_dir", ""), c.get("mask", ""),
+                    c.get("platepar", ""))
             for c in data.get("cameras", data if isinstance(data, list) else [])]
 
 
@@ -83,8 +86,10 @@ def discover_stations(stations_dir):
         if m:
             # RMS: mask = <config dir>/<basename of [Capture] mask>, default mask.bmp
             mask_name = os.path.basename(_get(txt, "mask", "") or "mask.bmp")
+            pp_name = os.path.basename(_get(txt, "platepar_name", "") or "platepar_cmn2010.cal")
             out.append(Station(sid, m.group(1), _get(txt, "data_dir", ""),
-                               os.path.join(os.path.dirname(cfg), mask_name)))
+                               os.path.join(os.path.dirname(cfg), mask_name),
+                               os.path.join(os.path.dirname(cfg), pp_name)))
     return out
 
 
@@ -118,4 +123,5 @@ def discover(stations_dir=None):
 if __name__ == "__main__":
     for s in get_pod():
         print(s, "data_dir:", s.data_dir or "(none -> RTSP grab)",
-              "mask:", s.mask_path if s.mask_path and os.path.isfile(s.mask_path) else "(none)")
+              "mask:", s.mask_path if s.mask_path and os.path.isfile(s.mask_path) else "(none)",
+              "platepar:", "ok" if s.platepar_path and os.path.isfile(s.platepar_path) else "(none)")

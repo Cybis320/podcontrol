@@ -50,9 +50,10 @@ def _parse_goke(q):
     def n(k):
         v = _f(q, k + r":\s*(-?\d+)")
         return int(v) if v is not None else None
-    again = n("AGain")
+    again = n("AGain"); ispd = n("ISPDGain")
     return {
         "again_x": (again / 1024.0) if again else None,
+        "ispdgain_x": (ispd / 1024.0) if ispd else None,
         "sysgain_x": None,   # derivable if needed
         "exp_us": n("ExpTime"), "iso": n("ISO"),
         "avelum": n("AveLum"), "chiptemp": n("ChipTemp"),
@@ -67,7 +68,7 @@ def _parse_ae_line(text):
         return float(v) if v else None
     us = _f(text, r"~(\d+)\s*us")
     return {
-        "again_x": x("AGain"), "sysgain_x": x("SysGain"),
+        "again_x": x("AGain"), "sysgain_x": x("SysGain"), "ispdgain_x": None,
         "exp_us": int(us) if us else None,
         "iso": int(_f(text, r"ISO=(\d+)") or 0) or None,
         "avelum": None, "chiptemp": None, "optype": None, "exp_max": None,

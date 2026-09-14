@@ -119,6 +119,36 @@ every measurement podcontrol makes:
 
 A station without a mask file is metered over the full frame.
 
+## Sun exclusion zone
+
+The sun (and its glare) is kept out of every measurement too. Each station's
+RMS platepar (`platepar_cmn2010.cal`, or `platepar_name` in `.config`) gives
+the alt/az of every pixel, computed once per station on an 8-px grid; at
+measurement time the sun's alt/az (ephem, from the platepar's site) gives each
+pixel's angular distance to the sun, and everything within the **sun radius**
+is excluded — exactly like the static mask, and combined with it. It applies
+whenever the circle can touch the sky (sun altitude above minus the radius),
+so the glow around a just-set sun is excluded as well.
+
+- GUI: **mask overlay** checkbox tints the excluded zones on the tiles
+  (red = RMS mask, orange = sun zone, small white circle = the sun) and the
+  **sun r°** spinbox sets the radius live (0 disables it). The telemetry line
+  shows `maskNN%` (static + sun) and `sun 23° IN FOV` when it is in the frame.
+- The right radius depends on the lens, haze and exposure. Measure it on real
+  frames — it prints the mean luma and clipped fraction per 2° annulus around
+  the sun and suggests a radius:
+
+  ```
+  ~/vRMS/bin/python -m podcontrol.sunmask --measure US05B1
+  ~/vRMS/bin/python -m podcontrol.sunmask --where        # sun in each camera now
+  ```
+
+  First measurement (US05B1, sun only 6° up, 2026-09-14): clipping reached
+  12–14° from the sun, so the default is **20°**; re-measure with the sun high
+  (B1 ~15:40 UTC, F1 ~19:20 UTC, D1 ~23:20 UTC at this site) and raise it if
+  the halo is larger. Lens-flare ghosts elsewhere in the frame are not covered
+  by the circle; the overlay and the clip% show whether anything leaks.
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).
@@ -127,6 +157,13 @@ A station without a mask file is metered over the full frame.
   `auto --min/max-exptime` syntax (x256 WB gains, 256 = 1.0x); the Goke fleet
   runs it on OpenIPC. `podctl` polls the encoder state on both and exposes
   `venc_qp_all` / `venc_cqp_all` / `venc_gop_all`. See [docs/PARITY.md](docs/PARITY.md).
+- **Shared-AE loop discipline (2026-09-14, after railing the live pod to the
+  30 µs floor):** a step is taken only on frames captured after the previous
+  change (RMS frames are up to ~50 s old, so the loop runs at that cadence),
+  and switching Shared AE on seeds the ladder from the cameras' current
+  darkest exposure instead of a fixed mid-ladder guess. A SIGTERM/SIGINT
+  releases the cameras to auto like a window close. If an app dies hard, run
+  `Auto All` or `python -m podcontrol.podctl` + `auto` per camera.
 - Shared AE on the Goke pod: validated on the IMX291 bench only. On the Goke
   science config, night exposure/gain is already pinned identically by
   `camera_settings.json`; shared AE matters at twilight/day where the cameras'
