@@ -259,6 +259,18 @@ A1 lamp's verdict from "darker" into "headroom" without touching the mask; it
 also stops headlights or a planet from dipping the pod. The peak metric is
 unaffected (a lamp is far below 0.1% of the frame).
 
+## White balance controls
+
+The **white balance** group holds R, G, B gain multipliers (the daemons' ×256
+gains shown as ×1.00; seeded from the first camera's current WB at start,
+then remembered), **Apply** pushes the same `wb` to every camera, **Auto**
+hands WB back to the cameras' AWB. The **≈ K** readout is an estimated
+correlated colour temperature for the entered gains: the gains are inverted
+to an illuminant colour, taken through the sRGB matrix to chromaticity and
+McCamy's formula, anchored so the config's daylight preset (460/256/490)
+reads as D65. Relative shifts are meaningful (more R gain = bluer light =
+higher K); absolute values are approximate, not a calibrated colorimeter.
+
 ## Settings
 
 Toolbar values (refresh, slew, clip threshold, point-source tolerance,

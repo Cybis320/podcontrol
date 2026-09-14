@@ -35,6 +35,7 @@ from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, hig
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
+from podcontrol.colour import cct_from_gains
 
 COLS = 3
 BG, PANEL = "#0f0d08", "#14110c"
@@ -302,8 +303,14 @@ class App(tk.Tk):
         self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
         self.moon_radius = tk.DoubleVar(value=sv("moon_radius_deg", F.MOON_RADIUS_DEG[0]))
         self.clip_pct = tk.DoubleVar(value=sv("clip_limit_pct", 100.0 * self.ae.cfg.clip_limit))
+        self.wb_r = tk.DoubleVar(value=sv("wb_r", 1.0))
+        self.wb_g = tk.DoubleVar(value=sv("wb_g", 1.0))
+        self.wb_b = tk.DoubleVar(value=sv("wb_b", 1.0))
+        self._wb_seeded = "wb_r" in saved          # else seed from the first camera poll
         self._saved = saved
         self._save_job = None
+        for var in (self.wb_r, self.wb_g, self.wb_b):
+            var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
         for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.sun_votes,
                     self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
@@ -367,6 +374,15 @@ class App(tk.Tk):
 
         g = group(row2, "policy")
         check(g, "sun cam votes", self.sun_votes)
+
+        g = group(row2, "white balance (x gains, pod-wide)")
+        for txt, var in (("R", self.wb_r), ("G", self.wb_g), ("B", self.wb_b)):
+            lab(g, txt); spin(g, var, 0.25, 4.0, 0.01, 5, "%.2f"); lab(g, "", padx=(0, 4))
+        tk.Button(g, text="Apply", command=self.apply_wb).pack(side="left", padx=(4, 4))
+        tk.Button(g, text="Auto", command=self.wb_auto).pack(side="left")
+        self.kelvin = tk.Label(g, text="", fg="#f0a830", bg=BG, font=(MONO, 9, "bold"))
+        self.kelvin.pack(side="left", padx=(8, 0))
+        self._update_kelvin()
 
         self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
         self.status.pack(fill="x", padx=12, pady=(0, 6))
@@ -473,6 +489,13 @@ class App(tk.Tk):
                     if b is not None:
                         brights.append(b)
                 daemons = sum(1 for v in poll.values() if v.get("online"))
+                if not self._wb_seeded:
+                    for v in poll.values():
+                        gs = (v.get("wb") or {}).get("gains")
+                        if v.get("online") and gs and len(gs) >= 3:
+                            self.wb_r.set(round(gs[0], 2)); self.wb_g.set(round(gs[1], 2)); self.wb_b.set(round(gs[-1], 2))
+                            self._wb_seeded = True
+                            break
                 ae = ""
                 if info:
                     ae = "  AE[%s] %s exp=%dus gain=%.2fx (to go %+.2f stop; set %s)" % (
@@ -491,12 +514,33 @@ class App(tk.Tk):
             self._draw_history()
         self.after(200, self._drain)
 
+    def _update_kelvin(self):
+        try:
+            c = cct_from_gains(self.wb_r.get(), self.wb_g.get(), self.wb_b.get())
+            self.kelvin.config(text=("\u2248 %d K" % (round(c / 50) * 50)) if c else "\u2248 ? K")
+        except Exception:
+            pass
+
+    def apply_wb(self):
+        try:
+            r, g, b = (int(round(self.wb_r.get() * 256)), int(round(self.wb_g.get() * 256)),
+                       int(round(self.wb_b.get() * 256)))
+        except Exception:
+            return
+        self.status.config(text="WB %d %d %d pushed to the pod" % (r, g, b))
+        threading.Thread(target=lambda: self.pod.wb_all(r, g, b), daemon=True).start()
+
+    def wb_auto(self):
+        self.status.config(text="WB auto pushed to the pod")
+        threading.Thread(target=lambda: self.pod.wb_auto_all(), daemon=True).start()
+
     def _settings_dict(self):
         d = {"refresh_s": float(self.interval.get()), "overlay": bool(self.overlay.get()),
              "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
+             "wb_r": float(self.wb_r.get()), "wb_g": float(self.wb_g.get()), "wb_b": float(self.wb_b.get()),
              "history_open": bool(self.hist_win and self.hist_win.winfo_exists()),
              "geometry": self.geometry()}
         if self.hist_win and self.hist_win.winfo_exists():
