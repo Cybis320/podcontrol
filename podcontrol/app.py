@@ -39,6 +39,7 @@ SRC_COLOR = {"rms": "#7fc776", "stale": "#f0a830", "grab": "#5aa9e6", "none": "#
 # translucent overlay tints (RGB)
 TINT_STATIC, TINT_SUN = (220, 60, 60), (255, 190, 40)     # excluded zones
 TINT_FLARE = (170, 110, 255)                              # flare corridor
+TINT_MOON = (140, 200, 255)                               # moon zone
 TINT_CLIP, TINT_HOT = (255, 0, 255), (0, 255, 255)        # what drives the AE
 OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
@@ -154,7 +155,8 @@ class Tile(tk.Frame):
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             small = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA)
             if overlay and layers:
-                for key, tint in (("static", TINT_STATIC), ("sun", TINT_SUN), ("flare", TINT_FLARE)):
+                for key, tint in (("static", TINT_STATIC), ("sun", TINT_SUN), ("flare", TINT_FLARE),
+                                  ("moon", TINT_MOON)):
                     if layers.get(key) is not None:
                         _tint(small, layers[key], tint, OVERLAY_ALPHA, (dw, dh))
                 if layers.get("clip") is not None:
@@ -172,6 +174,14 @@ class Tile(tk.Frame):
                     cv2.circle(small, (cx, cy), r, TINT_SUN, 2)
                     cv2.putText(small, "sun", (cx + r + 3, cy + 4), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.4, TINT_SUN, 1, cv2.LINE_AA)
+                mi = layers.get("moon_info")
+                if mi and mi.get("in_fov") and mi.get("x") is not None:
+                    fw, fh = self.frame_wh
+                    cx, cy = int(mi["x"] * dw / fw), int(mi["y"] * dh / fh)
+                    r = max(4, dw // 60)
+                    cv2.circle(small, (cx, cy), r, TINT_MOON, 2)
+                    cv2.putText(small, "moon", (cx + r + 3, cy + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.4, TINT_MOON, 1, cv2.LINE_AA)
             if is_driver:
                 col = DRIVE_COLOR.get(why, "#ff5ad6")
                 c = tuple(int(col[i:i + 2], 16) for i in (1, 3, 5))
@@ -217,6 +227,9 @@ class Tile(tk.Frame):
         si = (layers or {}).get("sun_info")
         if si and si.get("alt") is not None and si["alt"] > -si["radius_deg"]:
             masked += "  sun %.0f°%s" % (si["alt"], " IN FOV" if si.get("in_fov") else "")
+        mi = (layers or {}).get("moon_info")
+        if mi and mi.get("alt") is not None:
+            masked += "  moon %.0f° %.0f%%%s" % (mi["alt"], mi.get("phase") or 0, " IN FOV" if mi.get("in_fov") else "")
         gains = "A%.2f" % (tel.get("again_x") or 0)
         if tel.get("dgain_x"):
             gains += " D%.2f" % tel["dgain_x"]
@@ -264,6 +277,7 @@ class App(tk.Tk):
         self.sun_votes = tk.BooleanVar(value=self.ae.cfg.sun_cam_votes)
         self.flare_w = tk.DoubleVar(value=F.FLARE_HALF_WIDTH_DEG[0])
         self.min_blob = tk.IntVar(value=F.CLIP_MIN_BLOB_PX[0])
+        self.moon_radius = tk.DoubleVar(value=F.MOON_RADIUS_DEG[0])
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -300,6 +314,9 @@ class App(tk.Tk):
         lab("sun r", padx=(8, 0))
         tk.Spinbox(bar, from_=0, to=45, increment=1, width=4, textvariable=self.sun_radius).pack(side="left")
         lab("°")
+        lab("moon r", padx=(8, 0))
+        tk.Spinbox(bar, from_=0, to=30, increment=1, width=4, textvariable=self.moon_radius).pack(side="left")
+        lab("°")
         lab("flare r", padx=(8, 0))
         tk.Spinbox(bar, from_=0, to=15, increment=0.5, width=4, textvariable=self.flare_w,
                    format="%.1f").pack(side="left")
@@ -325,6 +342,7 @@ class App(tk.Tk):
                 F.set_sun_radius(self.sun_radius.get())
                 F.set_flare_width(self.flare_w.get())
                 F.set_clip_min_blob(self.min_blob.get())
+                F.set_moon_radius(self.moon_radius.get())
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:

@@ -98,16 +98,32 @@ def available(station):
     return _load(station) is not None
 
 
-def sun_altaz(station, t=None):
-    """Sun alt/az (deg, unrefracted) + astrometric J2000 RA/Dec at epoch t."""
+def body_altaz(station, body="sun", t=None):
+    """Alt/az (deg, unrefracted) + astrometric J2000 RA/Dec of the sun or the
+    moon at epoch t (moon: topocentric, plus 'phase' = % illuminated)."""
     st = _load(station)
     if not st:
         return None
     import ephem
     st["obs"].date = _utc(time.time() if t is None else t)
-    s = ephem.Sun(st["obs"])
-    return {"alt": math.degrees(s.alt), "az": math.degrees(s.az),
-            "ra": math.degrees(s.a_ra), "dec": math.degrees(s.a_dec)}
+    b = ephem.Moon(st["obs"]) if body == "moon" else ephem.Sun(st["obs"])
+    out = {"alt": math.degrees(b.alt), "az": math.degrees(b.az),
+           "ra": math.degrees(b.a_ra), "dec": math.degrees(b.a_dec), "body": body}
+    if body == "moon":
+        out["phase"] = float(b.phase)
+    return out
+
+
+def sun_altaz(station, t=None):
+    """Sun alt/az (deg, unrefracted) + astrometric J2000 RA/Dec at epoch t."""
+    return body_altaz(station, "sun", t)
+
+
+def moon_altaz(station, t=None):
+    return body_altaz(station, "moon", t)
+
+
+DEFAULT_MOON_RADIUS_DEG = 10.0   # not yet measured (no moon-in-field frames saved as of 2026-09-14)
 
 
 # RMS switches day/night capture modes when the sun crosses this altitude
@@ -186,9 +202,10 @@ def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
 
 
 def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
-              flare_half_width_deg=DEFAULT_GHOST_RADIUS_DEG):
+              flare_half_width_deg=DEFAULT_GHOST_RADIUS_DEG, moon_radius_deg=DEFAULT_MOON_RADIUS_DEG):
     # flare_half_width_deg is the GHOST RADIUS knob (name kept for callers);
-    # 0 disables the whole flare model
+    # 0 disables the whole flare model. moon_radius_deg: the moon zone (0 = off),
+    # applied whenever the moon is above -radius like the sun zone.
     """(excluded, info): excluded = full-res bool (True = drop the pixel) of the
     sun zone UNION the flare corridor, or None when nothing is excluded; info
     = sun alt/az, in_fov, x/y, fractions, plus the two maps ("sun_map",
@@ -198,27 +215,46 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
         return None, None
     t = time.time() if t is None else t
     key = (station.id, int(t // 30), round(float(radius_deg), 2),
-           round(float(flare_half_width_deg), 2), shape)
+           round(float(flare_half_width_deg), 2), round(float(moon_radius_deg), 2), shape)
     hit = _CACHE.get(key)
     if hit:
         return hit
     sa = sun_altaz(station, t)
     info = {"alt": sa["alt"], "az": sa["az"], "radius_deg": float(radius_deg),
             "in_fov": False, "x": None, "y": None, "frac": 0.0, "min_sep_deg": None,
-            "sun_map": None, "flare_map": None, "flare_frac": 0.0}
+            "sun_map": None, "flare_map": None, "flare_frac": 0.0,
+            "moon_map": None, "moon_frac": 0.0, "moon": None}
     excl = None
+    h, w = shape or st["shape"]
+    # ---- moon zone (same geometry as the sun zone); only while the sun is
+    # below the horizon -- a daytime moon cannot clip at day exposures ----
+    if moon_radius_deg > 0 and sa["alt"] < 0:
+        ma = moon_altaz(station, t)
+        if ma and ma["alt"] > -moon_radius_deg:
+            angm = separation_map(station, ma)
+            mi = {"alt": ma["alt"], "az": ma["az"], "phase": ma.get("phase"), "radius_deg": float(moon_radius_deg),
+                  "in_fov": bool(angm.min() < 1.0), "min_sep_deg": float(angm.min()), "x": None, "y": None}
+            if mi["in_fov"]:
+                mi["x"], mi["y"] = _sun_pixel(station, ma, t)
+            info["moon"] = mi
+            cm = angm <= moon_radius_deg
+            if cm.any():
+                mm = cv2.resize(cm.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                info["moon_map"] = mm
+                info["moon_frac"] = float(mm.mean())
+                excl = mm
     if sa["alt"] > -radius_deg:
         ang = separation_map(station, sa)
         info["min_sep_deg"] = float(ang.min())
         info["in_fov"] = bool(ang.min() < 1.0)           # sun direction inside the grid
-        h, w = shape or st["shape"]
         if ang.min() < FLARE_MAX_SEP_DEG + 30.0:
             info["x"], info["y"] = _sun_pixel(station, sa, t)   # may be off-frame
         coarse = ang <= radius_deg
         if coarse.any():
-            excl = cv2.resize(coarse.astype(np.uint8), (w, h),
-                              interpolation=cv2.INTER_NEAREST).astype(bool)
-            info["sun_map"] = excl
+            sm = cv2.resize(coarse.astype(np.uint8), (w, h),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+            info["sun_map"] = sm
+            excl = sm if excl is None else (excl | sm)
         if (flare_half_width_deg > 0 and info["x"] is not None
                 and ang.min() < FLARE_MAX_SEP_DEG):
             fl = flare_map(station, info["x"], info["y"], (h, w), flare_half_width_deg,
@@ -227,8 +263,8 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
                 info["flare_map"] = fl
                 info["flare_frac"] = float(fl.mean())
                 excl = fl if excl is None else (excl | fl)
-        if excl is not None:
-            info["frac"] = float(excl.mean())
+    if excl is not None:
+        info["frac"] = float(excl.mean())
     if len(_CACHE) > 24:                 # entries hold full-res maps: keep it small
         _CACHE.clear()
     _CACHE[key] = (excl, info)
@@ -262,27 +298,29 @@ def axis_blobs(station, img, keep, sa, t, level=235, min_area=15):
 
 # ---------------------------------------------------------------------------
 # Measuring the glare radius on real frames
-def _day_frames(station, n):
+def _day_frames(station, n, suffix="_d"):
     if not station.data_dir:
         return []
     root = os.path.join(station.data_dir, "FramesFiles")
     days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
     files = []
     for d in days:
-        files += glob.glob(os.path.join(d, "**", station.id + "_*_d.png"), recursive=True)
+        files += glob.glob(os.path.join(d, "**", station.id + "_*" + suffix + ".png"), recursive=True)
     return sorted(files)[-n:]
 
 
-def measure(station, n_frames=3, max_deg=40, step=2, clip_level=250, clip_thresh=0.005):
-    """Print mean luma / clipped fraction per annulus around the sun on the
-    newest day frames with the sun above the horizon; suggest a radius."""
+def measure(station, n_frames=3, max_deg=40, step=2, clip_level=250, clip_thresh=0.005, body="sun"):
+    """Print mean luma / clipped fraction per annulus around the sun (or the
+    moon, on night frames) on the newest frames with the body above the
+    horizon; suggest a radius."""
     from podcontrol.frames import frame_capture_time
     if not available(station):
-        print("%s: no platepar -> cannot locate the sun" % station.id); return None
+        print("%s: no platepar -> cannot locate the %s" % (station.id, body)); return None
     suggested = []
-    for f in _day_frames(station, n_frames):
+    frames = _day_frames(station, n_frames, "_d") if body == "sun" else _day_frames(station, n_frames, "_n")
+    for f in frames:
         t = frame_capture_time(f) or os.path.getmtime(f)
-        sa = sun_altaz(station, t)
+        sa = body_altaz(station, body, t)
         if sa["alt"] < 0:
             continue
         ang = separation_map(station, sa)
@@ -293,8 +331,9 @@ def measure(station, n_frames=3, max_deg=40, step=2, clip_level=250, clip_thresh
         gh, gw = ang.shape
         y = y[:gh, :gw]
         xy = _sun_pixel(station, sa, t)
-        print("%s  sun alt=%.1f az=%.1f -> px (%.0f,%.0f) %s  min sep %.1f deg" % (
-            os.path.basename(f), sa["alt"], sa["az"], xy[0], xy[1],
+        print("%s  %s alt=%.1f az=%.1f%s -> px (%.0f,%.0f) %s  min sep %.1f deg" % (
+            os.path.basename(f), body, sa["alt"], sa["az"],
+            (" phase %.0f%%" % sa["phase"]) if "phase" in sa else "", xy[0], xy[1],
             "IN FOV" if ang.min() < 1.0 else "outside", ang.min()))
         try:
             from podcontrol.frames import static_mask_for
@@ -336,20 +375,23 @@ if __name__ == "__main__":
     ap.add_argument("--measure", metavar="STATION", help="glare profile around the sun on recent frames")
     ap.add_argument("--frames", type=int, default=3)
     ap.add_argument("--radius", type=float, default=DEFAULT_RADIUS_DEG)
+    ap.add_argument("--body", choices=("sun", "moon"), default="sun", help="for --measure")
     args = ap.parse_args()
     pod = get_pod()
     if args.measure:
         st = next((s for s in pod if s.id == args.measure), None)
         if not st:
             raise SystemExit("unknown station %s (have %s)" % (args.measure, [s.id for s in pod]))
-        measure(st, n_frames=args.frames)
+        measure(st, n_frames=args.frames, body=args.body)
     else:
         now = time.time()
         for s in pod:
             excl, info = exclusion(s, now, args.radius)
             if info is None:
                 print("%-7s no platepar" % s.id); continue
-            print("%-7s sun alt %5.1f az %5.1f  %s  excluded %.1f%% (r=%.0f deg)%s" % (
+            mi = info.get("moon") or {}
+            print("%-7s sun alt %5.1f az %5.1f  %s  excluded %.1f%% (r=%.0f deg) | moon %s" % (
                 s.id, info["alt"], info["az"],
                 "IN FOV px (%.0f,%.0f)" % (info["x"], info["y"]) if info["in_fov"] else "outside (sep %.0f deg)" % (info["min_sep_deg"] or -1),
-                100 * info["frac"], args.radius, ""))
+                100 * info["frac"], args.radius,
+                ("alt %.0f phase %.0f%% %s %.1f%%" % (mi["alt"], mi.get("phase") or 0, "IN FOV" if mi["in_fov"] else "out", 100 * info["moon_frac"])) if mi else "below horizon"))

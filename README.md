@@ -151,6 +151,17 @@ so the glow around a just-set sun is excluded as well.
   the halo is larger. Lens-flare ghosts elsewhere in the frame are not covered
   by the circle; the overlay and the clip% show whether anything leaks.
 
+## Moon exclusion zone
+
+Same machinery as the sun zone, from ephem's topocentric Moon: a disc of
+**moon r°** (spinbox, default 10°, 0 = off) is excluded around the Moon while
+the sun is below the horizon (a daytime Moon cannot clip). Tinted pale blue in
+the overlay, with a "moon" marker; the telemetry line shows its altitude and
+illuminated fraction. The radius is a placeholder until measured on frames
+with the Moon in the field: `python -m podcontrol.sunmask --measure STATION
+--body moon` prints the luma/clip profile per annulus on the newest `_n`
+frames. No flare model for the Moon yet.
+
 ## Lens-flare model
 
 Internal-reflection ghosts are images mirrored through the lens's
