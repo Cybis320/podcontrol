@@ -153,20 +153,25 @@ so the glow around a just-set sun is excluded as well.
 
 ## Lens-flare model
 
-Internal-reflection ghosts sit on the line through the sun's image and the
-optical centre (a radial distortion keeps that line straight) at fixed
-fractions *k* of the sun-to-centre distance, with a roughly constant angular
-size. Measured on US05B1 on 2026-09-14 at four sun positions: one large ghost,
-a pale disc ~5.4° in radius centred at k = −0.40 on the mirrored side (its
-brighter rim at k ≈ −0.57), 60–90 luma above the sky, up to 3° off the axis.
+Internal-reflection ghosts are images mirrored through the lens's
+**principal point** on the sensor. That is the platepar's fitted radial
+distortion centre, not the geometric image centre: on US05B1 it is 36 px
+below the centre, and the ghost drifted off the image-centre line during the
+afternoon exactly as that offset predicts (on the line when the sun was
+straight below the centre, 1.7° off when it was upper-right). A radial
+distortion keeps the sun-to-principal-point line straight, so ghosts sit on
+it at fixed fractions *k* of the sun's distance from that point, with a
+roughly constant angular size. Measured on US05B1 (2026-09-14, 14:10 to
+15:57): one pale disc ~5° in radius at k = −0.57, 60–90 luma above the sky;
+with the sun ~10° outside the field (US05F1) a smaller ghost at k ≈ −0.20.
 
-The model excludes ghost **discs** at those *k* (default one at −0.40, radius
-**flare r°** = 7°, spinbox; 0 disables the model) plus a 3° half-width
-**corridor** along the whole axis (rim streaks, smaller ghosts), while the sun
-is inside the field. It is tinted violet in the overlay. Other lenses: run
-`python -m podcontrol.sunmask --measure STATION`, which lists the bright
-blobs with their *k* and off-axis angle, and add `(k, scale)` entries to
-`sunmask.FLARE_GHOSTS`.
+The model excludes ghost **discs** at those *k* (radius **flare r°** = 6°,
+spinbox; 0 disables the model; the far ghost only while the sun is within 5°
+of the field, the near one out to 30°) plus a 3° half-width **corridor**
+along the whole axis while the sun is inside the field. It is tinted violet
+in the overlay. Other lenses: `python -m podcontrol.sunmask --measure
+STATION` lists the bright blobs with their *k* and off-axis angle; add
+`(k, scale, max_sep)` entries to `sunmask.FLARE_GHOSTS`.
 
 ## What is driving the exposure (GUI)
 

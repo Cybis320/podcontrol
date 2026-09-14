@@ -281,7 +281,7 @@ def set_sun_radius(deg):
 
 # Flare ghost radius (deg) for the lens-flare model (ghost discs on the
 # sun-centre axis + a narrow corridor); 0 = off.
-FLARE_HALF_WIDTH_DEG = [7.0]
+FLARE_HALF_WIDTH_DEG = [6.0]
 
 
 def set_flare_width(deg):

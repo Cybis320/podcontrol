@@ -33,18 +33,20 @@ GRID_STEP = 8            # px between alt/az samples; upsampled nearest to the f
 # image and the optical centre (a radial distortion keeps that line straight)
 # at FIXED fractions k of the sun-to-centre distance: k = 1 is the sun, 0 the
 # centre, k < 0 the mirrored side; their angular size is ~constant. Measured
-# on US05B1 (2026-09-14, sun 11-16 deg from the centre): one big ghost, a
-# pale disc ~5.4 deg in radius centred at k = -0.40 (its brighter rim at
-# k = -0.55..-0.60), 60-90 luma above the sky, up to 3 deg off the axis.
-# Model = ghost DISCS at (k, radius_deg) (default 7 deg = disc + offset) plus a
-# narrow corridor along the whole axis (rim streaks, smaller ghosts), applied
-# while the sun is within FLARE_MAX_SEP_DEG of the pixel grid (default: only
-# while it is inside the field).
-FLARE_GHOSTS = [(-0.40, 1.0)]        # (k, radius scale): disc centre at k*(sun-centre)
-DEFAULT_GHOST_RADIUS_DEG = 7.0
+# on US05B1 (2026-09-14, sun 11-17 deg from the centre, 7 clean frames): a
+# pale disc, radius 2-5 deg (larger as the sun nears the centre), centred at
+# k = -0.52..-0.58, 60-90 luma above the sky, within 2 deg of the axis. With
+# the sun ~12 deg OUTSIDE the field (US05F1) a smaller ghost shows at
+# k ~ -0.20 (mirrored, ~10 deg from the centre). Model = ghost DISCS at
+# (k, radius scale) x ghost_radius_deg, applied while the sun is within
+# FLARE_MAX_SEP_DEG of the pixel grid, plus a narrow corridor along the whole
+# axis (rim streaks) only while the sun is inside the field.
+# (k, radius scale, max sun separation from the field in deg for this ghost)
+FLARE_GHOSTS = [(-0.55, 1.0, 5.0), (-0.20, 1.0, 30.0)]
+DEFAULT_GHOST_RADIUS_DEG = 6.0
 FLARE_K_MIN, FLARE_K_MAX = -1.6, 1.0
 FLARE_CORRIDOR_HALF_WIDTH_DEG = 3.0
-FLARE_MAX_SEP_DEG = 1.0
+FLARE_MAX_SEP_DEG = 30.0                      # ghosts appear with the sun well outside the field
 
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
 _CACHE = {}              # (station, 30 s bucket, radius, shape) -> (excl, info)
@@ -140,13 +142,26 @@ def separation_map(station, sa):
 
 
 def optical_centre(station):
+    """The lens's principal point on the sensor = the platepar's fitted radial
+    distortion centre (x_poly_rev[0], [1] in units of the half-width/height,
+    as RMS's cyXYToRADec applies them), NOT the geometric image centre.
+    Flare ghosts mirror through this point; on US05B1 it is 36 px below the
+    image centre, which is exactly the drift the ghost showed as the sun moved.
+    Falls back to the image centre for non-radial models or forced centres."""
     pp = _load(station)["pp"]
-    return (pp.X_res / 2.0 + float(pp.x_poly_rev[0]), pp.Y_res / 2.0 + float(pp.y_poly_rev[0]))
+    cx, cy = pp.X_res / 2.0, pp.Y_res / 2.0
+    try:
+        if str(pp.distortion_type).startswith("radial") and not getattr(pp, "force_distortion_centre", False):
+            cx += float(pp.x_poly_rev[0]) * pp.X_res / 2.0
+            cy += float(pp.x_poly_rev[1]) * pp.Y_res / 2.0
+    except Exception:
+        pass
+    return (cx, cy)
 
 
 def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
               corridor_half_width_deg=FLARE_CORRIDOR_HALF_WIDTH_DEG,
-              ghosts=FLARE_GHOSTS, k_min=FLARE_K_MIN, k_max=FLARE_K_MAX):
+              ghosts=FLARE_GHOSTS, k_min=FLARE_K_MIN, k_max=FLARE_K_MAX, sun_sep_deg=0.0):
     """Bool map (True = excluded) of the lens-flare model for a sun imaged at
     (sx, sy) (may be outside the frame): ghost discs at k * (sun - centre)
     with radius ghost_radius_deg * scale, plus a corridor (capsule) along the
@@ -156,12 +171,15 @@ def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
     h, w = shape
     Fs = float(pp.F_scale)
     m = np.zeros((h, w), np.uint8)
-    if corridor_half_width_deg > 0:
+    in_frame = 0 <= sx < w and 0 <= sy < h
+    if corridor_half_width_deg > 0 and in_frame:
         p1 = (int(round(cx + k_min * (sx - cx))), int(round(cy + k_min * (sy - cy))))
         p2 = (int(round(cx + k_max * (sx - cx))), int(round(cy + k_max * (sy - cy))))
         cv2.line(m, p1, p2, 1, max(1, int(round(2 * corridor_half_width_deg * Fs))))
     if ghost_radius_deg > 0:
-        for k, scale in ghosts:
+        for k, scale, max_sep in ghosts:
+            if sun_sep_deg > max_sep:
+                continue
             c = (int(round(cx + k * (sx - cx))), int(round(cy + k * (sy - cy))))
             cv2.circle(m, c, max(1, int(round(ghost_radius_deg * scale * Fs))), 1, -1)
     return m.astype(bool)
@@ -194,7 +212,7 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
         info["min_sep_deg"] = float(ang.min())
         info["in_fov"] = bool(ang.min() < 1.0)           # sun direction inside the grid
         h, w = shape or st["shape"]
-        if ang.min() < max(1.0, FLARE_MAX_SEP_DEG) + 60.0:
+        if ang.min() < FLARE_MAX_SEP_DEG + 30.0:
             info["x"], info["y"] = _sun_pixel(station, sa, t)   # may be off-frame
         coarse = ang <= radius_deg
         if coarse.any():
@@ -203,7 +221,8 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
             info["sun_map"] = excl
         if (flare_half_width_deg > 0 and info["x"] is not None
                 and ang.min() < FLARE_MAX_SEP_DEG):
-            fl = flare_map(station, info["x"], info["y"], (h, w), flare_half_width_deg)
+            fl = flare_map(station, info["x"], info["y"], (h, w), flare_half_width_deg,
+                           sun_sep_deg=float(ang.min()))
             if fl.any():
                 info["flare_map"] = fl
                 info["flare_frac"] = float(fl.mean())
