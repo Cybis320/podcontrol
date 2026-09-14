@@ -29,6 +29,23 @@ import cv2
 DEFAULT_RADIUS_DEG = 25.0
 GRID_STEP = 8            # px between alt/az samples; upsampled nearest to the frame
 
+# Lens flare. Internal-reflection ghosts lie on the line through the sun's
+# image and the optical centre (a radial distortion keeps that line straight)
+# at FIXED fractions k of the sun-to-centre distance: k = 1 is the sun, 0 the
+# centre, k < 0 the mirrored side; their angular size is ~constant. Measured
+# on US05B1 (2026-09-14, sun 11-16 deg from the centre): one big ghost, a
+# pale disc ~5.4 deg in radius centred at k = -0.40 (its brighter rim at
+# k = -0.55..-0.60), 60-90 luma above the sky, up to 3 deg off the axis.
+# Model = ghost DISCS at (k, radius_deg) (default 7 deg = disc + offset) plus a
+# narrow corridor along the whole axis (rim streaks, smaller ghosts), applied
+# while the sun is within FLARE_MAX_SEP_DEG of the pixel grid (default: only
+# while it is inside the field).
+FLARE_GHOSTS = [(-0.40, 1.0)]        # (k, radius scale): disc centre at k*(sun-centre)
+DEFAULT_GHOST_RADIUS_DEG = 7.0
+FLARE_K_MIN, FLARE_K_MAX = -1.6, 1.0
+FLARE_CORRIDOR_HALF_WIDTH_DEG = 3.0
+FLARE_MAX_SEP_DEG = 1.0
+
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
 _CACHE = {}              # (station, 30 s bucket, radius, shape) -> (excl, info)
 _WARNED = set()
@@ -122,37 +139,106 @@ def separation_map(station, sa):
     return np.degrees(np.arccos(np.clip(cosd, -1.0, 1.0)))
 
 
-def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None):
-    """(excluded, info): excluded = full-res bool (True = drop the pixel) or
-    None when nothing is excluded; info = sun alt/az, in_fov, x/y, fraction."""
+def optical_centre(station):
+    pp = _load(station)["pp"]
+    return (pp.X_res / 2.0 + float(pp.x_poly_rev[0]), pp.Y_res / 2.0 + float(pp.y_poly_rev[0]))
+
+
+def flare_map(station, sx, sy, shape, ghost_radius_deg=DEFAULT_GHOST_RADIUS_DEG,
+              corridor_half_width_deg=FLARE_CORRIDOR_HALF_WIDTH_DEG,
+              ghosts=FLARE_GHOSTS, k_min=FLARE_K_MIN, k_max=FLARE_K_MAX):
+    """Bool map (True = excluded) of the lens-flare model for a sun imaged at
+    (sx, sy) (may be outside the frame): ghost discs at k * (sun - centre)
+    with radius ghost_radius_deg * scale, plus a corridor (capsule) along the
+    axis from k_min to k_max, corridor_half_width_deg wide. F_scale px/deg."""
+    pp = _load(station)["pp"]
+    cx, cy = optical_centre(station)
+    h, w = shape
+    Fs = float(pp.F_scale)
+    m = np.zeros((h, w), np.uint8)
+    if corridor_half_width_deg > 0:
+        p1 = (int(round(cx + k_min * (sx - cx))), int(round(cy + k_min * (sy - cy))))
+        p2 = (int(round(cx + k_max * (sx - cx))), int(round(cy + k_max * (sy - cy))))
+        cv2.line(m, p1, p2, 1, max(1, int(round(2 * corridor_half_width_deg * Fs))))
+    if ghost_radius_deg > 0:
+        for k, scale in ghosts:
+            c = (int(round(cx + k * (sx - cx))), int(round(cy + k * (sy - cy))))
+            cv2.circle(m, c, max(1, int(round(ghost_radius_deg * scale * Fs))), 1, -1)
+    return m.astype(bool)
+
+
+def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
+              flare_half_width_deg=DEFAULT_GHOST_RADIUS_DEG):
+    # flare_half_width_deg is the GHOST RADIUS knob (name kept for callers);
+    # 0 disables the whole flare model
+    """(excluded, info): excluded = full-res bool (True = drop the pixel) of the
+    sun zone UNION the flare corridor, or None when nothing is excluded; info
+    = sun alt/az, in_fov, x/y, fractions, plus the two maps ("sun_map",
+    "flare_map") for display."""
     st = _load(station)
     if not st:
         return None, None
     t = time.time() if t is None else t
-    key = (station.id, int(t // 30), round(float(radius_deg), 2), shape)
+    key = (station.id, int(t // 30), round(float(radius_deg), 2),
+           round(float(flare_half_width_deg), 2), shape)
     hit = _CACHE.get(key)
     if hit:
         return hit
     sa = sun_altaz(station, t)
     info = {"alt": sa["alt"], "az": sa["az"], "radius_deg": float(radius_deg),
-            "in_fov": False, "x": None, "y": None, "frac": 0.0, "min_sep_deg": None}
+            "in_fov": False, "x": None, "y": None, "frac": 0.0, "min_sep_deg": None,
+            "sun_map": None, "flare_map": None, "flare_frac": 0.0}
     excl = None
     if sa["alt"] > -radius_deg:
         ang = separation_map(station, sa)
         info["min_sep_deg"] = float(ang.min())
         info["in_fov"] = bool(ang.min() < 1.0)           # sun direction inside the grid
-        if info["in_fov"]:
-            info["x"], info["y"] = _sun_pixel(station, sa, t)
+        h, w = shape or st["shape"]
+        if ang.min() < max(1.0, FLARE_MAX_SEP_DEG) + 60.0:
+            info["x"], info["y"] = _sun_pixel(station, sa, t)   # may be off-frame
         coarse = ang <= radius_deg
         if coarse.any():
-            h, w = shape or st["shape"]
             excl = cv2.resize(coarse.astype(np.uint8), (w, h),
                               interpolation=cv2.INTER_NEAREST).astype(bool)
+            info["sun_map"] = excl
+        if (flare_half_width_deg > 0 and info["x"] is not None
+                and ang.min() < FLARE_MAX_SEP_DEG):
+            fl = flare_map(station, info["x"], info["y"], (h, w), flare_half_width_deg)
+            if fl.any():
+                info["flare_map"] = fl
+                info["flare_frac"] = float(fl.mean())
+                excl = fl if excl is None else (excl | fl)
+        if excl is not None:
             info["frac"] = float(excl.mean())
-    if len(_CACHE) > 128:
+    if len(_CACHE) > 24:                 # entries hold full-res maps: keep it small
         _CACHE.clear()
     _CACHE[key] = (excl, info)
     return excl, info
+
+
+def axis_blobs(station, img, keep, sa, t, level=235, min_area=15):
+    """Bright blobs (>= level, unmasked) with their (k, perp_deg) relative to
+    the sun-centre axis -- for finding a lens's ghost positions."""
+    pp = _load(station)["pp"]
+    cx, cy = optical_centre(station)
+    sx, sy = _sun_pixel(station, sa, t)
+    d = math.hypot(sx - cx, sy - cy)
+    if d < 1:
+        return []
+    ux, uy = (sx - cx) / d, (sy - cy) / d
+    y = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    k = np.ones(y.shape, bool) if keep is None else keep
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(((y >= level) & k).astype(np.uint8), 8)
+    out = []
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        bx, by = cents[i]
+        kk = ((bx - cx) * ux + (by - cy) * uy) / d
+        perp = abs((bx - cx) * uy - (by - cy) * ux) / float(pp.F_scale)
+        out.append({"area": area, "x": float(bx), "y": float(by), "k": float(kk), "perp_deg": float(perp)})
+    return sorted(out, key=lambda b: -b["area"])
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +277,18 @@ def measure(station, n_frames=3, max_deg=40, step=2, clip_level=250, clip_thresh
         print("%s  sun alt=%.1f az=%.1f -> px (%.0f,%.0f) %s  min sep %.1f deg" % (
             os.path.basename(f), sa["alt"], sa["az"], xy[0], xy[1],
             "IN FOV" if ang.min() < 1.0 else "outside", ang.min()))
+        try:
+            from podcontrol.frames import static_mask_for
+            keep = static_mask_for(station, img)
+            sun_excl = cv2.resize((ang <= DEFAULT_RADIUS_DEG).astype(np.uint8), (img.shape[1], img.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST).astype(bool)
+            keep = ~sun_excl if keep is None else (keep & ~sun_excl)
+            for b in axis_blobs(station, img, keep, sa, t)[:6]:
+                print("   bright blob %5d px at (%4.0f,%4.0f)  k=%+.2f  %4.1f deg off axis%s" % (
+                    b["area"], b["x"], b["y"], b["k"], b["perp_deg"],
+                    "  <- ON AXIS (flare ghost?)" if b["perp_deg"] < 3 else ""))
+        except Exception as e:
+            print("   (axis analysis skipped: %s)" % e)
         last_clip = None
         for r in range(0, max_deg, step):
             sel = (ang >= r) & (ang < r + step)

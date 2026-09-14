@@ -5,8 +5,9 @@ the shared-AE engine and the WB cloud-gray calibrator. The frame source is
 RMS-safe (reads RMS's saved frames while RMS captures; grabs only when RMS
 is idle). Tiles scale with the window; the overlay shows what the metering
 ignores (red = RMS mask, orange = sun zone) and what drives the exposure
-(magenta = clipped pixels, cyan = the peak pixels of the driving camera). The
-small orange circle labelled "sun" only marks the computed sun position.
+(magenta = clipped pixels, cyan = the peak pixels of the driving camera;
+violet = the lens-flare corridor along the sun-to-centre axis). The small
+orange circle labelled "sun" only marks the computed sun position.
 
 Run:  python -m podcontrol            (pod from ~/source/Stations if present,
                                        else 192.168.42.101-.106)
@@ -37,6 +38,7 @@ BG, PANEL = "#0f0d08", "#14110c"
 SRC_COLOR = {"rms": "#7fc776", "stale": "#f0a830", "grab": "#5aa9e6", "none": "#726650"}
 # translucent overlay tints (RGB)
 TINT_STATIC, TINT_SUN = (220, 60, 60), (255, 190, 40)     # excluded zones
+TINT_FLARE = (170, 110, 255)                              # flare corridor
 TINT_CLIP, TINT_HOT = (255, 0, 255), (0, 255, 255)        # what drives the AE
 OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
@@ -152,7 +154,7 @@ class Tile(tk.Frame):
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             small = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA)
             if overlay and layers:
-                for key, tint in (("static", TINT_STATIC), ("sun", TINT_SUN)):
+                for key, tint in (("static", TINT_STATIC), ("sun", TINT_SUN), ("flare", TINT_FLARE)):
                     if layers.get(key) is not None:
                         _tint(small, layers[key], tint, OVERLAY_ALPHA, (dw, dh))
                 if layers.get("clip") is not None:
@@ -259,6 +261,7 @@ class App(tk.Tk):
         self.sun_radius = tk.DoubleVar(value=F.SUN_RADIUS_DEG[0])
         self.slew = tk.DoubleVar(value=self.ae.cfg.slew)
         self.sun_votes = tk.BooleanVar(value=self.ae.cfg.sun_cam_votes)
+        self.flare_w = tk.DoubleVar(value=F.FLARE_HALF_WIDTH_DEG[0])
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -295,6 +298,10 @@ class App(tk.Tk):
         lab("sun r", padx=(8, 0))
         tk.Spinbox(bar, from_=0, to=45, increment=1, width=4, textvariable=self.sun_radius).pack(side="left")
         lab("°")
+        lab("flare r", padx=(8, 0))
+        tk.Spinbox(bar, from_=0, to=15, increment=0.5, width=4, textvariable=self.flare_w,
+                   format="%.1f").pack(side="left")
+        lab("°")
         tk.Checkbutton(bar, text="sun cam votes", variable=self.sun_votes, fg="#c8bfa8", bg=BG,
                        selectcolor=BG, activebackground=BG).pack(side="left", padx=(8, 0))
         self.status = tk.Label(bar, text="starting…", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="e")
@@ -311,6 +318,7 @@ class App(tk.Tk):
             t0 = time.time()
             try:
                 F.set_sun_radius(self.sun_radius.get())
+                F.set_flare_width(self.flare_w.get())
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:

@@ -151,6 +151,23 @@ so the glow around a just-set sun is excluded as well.
   the halo is larger. Lens-flare ghosts elsewhere in the frame are not covered
   by the circle; the overlay and the clip% show whether anything leaks.
 
+## Lens-flare model
+
+Internal-reflection ghosts sit on the line through the sun's image and the
+optical centre (a radial distortion keeps that line straight) at fixed
+fractions *k* of the sun-to-centre distance, with a roughly constant angular
+size. Measured on US05B1 on 2026-09-14 at four sun positions: one large ghost,
+a pale disc ~5.4° in radius centred at k = −0.40 on the mirrored side (its
+brighter rim at k ≈ −0.57), 60–90 luma above the sky, up to 3° off the axis.
+
+The model excludes ghost **discs** at those *k* (default one at −0.40, radius
+**flare r°** = 7°, spinbox; 0 disables the model) plus a 3° half-width
+**corridor** along the whole axis (rim streaks, smaller ghosts), while the sun
+is inside the field. It is tinted violet in the overlay. Other lenses: run
+`python -m podcontrol.sunmask --measure STATION`, which lists the bright
+blobs with their *k* and off-axis angle, and add `(k, scale)` entries to
+`sunmask.FLARE_GHOSTS`.
+
 ## What is driving the exposure (GUI)
 
 With Shared AE on, the tile of the camera whose need set the pod target gets

@@ -279,6 +279,15 @@ def set_sun_radius(deg):
     SUN_RADIUS_DEG[0] = max(0.0, float(deg))
 
 
+# Flare ghost radius (deg) for the lens-flare model (ghost discs on the
+# sun-centre axis + a narrow corridor); 0 = off.
+FLARE_HALF_WIDTH_DEG = [7.0]
+
+
+def set_flare_width(deg):
+    FLARE_HALF_WIDTH_DEG[0] = max(0.0, float(deg))
+
+
 def mask_for(station, img, t=None, layers=False):
     """Combined measurement mask for img (True = pixel counts), or None when
     nothing is excluded: the station's static RMS mask AND the sun exclusion
@@ -292,11 +301,14 @@ def mask_for(station, img, t=None, layers=False):
     sun_excl, sun_info = None, None
     if SUN_RADIUS_DEG[0] > 0:
         from podcontrol import sunmask
-        sun_excl, sun_info = sunmask.exclusion(station, t, SUN_RADIUS_DEG[0], img.shape[:2])
+        sun_excl, sun_info = sunmask.exclusion(station, t, SUN_RADIUS_DEG[0], img.shape[:2],
+                                               FLARE_HALF_WIDTH_DEG[0])
     if sun_excl is not None:
         keep = ~sun_excl if keep is None else (keep & ~sun_excl)
     if layers:
-        return keep, {"static": static_excl, "sun": sun_excl, "sun_info": sun_info}
+        si = sun_info or {}
+        return keep, {"static": static_excl, "sun": si.get("sun_map"),
+                      "flare": si.get("flare_map"), "sun_info": sun_info}
     return keep
 
 
@@ -354,7 +366,7 @@ def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
 
 def stats_for_path(station, path, t):
     """luma_stats of a saved frame (masked, sun at t), cached by path."""
-    key = (path, round(F_SUN_RADIUS(), 2))
+    key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2))
     hit = _STATS_CACHE.get(key)
     if hit is not None:
         return hit
