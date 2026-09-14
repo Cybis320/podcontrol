@@ -36,7 +36,7 @@ if __name__ == "__main__" and not __package__:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-import math, time
+import math, re, time
 
 
 class AEConfig:
@@ -59,11 +59,33 @@ class AEConfig:
     period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
     settle_s = 1.5              # an apply is in effect this long after it was sent
     slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
+    night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n)
+    dawn_unlatch_deg = -12.0    # may unlatch once the sun is rising above this
+    dusk_ramp_deg = 6.0         # over the last N deg before the night switch, force the
+                                # pod up to the night line so the hand-over has no jump
+                                # (the twilight sky needs far less light than the night
+                                # line; 0 = no ramp, i.e. RMS's hard cut at the switch)
+    night_line = None           # RMS night exposure line, e.g. "manual -a 22924 -i 2048 -e 39941";
+                                # the ladder's top rung is made identical to it
     sun_cam_votes = True        # EVERY unmasked pixel on EVERY camera counts
                                 # (operator decision 2026-09-14): the sun camera
                                 # votes like any other; the sun zone radius is
                                 # the operator's lever. False = it follows only.
     history_s = 300.0           # how long we remember our applies (frame latency)
+
+    def set_night_line(self, cmd):
+        """Derive the ladder caps from RMS's night line so the top rung IS the
+        night line (exp_max_us, analog max, ISP-digital max)."""
+        if not cmd:
+            return False
+        m = dict(re.findall(r"-(a|d|i|e)\s+(\d+)", cmd))
+        if "e" not in m or "a" not in m:
+            return False
+        self.night_line = cmd
+        self.exp_max_us = int(m["e"])
+        self.analog_max_x = int(m["a"]) / 1024.0
+        self.boost_max_x = int(m.get("i", 1024)) / 1024.0
+        return True
 
 
 class SharedAE:
@@ -81,6 +103,10 @@ class SharedAE:
         self._applied_li = None
         self.needs = {}                      # cam -> (li_needed, why) from the last set
         self.followers = {}                  # cam -> (li_needed, why) not voting (sun in FOV)
+        self.latched = False                 # night: pinned at the night line, silent
+        self.sun_alt = None                  # deg, updated by update_sun()
+        self.sun_rising = None
+        self.state = "day"                   # day | dusk | night | dawn (for display)
         self.driver = None                   # cam whose need set the target
         self.driver_why = None               # 'clipping' | 'headroom' | 'at target'
 
@@ -111,6 +137,9 @@ class SharedAE:
         g = max(1.0, target / exp)                      # gain makes up the rest
         analog = min(g, c.analog_max_x)
         boost = min(c.boost_max_x, max(1.0, g / analog))
+        if li >= self._max_li() - 1e-6:
+            # the top rung IS the night line (byte-identical hand-over to RMS)
+            return int(c.exp_max_us), c.analog_max_x, c.boost_max_x
         return int(round(exp)), analog, boost
 
     # --- seeding -----------------------------------------------------------
@@ -150,9 +179,74 @@ class SharedAE:
         return li if li is not None else (self.hist[0][1] if self.hist else self.li)
 
     def takeover(self, poll):
-        """Seed the ladder AND remember how to hand every camera back."""
+        """Seed the ladder AND remember how to hand every camera back. At
+        night (sun below the RMS switch) we latch immediately and touch
+        nothing: RMS's night line is in place and is exactly our top rung."""
         self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
-        return self.seed(poll)
+        li = self.seed(poll)
+        if self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg:
+            self.li = self.target = self._max_li()
+            self.latched = True
+            self.state = "night"
+            self._applied_li = self.li           # nothing to push
+        return li
+
+    def update_sun(self, alt_deg, rising):
+        """Feed the sun altitude (deg) and whether it is rising; sets state."""
+        self.sun_alt, self.sun_rising = alt_deg, bool(rising)
+        c = self.cfg
+        if self.latched:
+            self.state = "night" if alt_deg < c.night_switch_deg else "dawn"
+        elif alt_deg < 0:
+            self.state = "dawn" if rising else "dusk"
+        else:
+            self.state = "day"
+
+    def _dusk_ramp_target(self):
+        """During the last dusk_ramp_deg before RMS's night switch, the light
+        index the pod should be at so that it reaches the top rung exactly at
+        the switch (linear in sun altitude from where the ramp starts)."""
+        c = self.cfg
+        if c.dusk_ramp_deg <= 0 or self.sun_alt is None or self.sun_rising:
+            return None
+        start = c.night_switch_deg + c.dusk_ramp_deg
+        if self.sun_alt > start:
+            self._ramp_from = None
+            return None
+        if getattr(self, "_ramp_from", None) is None:
+            self._ramp_from = self.li        # where the AE was when the ramp began
+        frac = min(1.0, max(0.0, (start - self.sun_alt) / c.dusk_ramp_deg))
+        return self._ramp_from + frac * (self._max_li() - self._ramp_from)
+
+    def _maybe_latch(self):
+        """Latch at the night line: when the ladder reaches the top rung, or
+        when RMS switches to night (sun below the switch and setting)."""
+        c = self.cfg
+        if self.latched or self.sun_alt is None:
+            return False
+        at_top = self.li >= self._max_li() - 1e-6
+        rms_night = self.sun_alt < c.night_switch_deg and not self.sun_rising
+        if at_top or rms_night:
+            self.li = self.target = self._max_li()
+            self.latched = True
+            self.state = "night"
+            return True
+        return False
+
+    def _maybe_unlatch(self, metering):
+        """Dawn: unlatch once the sun is rising above dawn_unlatch_deg AND a
+        fresh set asks for less light than the night line."""
+        c = self.cfg
+        if not self.latched or self.sun_alt is None:
+            return False
+        if not (self.sun_rising and self.sun_alt > c.dawn_unlatch_deg):
+            return False
+        needs = [n for n in (self._need(m) for m in metering.values() if m) if n is not None]
+        if needs and min(n[0] for n in needs) < self.li - c.deadband:
+            self.latched = False
+            self.state = "dawn"
+            return True
+        return False
 
     # --- freshness (kept for callers; the controller no longer needs it) ----
     def fresh(self, metering):
@@ -221,15 +315,36 @@ class SharedAE:
         lums = [m["mean"] for m in metering.values() if m]
         clips = [m["clip"] for m in metering.values() if m]
         peaks = [m.get("peak") for m in metering.values() if m and m.get("peak") is not None]
+        prev = self.li
+        if self.latched:
+            self._maybe_unlatch(metering)
+        if self.latched:
+            # night: pinned at the night line, silent (nothing can move the pod)
+            exp, analog, boost = self._li_to_exp_gain(self.li)
+            self.last = {"pod_lum": max(lums) if lums else None, "pod_clip": max(clips) if clips else None,
+                         "pod_peak": max(peaks) if peaks else None, "d_stops": 0.0,
+                         "reason": "latched at night line", "li": self.li, "target": self.target,
+                         "to_go": 0.0, "exp_us": exp, "analog_x": analog, "boost_x": boost,
+                         "total_gain_x": analog * boost, "driver": None, "driver_why": None,
+                         "needs": {}, "changed": self._applied_li is None, "state": self.state}
+            return self.last
         self.evaluate(metering)
-        err = self.target - self.li
+        target = self.target
+        ramp = self._dusk_ramp_target()
+        if ramp is not None and ramp > target:
+            target = ramp                    # dusk: climb to the night line by the switch
+        err = target - self.li
         d = max(-c.slew, min(c.slew, err))
         if abs(err) < 1e-3:
             d = 0.0
-        prev = self.li
         self.li = max(0.0, min(self.li + d, self._max_li()))
+        just_latched = self._maybe_latch()
         exp, analog, boost = self._li_to_exp_gain(self.li)
-        if d:
+        if just_latched:
+            reason = "reached night line -> latched"
+        elif ramp is not None and ramp > self.target and d > 0:
+            reason = "dusk ramp to night line \u2191"
+        elif d:
             reason = "slew\u2191" if d > 0 else "slew\u2193"
         elif self.waiting and not self.needs:
             reason = "awaiting first post-takeover set"   # sets so far predate our control
@@ -247,8 +362,18 @@ class SharedAE:
                      "driver": self.driver, "driver_why": self.driver_why,
                      "needs": {k: (v[0] - self.li, v[1]) for k, v in
                                list(self.needs.items()) + list(self.followers.items())},
-                     "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None}
+                     "state": self.state, "ramp": ramp,
+                     "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
+
+    def repin_needed(self, poll):
+        """True if RMS (or anything) put a camera back in AUTO while we are
+        driving and not latched -- e.g. RMS's dawn day-switch. The caller
+        re-applies so at most one frame sees the camera's own AE."""
+        if self.latched or self._applied_li is None:
+            return False
+        return any(d.get("online") and (d.get("optype") or "").upper() == "AUTO"
+                   for d in poll.values())
 
     def apply(self, platform="imx291", timeout=5.0):
         """Push the last-computed exp+gain to all cameras (platform-aware split)."""
@@ -277,6 +402,34 @@ class SharedAE:
         return self.pod.auto_all(timeout=timeout)
 
 
+def configure_from_pod(ae, pod):
+    """Make the ladder's top rung RMS's night line (from the first station
+    with a camera_settings file)."""
+    for st in getattr(pod, "stations", []):
+        line = st.mode_cmd("night") if hasattr(st, "mode_cmd") else None
+        if line and ae.cfg.set_night_line(line):
+            return line
+    return None
+
+
+def feed_sun(ae, pod, t=None):
+    """Update the controller with the sun altitude / rising flag from the
+    first station that has a platepar. Returns (alt, rising) or None."""
+    try:
+        from podcontrol import sunmask
+    except Exception:
+        return None
+    t = time.time() if t is None else t
+    for st in getattr(pod, "stations", []):
+        sa = sunmask.sun_altaz(st, t)
+        if sa is None:
+            continue
+        sa2 = sunmask.sun_altaz(st, t + 600)
+        ae.update_sun(sa["alt"], sa2["alt"] > sa["alt"])
+        return sa["alt"], sa2["alt"] > sa["alt"]
+    return None
+
+
 def _pod_platform(poll):
     plats = [d.get("platform") for d in poll.values() if d.get("online")]
     for p in ("goke", "imx291"):
@@ -289,13 +442,15 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
     """Headless shared-AE loop. meter_fn() -> {cam:{mean,clip}}. Releases to auto on exit."""
     ae = SharedAE(pod, cfg)
     cfg = ae.cfg
+    configure_from_pod(ae, pod)
     ae.takeover(pod.poll_all(timeout=4))     # start from where the cameras are
     try:
         while not stop():
             poll = pod.poll_all(timeout=4)
+            feed_sun(ae, pod)
             m = {sid: v for sid, v in meter_fn().items() if poll.get(sid, {}).get("online")}
             info = ae.step(m)
-            if info["changed"]:
+            if info["changed"] or ae.repin_needed(poll):
                 ae.apply(platform=_pod_platform(poll))
             if on_tick:
                 on_tick(info, poll)

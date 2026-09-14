@@ -31,7 +31,7 @@ from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
 from podcontrol import frames as F
 from podcontrol.frames import frame_for, fresh_frame, luma_stats, mask_for, highlight_maps
-from podcontrol.sharedae import SharedAE, _pod_platform
+from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 
 COLS = 3
 BG, PANEL = "#0f0d08", "#14110c"
@@ -250,6 +250,7 @@ class App(tk.Tk):
             self.pod.auto_all = lambda *a, **k: {}
         self.allow_grab = allow_grab
         self.ae = SharedAE(self.pod)
+        configure_from_pod(self.ae, self.pod)      # top rung = RMS night line
         self.ae_on = False
         self.ae_info = None
         self.ae_slot = None
@@ -324,6 +325,7 @@ class App(tk.Tk):
             except Exception:
                 pass
             poll = self.pod.poll_all(timeout=4)
+            feed_sun(self.ae, self.pod)
             futs = {self._pool.submit(frame_for, s, self.allow_grab, True): s.id
                     for s in self.stations}
             frames, lumas, layers = {}, {}, {}
@@ -348,7 +350,7 @@ class App(tk.Tk):
                 ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
                 self.ae_slot = slot
                 info = self.ae.step(ctl)       # target from the set, one small slew step
-                if info.get("changed"):
+                if info.get("changed") or self.ae.repin_needed(poll):
                     try:
                         self.ae.apply(platform=_pod_platform(poll))
                     except Exception:
@@ -384,8 +386,9 @@ class App(tk.Tk):
                 daemons = sum(1 for v in poll.values() if v.get("online"))
                 ae = ""
                 if info:
-                    ae = "  AE %s exp=%dus gain=%.2fx (to go %+.2f stop; set %s)" % (
-                        info["reason"], info["exp_us"], info["total_gain_x"], info.get("to_go", 0.0),
+                    ae = "  AE[%s] %s exp=%dus gain=%.2fx (to go %+.2f stop; set %s)" % (
+                        info.get("state", "?"), info["reason"], info["exp_us"], info["total_gain_x"],
+                        info.get("to_go", 0.0),
                         ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
                 self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
                     daemons, len(self.stations),
@@ -403,8 +406,10 @@ class App(tk.Tk):
             # start from the cameras' current (darkest) exposure, not a fixed
             # mid-ladder guess that blows out a daytime scene
             self.ae_info = None
-            threading.Thread(target=lambda: self.ae.takeover(self.pod.poll_all(timeout=4)),
-                             daemon=True).start()
+            def _take():
+                feed_sun(self.ae, self.pod)
+                self.ae.takeover(self.pod.poll_all(timeout=4))
+            threading.Thread(target=_take, daemon=True).start()
         else:
             threading.Thread(target=lambda: self.ae.release(), daemon=True).start()
 

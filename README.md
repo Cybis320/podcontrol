@@ -197,6 +197,34 @@ vote)`); if every camera sees the sun they all vote regardless.
 targets, driver display) without ever sending an exposure command — for
 demos and UI testing on a live pod.
 
+## RMS ↔ podcontrol: who owns what
+
+RMS owns colour and the night. At every −9° sun crossing it replays
+camera_settings (`SwitchMode day|night`): day = `auto …` + daylight WB, colour;
+night = the fixed science exposure line + `wb unity`, mono. The FramesFiles
+frames carry `_d`/`_n` accordingly, and the colour→mono cut sits on that
+boundary on purpose. podcontrol never touches WB, CCM, saturation or IR-cut;
+it owns **exposure only, and only while the sun is above the switch**:
+
+- **Day**: Shared AE slews the pod as described above.
+- **Dusk**: the ladder's top rung is made byte-identical to RMS's night line
+  (from camera_settings). Because the twilight sky needs far less light than
+  that line, the AE would not reach it by −9° on its own and RMS's switch would
+  be a multi-stop jump; so over the last `dusk_ramp_deg` (6°, ~30 min) the pod
+  is ramped up to the night line at the slew rate and **latches** exactly at the
+  switch. RMS then writes the same values: no exposure step, only the intended
+  colour→mono cut.
+- **Night**: latched and silent. Nothing podcontrol sees (moon, lit clouds,
+  headlights) can move the pod; RMS owns it.
+- **Dawn**: unlatch once the sun is rising above −12° and a fresh set asks for
+  less light; slew down. When RMS's day switch sends `auto`, podcontrol re-pins
+  on the next cycle, so at most one frame shows a camera's own AE.
+
+Switching Shared AE on at night latches immediately and sends nothing.
+Still open: a lease in the camera daemon so a dead podcontrol can never
+strand the pod (today a hard kill leaves it pinned until the next switch), and
+daemon-side metering to drop the ~50 s frame latency.
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).
