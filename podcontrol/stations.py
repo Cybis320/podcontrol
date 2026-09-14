@@ -11,8 +11,11 @@ Preferring the RMS Stations directory matters: it carries each camera's
 data_dir, which is what lets the frame source read RMS's own saved frames
 instead of opening a second RTSP session on a capturing camera.
 
-A camera has an id, an ip (for the :9600 daemon + RTSP), and an optional
-data_dir (where RMS writes FramesFiles we can read for previews/metering).
+A camera has an id, an ip (for the :9600 daemon + RTSP), an optional
+data_dir (where RMS writes FramesFiles we can read for previews/metering) and
+an optional mask_path: the station's RMS mask.bmp (0 = excluded). Metering
+ignores masked pixels so a bright light in a masked zone (a street lamp, a
+roof edge) cannot drive the pod's shared AE or the WB calibration.
 """
 import os, re, glob, json
 
@@ -20,10 +23,11 @@ DEFAULT_IPS = ["192.168.42.%d" % n for n in range(101, 107)]
 
 
 class Station:
-    def __init__(self, station_id, ip, data_dir=""):
+    def __init__(self, station_id, ip, data_dir="", mask_path=""):
         self.id = station_id
         self.ip = ip
         self.data_dir = os.path.expanduser(data_dir) if data_dir else ""
+        self.mask_path = os.path.expanduser(mask_path) if mask_path else ""
 
     @property
     def frames_dir(self):
@@ -62,7 +66,7 @@ def parse_ip_spec(spec):
 def from_pod_file(path):
     """JSON: {"cameras":[{"id":..,"ip":..,"data_dir":..}, ...]}."""
     data = json.load(open(os.path.expanduser(path)))
-    return [Station(c.get("id") or c["ip"], c["ip"], c.get("data_dir", ""))
+    return [Station(c.get("id") or c["ip"], c["ip"], c.get("data_dir", ""), c.get("mask", ""))
             for c in data.get("cameras", data if isinstance(data, list) else [])]
 
 
@@ -77,7 +81,10 @@ def discover_stations(stations_dir):
         sid = _get(txt, "stationID") or os.path.basename(os.path.dirname(cfg))
         m = re.search(r'rtsp://(\d+\.\d+\.\d+\.\d+)', _get(txt, "device", "") or "")
         if m:
-            out.append(Station(sid, m.group(1), _get(txt, "data_dir", "")))
+            # RMS: mask = <config dir>/<basename of [Capture] mask>, default mask.bmp
+            mask_name = os.path.basename(_get(txt, "mask", "") or "mask.bmp")
+            out.append(Station(sid, m.group(1), _get(txt, "data_dir", ""),
+                               os.path.join(os.path.dirname(cfg), mask_name)))
     return out
 
 
@@ -110,4 +117,5 @@ def discover(stations_dir=None):
 
 if __name__ == "__main__":
     for s in get_pod():
-        print(s, "data_dir:", s.data_dir or "(none -> RTSP grab)")
+        print(s, "data_dir:", s.data_dir or "(none -> RTSP grab)",
+              "mask:", s.mask_path if s.mask_path and os.path.isfile(s.mask_path) else "(none)")

@@ -163,15 +163,17 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
 if __name__ == "__main__":
     from podcontrol.stations import get_pod
     from podcontrol.podctl import PodController
-    from podcontrol.frames import frame_for, luma_stats
+    from podcontrol.frames import frame_for, luma_stats, mask_for
     from concurrent.futures import ThreadPoolExecutor
     pod = PodController(get_pod())
     pool = ThreadPoolExecutor(max_workers=8)
 
     def meter():
         sts = pod.stations
-        imgs = dict(zip([s.id for s in sts], pool.map(lambda s: frame_for(s)[0], sts)))
-        return {sid: luma_stats(img) for sid, img in imgs.items()}
+        imgs = dict(zip(sts, pool.map(lambda s: frame_for(s)[0], sts)))
+        # masked pixels (RMS mask.bmp) never count -- a lamp behind the mask
+        # cannot pull the pod's exposure down
+        return {s.id: luma_stats(img, mask_for(s, img)) for s, img in imgs.items()}
 
     def tick(info, poll):
         print("li=%.2f  lum=%.0f clip=%.1f%%  -> exp=%dus gain=%.1fx  (%s %+.2f)" % (

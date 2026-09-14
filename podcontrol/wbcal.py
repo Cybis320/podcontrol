@@ -18,15 +18,23 @@ def _clamp(v, lo=GAIN_MIN, hi=GAIN_MAX):
     return max(lo, min(hi, v))
 
 
-def region_mean_rgb(bgr, box):
-    """Mean (R,G,B) over box=(x0,y0,x1,y1) of a BGR frame (cv2 order)."""
+def region_mean_rgb(bgr, box, mask=None):
+    """Mean (R,G,B) over box=(x0,y0,x1,y1) of a BGR frame (cv2 order).
+    With a full-frame boolean mask (True = count), masked pixels inside the
+    box are ignored; None if nothing countable remains."""
     x0, y0, x1, y1 = box
     x0, x1 = sorted((max(0, int(x0)), max(0, int(x1))))
     y0, y1 = sorted((max(0, int(y0)), max(0, int(y1))))
     roi = bgr[y0:y1, x0:x1]
     if roi.size == 0:
         return None
-    b, g, r = roi[:, :, 0].mean(), roi[:, :, 1].mean(), roi[:, :, 2].mean()
+    if mask is not None and mask.shape[:2] == bgr.shape[:2]:
+        roi = roi[mask[y0:y1, x0:x1]]            # -> (N, 3)
+        if roi.size == 0:
+            return None
+        b, g, r = roi[:, 0].mean(), roi[:, 1].mean(), roi[:, 2].mean()
+    else:
+        b, g, r = roi[:, :, 0].mean(), roi[:, :, 1].mean(), roi[:, :, 2].mean()
     return float(r), float(g), float(b)
 
 
@@ -77,13 +85,15 @@ def calibrate(measure, apply_wb, gains0=(UNITY, UNITY, UNITY),
 
 
 def run_pod_calibration(pod, ref_id, box, frame_fn=None, settle_s=2.5, start_unity=True,
-                        on_step=None, fresh_fn=None, **kw):
+                        on_step=None, fresh_fn=None, mask_fn=None, **kw):
     """Calibrate on ref camera's `box`, push the WB to the whole pod.
 
     fresh_fn(station, after_epoch) -> BGR frame captured AFTER the last WB push
         (preferred; see frames.fresh_frame -- on a capturing camera this waits
         for RMS's next saved block, ~50 s, instead of measuring a pre-change frame)
-    frame_fn(station) -> BGR frame, sampled settle_s after the push (legacy)."""
+    frame_fn(station) -> BGR frame, sampled settle_s after the push (legacy).
+    mask_fn(station, img) -> boolean mask (True = count) or None; masked pixels
+        inside the box are ignored (see frames.mask_for)."""
     import time
     ref = next(s for s in pod.stations if s.id == ref_id)
     state = {"t_apply": 0.0}
@@ -94,7 +104,9 @@ def run_pod_calibration(pod, ref_id, box, frame_fn=None, settle_s=2.5, start_uni
         else:
             time.sleep(settle_s)             # let the WB + a fresh frame land
             img = frame_fn(ref)
-        return region_mean_rgb(img, box) if img is not None else None
+        if img is None:
+            return None
+        return region_mean_rgb(img, box, mask_fn(ref, img) if mask_fn else None)
 
     def apply_wb(R, G, B):
         pod.wb_all(R, G, B)
@@ -117,7 +129,7 @@ if __name__ == "__main__":
     import argparse
     from podcontrol.stations import get_pod
     from podcontrol.podctl import PodController
-    from podcontrol.frames import fresh_frame
+    from podcontrol.frames import fresh_frame, mask_for
     ap = argparse.ArgumentParser(description="Cloud-gray WB calibration (pushes to whole pod).")
     ap.add_argument("--camera", required=True, help="reference station id (e.g. cam101)")
     ap.add_argument("--box", required=True, help="x0,y0,x1,y1 region (full-frame px) that should be grey")
@@ -133,6 +145,7 @@ if __name__ == "__main__":
     print("calibrating on %s box=%s ..." % (args.camera, box))
     gains, err, n = run_pod_calibration(
         pod, args.camera, box, tol=args.tol, on_step=step,
-        fresh_fn=lambda s, after: fresh_frame(s, after, allow_grab=False)[0])
+        fresh_fn=lambda s, after: fresh_frame(s, after, allow_grab=False)[0],
+        mask_fn=mask_for)
     print("DONE: gains R=%d G=%d B=%d (%.2f/%.2f/%.2fx)  err=%.3f  in %d iters -> pushed to pod"
           % (gains[0], gains[1], gains[2], gains[0] / 256, gains[1] / 256, gains[2] / 256, err, n))

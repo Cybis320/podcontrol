@@ -105,6 +105,20 @@ opencv-python 5 drags in numpy 2, which breaks RMS's compiled extensions):
 - The pod is discovered from `~/source/Stations` (RMS `.config` → camera IP +
   `data_dir`) when present, so the production pod works out of the box.
 
+## RMS mask = metering exclusion zone
+
+Each station's RMS mask (`~/source/Stations/<ID>/mask.bmp`, or the `mask`
+entry in its `.config`; 0 = excluded, same convention as RMS) is applied to
+every measurement podcontrol makes:
+
+- shared-AE metering (mean luma, clip fraction, 99.9th-percentile peak) counts
+  only unmasked pixels, so a street lamp or a lit roof edge inside the mask can
+  never pull the whole pod's exposure down;
+- the WB cloud-gray region mean ignores masked pixels inside the drawn box;
+- preview tiles dim the masked area and show `maskNN%` in the telemetry line.
+
+A station without a mask file is metered over the full frame.
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).

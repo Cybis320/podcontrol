@@ -19,12 +19,13 @@ if __name__ == "__main__" and not __package__:
 import time, threading, queue, os
 import tkinter as tk
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 from concurrent.futures import ThreadPoolExecutor
 
 from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
-from podcontrol.frames import frame_for, fresh_frame, luma_stats
+from podcontrol.frames import frame_for, fresh_frame, luma_stats, mask_for
 from podcontrol.sharedae import SharedAE, _pod_platform
 
 TILE_W, TILE_H = 448, 252
@@ -88,8 +89,9 @@ class Tile(tk.Frame):
         return (int(min(x0, x1) * sx), int(min(y0, y1) * sy),
                 int(max(x0, x1) * sx), int(max(y0, y1) * sy))
 
-    def render(self, img, source, tel, luma):
-        # image (Canvas: keep image + selection rectangle)
+    def render(self, img, source, tel, luma, mask=None):
+        # image (Canvas: keep image + selection rectangle); masked (excluded)
+        # pixels are dimmed so what the metering ignores is visible
         if img is None:
             if self._img_id:
                 self.canvas.delete(self._img_id); self._img_id = None
@@ -102,7 +104,12 @@ class Tile(tk.Frame):
                 self.canvas.delete(self._txt_id); self._txt_id = None
             self.frame_wh = (img.shape[1], img.shape[0])
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            im = Image.fromarray(rgb).resize((TILE_W, TILE_H), Image.BILINEAR)
+            small = cv2.resize(rgb, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
+            if mask is not None:
+                m = cv2.resize(mask.astype(np.uint8), (TILE_W, TILE_H),
+                               interpolation=cv2.INTER_NEAREST).astype(bool)
+                small[~m] = (small[~m] * 0.35).astype(np.uint8)
+            im = Image.fromarray(small)
             self._photo = ImageTk.PhotoImage(im)
             if self._img_id:
                 self.canvas.itemconfig(self._img_id, image=self._photo)
@@ -130,9 +137,10 @@ class Tile(tk.Frame):
             line2 += "wb %s " % ("auto" if wb.get("op") == "auto" else "%.2f/%.2f" % (wb["gains"][0], wb["gains"][-1]))
         if qp and qp.get("maxqp") is not None:
             line2 += "qp %s" % qp["maxqp"]
-        self.tele.config(fg=bcol, text="%s  lum %s%s  exp %sus\nAGain %.2fx  ISO %s  %s\n%s" % (
+        masked = (" mask%.0f%%" % (100 * luma["masked"])) if luma and luma.get("masked") else ""
+        self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\nAGain %.2fx  ISO %s  %s\n%s" % (
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
-            (" clip%.0f%%" % (clip * 100)) if clip else "",
+            (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
             tel.get("exp_us"), tel.get("again_x") or 0, tel.get("iso"),
             ("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or ""),
             line2))
@@ -144,6 +152,7 @@ class App(tk.Tk):
         self.title("Pod Control — pod as one camera")
         self.configure(bg="#0f0d08")
         self.stations = get_pod()
+        self.by_id = {s.id: s for s in self.stations}
         self.pod = PodController(self.stations)
         self.allow_grab = allow_grab
         self.ae = SharedAE(self.pod)
@@ -193,7 +202,7 @@ class App(tk.Tk):
                 except Exception:
                     img, src = None, "none"
                 frames[sid] = (img, src)
-                lumas[sid] = luma_stats(img)
+                lumas[sid] = luma_stats(img, mask_for(self.by_id[sid], img))
             if self.ae_on:
                 ctl = {sid: lumas[sid] for sid in lumas if poll.get(sid, {}).get("online")}
                 info = self.ae.step(ctl)
@@ -216,7 +225,8 @@ class App(tk.Tk):
                 brights = []
                 for sid, t in self.tiles.items():
                     img, src = frames.get(sid, (None, "none"))
-                    t.render(img, src, poll.get(sid), lumas.get(sid))
+                    t.render(img, src, poll.get(sid), lumas.get(sid),
+                             mask_for(self.by_id[sid], img))
                     b = (poll.get(sid) or {}).get("avelum")
                     if b is None and lumas.get(sid):
                         b = lumas[sid]["mean"]
@@ -278,7 +288,8 @@ class App(tk.Tk):
             try:
                 gains, err, n = run_pod_calibration(
                     self.pod, self.selected, box, on_step=on_step,
-                    fresh_fn=lambda st, after: fresh_frame(st, after, self.allow_grab)[0])
+                    fresh_fn=lambda st, after: fresh_frame(st, after, self.allow_grab)[0],
+                    mask_fn=mask_for)
                 self.status.config(text="WB pushed to pod: %.2f/%.2f/%.2fx  err=%.3f (%d iters)" % (
                     gains[0]/256, gains[1]/256, gains[2]/256, err, n))
             except Exception as e:

@@ -11,6 +11,7 @@ We decide per camera from frame recency, so the app self-adjusts as RMS starts
 or stops. A hard 'allow_grab=False' forces read-only no matter what.
 """
 import os, re, glob, time, calendar, subprocess, cv2
+import numpy as np
 
 SCRATCH = "/tmp/podcontrol"
 os.makedirs(SCRATCH, exist_ok=True)
@@ -191,15 +192,64 @@ def fresh_frame(station, after, allow_grab=True, settle_s=2.5, max_wait=120.0, p
         time.sleep(poll_s)
 
 
-def luma_stats(bgr):
-    """Metering from a frame: (mean luma 0-255, clipped-pixel fraction 0-1).
-    The universal exposure signal -- works on IMX291 (no daemon AveLum) and Goke."""
+# ---------------------------------------------------------------------------
+# RMS mask: <station dir>/mask.bmp, 0 = excluded, >0 = kept (same convention as
+# RMS.Routines.MaskImage). Metering skips excluded pixels so a lamp or roof
+# edge inside the mask cannot drive the shared AE or the WB calibration.
+_MASK_CACHE = {}
+
+
+def load_mask(station):
+    """Boolean array (True = pixel counts) from the station's mask file, or
+    None when the station has no mask. Cached; reloads if the file changes."""
+    path = getattr(station, "mask_path", "") or ""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return None
+    hit = _MASK_CACHE.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if m is None:
+        return None
+    if m.ndim == 3:
+        m = m[:, :, 0]
+    keep = m > 0
+    _MASK_CACHE[path] = (mt, keep)
+    return keep
+
+
+def mask_for(station, img):
+    """The station mask sized to img (nearest-neighbour), or None."""
+    keep = load_mask(station)
+    if keep is None or img is None:
+        return None
+    h, w = img.shape[:2]
+    if keep.shape != (h, w):
+        keep = cv2.resize(keep.astype(np.uint8), (w, h),
+                          interpolation=cv2.INTER_NEAREST).astype(bool)
+    return keep
+
+
+def luma_stats(bgr, mask=None):
+    """Metering from a frame: mean luma (0-255), clipped-pixel fraction (0-1)
+    and the 99.9th-percentile peak -- over the UNMASKED pixels only when a mask
+    (True = count) of the same size is given. The universal exposure signal:
+    works on IMX291 (no daemon AveLum) and Goke alike."""
     if bgr is None:
         return None
-    import numpy as np
     y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    masked = 0.0
+    if mask is not None and mask.shape == y.shape:
+        masked = float(1.0 - mask.mean())
+        y = y[mask]
+        if y.size == 0:
+            return None
     return {"mean": float(y.mean()), "clip": float((y >= 250).mean()),
-            "peak": float(np.percentile(y, 99.9))}
+            "peak": float(np.percentile(y, 99.9)), "masked": masked}
 
 
 if __name__ == "__main__":
@@ -208,7 +258,8 @@ if __name__ == "__main__":
     allow = "--grab" in sys.argv          # default: never open RTSP from the CLI
     for s in get_pod():
         img, src = frame_for(s, allow_grab=allow)
-        st = luma_stats(img)
+        st = luma_stats(img, mask_for(s, img))
         print("%-8s %-15s %-6s %s  luma=%s" % (
             s.id, s.ip, src, None if img is None else img.shape,
-            None if st is None else "mean=%.0f clip=%.3f" % (st["mean"], st["clip"])))
+            None if st is None else "mean=%.0f clip=%.4f peak=%.0f masked=%.0f%%" % (
+                st["mean"], st["clip"], st["peak"], 100 * st["masked"])))
