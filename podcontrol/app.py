@@ -357,7 +357,7 @@ class App(tk.Tk):
         lab(g, "refresh"); spin(g, self.interval, 2, 60, 1, 4); lab(g, "s", padx=(0, 8))
         lab(g, "slew"); spin(g, self.slew, 0.01, 0.5, 0.01, 5, "%.2f"); lab(g, "stop/cycle", padx=(0, 8))
         lab(g, "clip \u2264"); spin(g, self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f"); lab(g, "%", padx=(0, 8))
-        lab(g, "pt-src <"); spin(g, self.min_blob, 0, 5000, 100, 5); lab(g, "px")
+        lab(g, "pt-src <"); spin(g, self.min_blob, 0, 5000, 50, 5); lab(g, "px")
 
         g = group(row2, "masks & overlay")
         check(g, "overlay", self.overlay, padx=(0, 8))
