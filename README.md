@@ -79,9 +79,11 @@ TL;DR of the gaps that matter for the pod goals:
 
 ## Installing into the RMS venv
 
-Install **editable** so the `podcontrol` command tracks the checkout, and with
-`--no-deps` so pip never touches RMS's pinned numpy/OpenCV (an unconstrained
-install once upgraded numpy to 2.x and broke RMS's compiled extensions):
+The RMS venv (`~/vRMS`) is created with `--system-site-packages` and uses the
+system `python3-opencv` (4.6) and `python3-numpy` (1.26). Install podcontrol
+**editable** so the `podcontrol` command tracks the checkout, and with
+`--no-deps` so pip never adds an `opencv-python`/`numpy` of its own (a pip
+opencv-python 5 drags in numpy 2, which breaks RMS's compiled extensions):
 
 ```
 ~/vRMS/bin/pip install --no-deps -e ~/source/podcontrol

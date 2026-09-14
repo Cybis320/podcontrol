@@ -1,6 +1,7 @@
-opencv-python>=4.5,<5
-numpy<2
 Pillow>=9
-# System packages (not pip-installable):
-#   python3-tk   (Tkinter GUI)
-#   ffmpeg       (RTSP grab fallback, only used when RMS is idle)
+# System packages (not pip-installable; do NOT pip install opencv-python/numpy
+# into the RMS venv -- it is --system-site-packages and uses these):
+#   python3-opencv  (cv2 4.6; opencv-python 5 drags numpy 2 and breaks RMS)
+#   python3-numpy   (1.26.x, RMS pins numpy<2)
+#   python3-tk      (Tkinter GUI)
+#   ffmpeg          (RTSP grab fallback, only used when RMS is idle)
