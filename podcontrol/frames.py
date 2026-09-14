@@ -366,7 +366,7 @@ def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
 
 def stats_for_path(station, path, t):
     """luma_stats of a saved frame (masked, sun at t), cached by path."""
-    key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2))
+    key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2), CLIP_MIN_BLOB_PX[0])
     hit = _STATS_CACHE.get(key)
     if hit is not None:
         return hit
@@ -424,22 +424,47 @@ def highlight_maps(bgr, keep, peak_value=None, clip_level=250):
     return clipped, hot
 
 
-def luma_stats(bgr, mask=None):
+# Point-source tolerance for the CLIP metric: clipped blobs smaller than this
+# many pixels (a lamp, a planet, headlights) are not counted as clipping --
+# they clip at any night-worthy exposure and dimming the whole pod for them
+# is pointless. 0 = every clipped pixel counts. ~470 px = a 1-deg lamp on
+# US05A1 at the night line (2026-09-13).
+CLIP_MIN_BLOB_PX = [0]
+
+
+def set_clip_min_blob(px):
+    CLIP_MIN_BLOB_PX[0] = max(0, int(px))
+
+
+def luma_stats(bgr, mask=None, min_blob_px=None):
     """Metering from a frame: mean luma (0-255), clipped-pixel fraction (0-1)
     and the 99.9th-percentile peak -- over the UNMASKED pixels only when a mask
     (True = count) of the same size is given. The universal exposure signal:
-    works on IMX291 (no daemon AveLum) and Goke alike."""
+    works on IMX291 (no daemon AveLum) and Goke alike. With a point-source
+    tolerance (min_blob_px, default CLIP_MIN_BLOB_PX) clipped blobs smaller
+    than that are excluded from the clip fraction ("clip_raw" keeps all)."""
     if bgr is None:
         return None
     y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
     masked = 0.0
+    keep = None
     if mask is not None and mask.shape == y.shape:
         masked = float(1.0 - mask.mean())
-        y = y[mask]
-        if y.size == 0:
-            return None
-    return {"mean": float(y.mean()), "clip": float((y >= 250).mean()),
-            "peak": float(np.percentile(y, 99.9)), "masked": masked}
+        keep = mask
+    mb = CLIP_MIN_BLOB_PX[0] if min_blob_px is None else int(min_blob_px)
+    clipped = (y >= 250) if keep is None else ((y >= 250) & keep)
+    n_keep = int(keep.sum()) if keep is not None else y.size
+    if n_keep == 0:
+        return None
+    clip_raw = float(clipped.sum()) / n_keep
+    clip = clip_raw
+    if mb > 0 and clipped.any():
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(clipped.astype(np.uint8), 8)
+        big = sum(int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= mb)
+        clip = float(big) / n_keep
+    v = y if keep is None else y[keep]
+    return {"mean": float(v.mean()), "clip": clip, "clip_raw": clip_raw,
+            "peak": float(np.percentile(v, 99.9)), "masked": masked}
 
 
 if __name__ == "__main__":

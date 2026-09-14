@@ -226,6 +226,24 @@ Still open: a lease in the camera daemon so a dead podcontrol can never
 strand the pod (today a hard kill leaves it pinned until the next switch), and
 daemon-side metering to drop the ~50 s frame latency.
 
+## Point sources at twilight and night
+
+Checked on real frames (night of 2026-09-12/13 at the night line, and the
+dawn of 09-14 from −9° to sunrise): with no sun in the field, five of six
+cameras have **no** clipped pixels at the night line and their 99.9th
+percentile sits at 70–140, so the highlight rule lets the pod climb to the
+night line and does not fight it. The exception is a single ~1° street lamp
+at US05A1's bottom edge (472 clipped px at the night line), which alone would
+hold the whole pod dark through dusk. The dawn horizon glow on the east camera
+at −9° is a genuine extended highlight and drives correctly.
+
+Two levers for point sources: the station mask (a fixed lamp belongs there),
+and the **pt-src < N px** spinbox: clipped blobs smaller than N pixels are not
+counted as clipping (default 0 = every clipped pixel counts). 600 px turns the
+A1 lamp's verdict from "darker" into "headroom" without touching the mask; it
+also stops headlights or a planet from dipping the pod. The peak metric is
+unaffected (a lamp is far below 0.1% of the frame).
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).

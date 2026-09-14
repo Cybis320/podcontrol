@@ -263,6 +263,7 @@ class App(tk.Tk):
         self.slew = tk.DoubleVar(value=self.ae.cfg.slew)
         self.sun_votes = tk.BooleanVar(value=self.ae.cfg.sun_cam_votes)
         self.flare_w = tk.DoubleVar(value=F.FLARE_HALF_WIDTH_DEG[0])
+        self.min_blob = tk.IntVar(value=F.CLIP_MIN_BLOB_PX[0])
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -305,6 +306,9 @@ class App(tk.Tk):
         lab("°")
         tk.Checkbutton(bar, text="sun cam votes", variable=self.sun_votes, fg="#c8bfa8", bg=BG,
                        selectcolor=BG, activebackground=BG).pack(side="left", padx=(8, 0))
+        lab("pt-src <", padx=(8, 0))
+        tk.Spinbox(bar, from_=0, to=5000, increment=100, width=5, textvariable=self.min_blob).pack(side="left")
+        lab("px")
         self.status = tk.Label(bar, text="starting…", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="e")
         self.status.pack(side="right")
 
@@ -320,6 +324,7 @@ class App(tk.Tk):
             try:
                 F.set_sun_radius(self.sun_radius.get())
                 F.set_flare_width(self.flare_w.get())
+                F.set_clip_min_blob(self.min_blob.get())
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:
