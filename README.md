@@ -162,13 +162,14 @@ these), and on the driving camera the **peak** pixels (top 0.1 %, what the
 headroom rule looks at) are tinted cyan. The window is resizable; tiles keep
 16:9 and scale with it.
 
-**Sun camera follows, does not vote (default).** A camera with the sun in its
-field takes the pod exposure like the others but is left out of the target:
-even with a 25° zone, the bright ring of sky just outside the circle sits at
-the 99.9th-percentile ceiling and would pin the whole pod dark for hours
-("DRIVING: at target" on the sun camera with 0% clipping was exactly that).
-Its badge reads `☀ following (no vote)`; the **sun cam votes** checkbox
-re-enables it. If every camera sees the sun they all vote.
+**Every unmasked pixel on every camera counts (default).** The sun camera
+votes like any other; the sun zone radius is the operator's lever. Measured
+2026-09-14 with the sun 27° up: at the minimum exposure B1 still clipped out
+to 32° from the sun, so a zone of 34° or more is needed for it not to pin the
+pod at the floor (that removes ~70% of B1's frame) — see `--measure`. The
+**sun cam votes** checkbox, when cleared, makes a camera with the sun in its
+field follow the pod exposure without voting (badge `☀ following (no
+vote)`); if every camera sees the sun they all vote regardless.
 
 `PODCONTROL_DRY=1 podcontrol --no-grab` runs the whole loop (metering,
 targets, driver display) without ever sending an exposure command — for

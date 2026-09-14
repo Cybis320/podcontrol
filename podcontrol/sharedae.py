@@ -59,9 +59,10 @@ class AEConfig:
     period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
     settle_s = 1.5              # an apply is in effect this long after it was sent
     slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
-    sun_cam_votes = False       # a camera with the sun in its FOV takes the pod
-                                # exposure but does not limit it (its unmasked
-                                # glare ring otherwise pins the whole pod dark)
+    sun_cam_votes = True        # EVERY unmasked pixel on EVERY camera counts
+                                # (operator decision 2026-09-14): the sun camera
+                                # votes like any other; the sun zone radius is
+                                # the operator's lever. False = it follows only.
     history_s = 300.0           # how long we remember our applies (frame latency)
 
 
