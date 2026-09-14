@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [{name = "Luc Busquin"}]
-dependencies = ["opencv-python>=4.5", "Pillow>=9"]
+# opencv-python 5 pulls numpy>=2, which breaks RMS's compiled extensions
+# (RMS pins numpy<2). Keep OpenCV 4 so installing into the RMS venv is safe.
+dependencies = ["opencv-python>=4.5,<5", "numpy<2", "Pillow>=9"]
 
 [project.scripts]
 podcontrol = "podcontrol.app:main"

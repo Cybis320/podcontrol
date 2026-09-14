@@ -77,6 +77,16 @@ TL;DR of the gaps that matter for the pod goals:
   the sky keeps its chroma. Headless:
   `python -m podcontrol.wbcal --camera cam101 --box x0,y0,x1,y1`
 
+## Installing into the RMS venv
+
+Install **editable** so the `podcontrol` command tracks the checkout, and with
+`--no-deps` so pip never touches RMS's pinned numpy/OpenCV (an unconstrained
+install once upgraded numpy to 2.x and broke RMS's compiled extensions):
+
+```
+~/vRMS/bin/pip install --no-deps -e ~/source/podcontrol
+```
+
 ## Frame source (RMS-safe) — what changed 2026-09-14
 
 - RMS now saves **PNG** frames in 10-frame blocks (`<id>_YYYYMMDD_HHMMSS_mmm_d.png`,

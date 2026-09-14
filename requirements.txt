@@ -1,4 +1,5 @@
-opencv-python>=4.5
+opencv-python>=4.5,<5
+numpy<2
 Pillow>=9
 # System packages (not pip-installable):
 #   python3-tk   (Tkinter GUI)
