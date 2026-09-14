@@ -255,6 +255,16 @@ A1 lamp's verdict from "darker" into "headroom" without touching the mask; it
 also stops headlights or a planet from dipping the pod. The peak metric is
 unaffected (a lamp is far below 0.1% of the frame).
 
+## Footprint
+
+The app is meant to sit beside six RMS captures. Per 5 s cycle it does one
+cached directory scan of each station's newest two hour-directories (never a
+recursive glob over FramesFiles), decodes a frame only when a new file
+appears (~every 50 s per camera, cached), caches statistics and overlay maps
+per file, and re-renders a tile only when its frame or overlay settings
+change. Measured: ~10 ms of CPU per cycle headless, ~6% of one core for the
+GUI (2026-09-14, six cameras).
+
 ## Roadmap
 
 - ✅ Phase 1 (preview + telemetry), ✅ Phase 2 (shared AE), ✅ Phase 3 (WB cloud-gray).

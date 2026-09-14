@@ -30,7 +30,8 @@ from concurrent.futures import ThreadPoolExecutor
 from podcontrol.stations import get_pod
 from podcontrol.podctl import PodController
 from podcontrol import frames as F
-from podcontrol.frames import frame_for, fresh_frame, luma_stats, mask_for, highlight_maps
+from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, highlight_maps,
+                               highlight_maps_cached, stats_for_path)
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 
 COLS = 3
@@ -136,11 +137,21 @@ class Tile(tk.Frame):
         return (fx(min(x0, x1)), fy(min(y0, y1)), fx(max(x0, x1)), fy(max(y0, y1)))
 
     # --- rendering -----------------------------------------------------------
-    def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None):
-        """drive: None, or (is_driver, why, need_stops) for the shared AE."""
-        self._last = (img, source, tel, luma, layers, overlay, drive)
+    def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None, sig=None):
+        """drive: None, or (is_driver, why, need_stops) for the shared AE.
+        sig: a hashable signature of the image content + overlay settings; when
+        it matches the last render (and the canvas size did not change) the
+        image is left alone and only the text is refreshed."""
+        self._last = (img, source, tel, luma, layers, overlay, drive, None)
         is_driver, why, need = drive if drive else (False, None, None)
-        if img is None:
+        same = (sig is not None and sig == getattr(self, "_sig", None)
+                and img is not None and self._img_id is not None
+                and (self.canvas.winfo_width(), self.canvas.winfo_height()) == getattr(self, "_sig_wh", None))
+        self._sig = sig
+        self._sig_wh = (self.canvas.winfo_width(), self.canvas.winfo_height())
+        if same:
+            pass                                    # image + overlays unchanged
+        elif img is None:
             if self._img_id:
                 self.canvas.delete(self._img_id); self._img_id = None
             if not self._txt_id:
@@ -349,22 +360,27 @@ class App(tk.Tk):
                 pass
             poll = self.pod.poll_all(timeout=4)
             feed_sun(self.ae, self.pod)
-            futs = {self._pool.submit(frame_for, s, self.allow_grab, True): s.id
+            futs = {self._pool.submit(frame_for, s, self.allow_grab, True, True): s.id
                     for s in self.stations}
             frames, lumas, layers = {}, {}, {}
+            overlay_on = self.overlay.get()
             for f in futs:
                 sid = futs[f]
                 try:
-                    img, src, tcap = f.result(timeout=18)
+                    img, src, tcap, path = f.result(timeout=18)
                 except Exception:
-                    img, src, tcap = None, "none", None
-                frames[sid] = (img, src)
-                keep, lay = mask_for(self.by_id[sid], img, tcap, layers=True)
-                lumas[sid] = luma_stats(img, keep)
+                    img, src, tcap, path = None, "none", None, None
+                frames[sid] = (img, src, path)
+                st = self.by_id[sid]
+                keep, lay = mask_for(st, img, tcap, layers=True)
+                # stats are cached per saved file: a new frame only appears every ~50 s
+                lumas[sid] = stats_for_path(st, path, tcap) if path else luma_stats(img, keep)
                 if lumas[sid] is not None:
-                    lumas[sid]["t"] = tcap
+                    lumas[sid] = dict(lumas[sid], t=tcap)
                     lay = dict(lay or {})
-                    lay["clip"], lay["hot"] = highlight_maps(img, keep, lumas[sid]["peak"])
+                    if overlay_on:
+                        lay["clip"], lay["hot"] = (highlight_maps_cached(path, img, keep, lumas[sid]["peak"])
+                                                   if path else highlight_maps(img, keep, lumas[sid]["peak"]))
                 layers[sid] = lay
             if self.ae_on and self.ae.t_seed:
                 # meter the pod on the newest COMPLETE frame set (one capture
@@ -393,14 +409,16 @@ class App(tk.Tk):
                 info = self.ae_info if self.ae_on else None
                 driver = (info or {}).get("driver")
                 needs = (info or {}).get("needs") or {}
+                ov = (self.overlay.get(), float(self.sun_radius.get()), float(self.flare_w.get()),
+                      float(self.moon_radius.get()))
                 for sid, t in self.tiles.items():
-                    img, src = frames.get(sid, (None, "none"))
+                    img, src, path = frames.get(sid, (None, "none", None))
                     drive = None
                     if info:
                         n = needs.get(sid)
                         drive = (sid == driver, (n[1] if n else None), (n[0] if n else None))
                     t.render(img, src, poll.get(sid), lumas.get(sid),
-                             layers.get(sid), self.overlay.get(), drive)
+                             layers.get(sid), ov[0], drive, sig=(path, ov, drive))
                     b = (poll.get(sid) or {}).get("avelum")
                     if b is None and lumas.get(sid):
                         b = lumas[sid]["mean"]

@@ -70,6 +70,78 @@ def rms_process_active(station):
     return False
 
 
+# One scan of the newest two hour-directories per station, cached for a few
+# seconds and shared by every consumer (latest frame, age, complete sets).
+# The previous code ran four recursive globs per station per cycle over
+# ~20k files (~1.8 s of CPU every 5 s).
+_DIR_CACHE = {}          # station.id -> (t_scan, [(capture_epoch, path)] newest first)
+DIR_SCAN_TTL = 4.0
+_EXT_TUPLE = tuple(e.lstrip("*") for e in FRAME_EXTS)
+
+
+def _newest_subdirs(d, n):
+    try:
+        subs = sorted(e.name for e in os.scandir(d) if e.is_dir())
+    except OSError:
+        return []
+    return [os.path.join(d, x) for x in subs[-n:]]
+
+
+def scan_station(station, ttl=DIR_SCAN_TTL):
+    """[(capture_epoch, path)] newest first for this station's most recent
+    frames (RMS layout FramesFiles/YYYY/YYYYMMDD-DDD/YYYYMMDD-DDD_HH/), from a
+    cheap scandir of the newest two hour directories; cached ttl seconds."""
+    now = time.time()
+    c = _DIR_CACHE.get(station.id)
+    if c and now - c[0] < ttl:
+        return c[1]
+    out = []
+    root = station.frames_dir
+    if root and os.path.isdir(root):
+        hourdirs = []
+        for y in _newest_subdirs(root, 1):
+            for d in _newest_subdirs(y, 2):
+                hourdirs += _newest_subdirs(d, 2)
+        hourdirs = hourdirs[-2:]
+        if not hourdirs:                    # legacy / flat layout
+            hourdirs = [root]
+        prefix = station.id + "_"
+        for hd in hourdirs:
+            try:
+                with os.scandir(hd) as it:
+                    for e in it:
+                        n = e.name
+                        if n.startswith(prefix) and n.endswith(_EXT_TUPLE):
+                            t = frame_capture_time(n)
+                            if t is None:
+                                try:
+                                    t = e.stat().st_mtime - _BLOCK_SPAN_S
+                                except OSError:
+                                    continue
+                            out.append((t, e.path))
+            except OSError:
+                continue
+    out.sort(reverse=True)
+    _DIR_CACHE[station.id] = (now, out)
+    return out
+
+
+_IMG_CACHE = {}          # path -> decoded BGR (frames are immutable once written)
+IMG_CACHE_MAX = 8
+
+
+def imread_cached(path):
+    img = _IMG_CACHE.get(path)
+    if img is not None:
+        return img
+    img = _imread_ok(path)
+    if img is not None:
+        if len(_IMG_CACHE) >= IMG_CACHE_MAX:
+            _IMG_CACHE.pop(next(iter(_IMG_CACHE)))
+        _IMG_CACHE[path] = img
+    return img
+
+
 def _newest(paths, n=1):
     """Newest path (n=1) or the n newest, newest first."""
     ts = []
@@ -95,45 +167,31 @@ def _imread_ok(path):
 
 
 def latest_rms_path(station):
-    """Newest saved RMS frame for this station (PNG or JPG), or None.
-    Only the two most recent day directories are scanned to keep this cheap."""
-    if not station.data_dir or not os.path.isdir(station.frames_dir):
-        return None
-    root = station.frames_dir
-    # RMS layout: FramesFiles/YYYY/YYYYMMDD-DDD/YYYYMMDD-DDD_HH/<id>_*.png
-    days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
-    cands = []
-    for d in days:
-        for ext in FRAME_EXTS:
-            cands += glob.glob(os.path.join(d, "**", station.id + "_" + ext), recursive=True)
-    if not cands:                      # legacy/flat layouts
-        for ext in FRAME_EXTS:
-            cands += glob.glob(os.path.join(root, "**", station.id + "_" + ext), recursive=True)
-    return _newest(cands)
+    """Newest saved RMS frame for this station (PNG or JPG), or None."""
+    sc = scan_station(station)
+    return sc[0][1] if sc else None
 
 
 def latest_rms_frame(station):
     """(bgr, path) of the newest READABLE saved frame; falls back to the
     previous file if the newest is still being written."""
-    if not station.data_dir or not os.path.isdir(station.frames_dir):
-        return None, None
-    root = station.frames_dir
-    days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
-    cands = []
-    for d in days:
-        for ext in FRAME_EXTS:
-            cands += glob.glob(os.path.join(d, "**", station.id + "_" + ext), recursive=True)
-    for p in _newest(cands, n=3) if cands else []:
-        img = _imread_ok(p)
+    now = time.time()
+    for t, p in scan_station(station)[:3]:
+        try:
+            if now - os.path.getmtime(p) < 1.5:     # RMS may still be writing it
+                continue
+        except OSError:
+            continue
+        img = imread_cached(p)
         if img is not None:
             return img, p
     return None, None
 
 
 def rms_frame_age(station):
-    """Seconds since the newest saved frame, or None if none exist."""
-    p = latest_rms_path(station)
-    return (time.time() - os.path.getmtime(p)) if p else None
+    """Seconds since the newest saved frame was captured, or None if none."""
+    sc = scan_station(station)
+    return (time.time() - sc[0][0]) if sc else None
 
 
 def grab_rtsp(ip, timeout_s=12):
@@ -161,9 +219,10 @@ def rms_active(station):
     return rms_process_active(station)
 
 
-def frame_for(station, allow_grab=True, with_time=False):
+def frame_for(station, allow_grab=True, with_time=False, with_path=False):
     """(bgr_or_None, source) where source in {'rms','grab','stale','none'};
-    with_time=True appends the frame's CAPTURE epoch (None if unknown).
+    with_time=True appends the frame's CAPTURE epoch (None if unknown);
+    with_path=True (implies with_time) appends the saved file's path or None.
 
     'stale' = RMS is active but its latest frame is older than we'd like (or
     it saves no frames at all); we return what we have and DO NOT grab
@@ -178,10 +237,16 @@ def frame_for(station, allow_grab=True, with_time=False):
             t = frame_capture_time(p)
             if t is None:
                 t = os.path.getmtime(p) - _BLOCK_SPAN_S        # pessimistic
+        if with_path:
+            return img, src, t, p
         return (img, src, t) if with_time else (img, src)
     if allow_grab:
         img = grab_rtsp(station.ip)
+        if with_path:
+            return img, "grab", time.time(), None
         return (img, "grab", time.time()) if with_time else (img, "grab")
+    if with_path:
+        return None, "none", None, None
     return (None, "none", None) if with_time else (None, "none")
 
 
@@ -335,24 +400,8 @@ _STATS_CACHE = {}          # path -> luma stats (frames are immutable once writt
 
 def recent_rms_frames(station, max_age=SET_MAX_AGE_S):
     """[(capture_epoch, path)] newest first, within max_age, for this station."""
-    if not station.data_dir or not os.path.isdir(station.frames_dir):
-        return []
-    root = station.frames_dir
-    days = sorted(glob.glob(os.path.join(root, "[0-9]" * 4, "*")))[-2:]
-    now = time.time(); out = []
-    for d in days:
-        for ext in FRAME_EXTS:
-            for f in glob.glob(os.path.join(d, "**", station.id + "_" + ext), recursive=True):
-                t = frame_capture_time(f)
-                if t is None:
-                    try:
-                        t = os.path.getmtime(f) - _BLOCK_SPAN_S
-                    except OSError:
-                        continue
-                if now - t <= max_age:
-                    out.append((t, f))
-    out.sort(reverse=True)
-    return out
+    now = time.time()
+    return [(t, p) for t, p in scan_station(station) if now - t <= max_age]
 
 
 def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
@@ -380,7 +429,7 @@ def stats_for_path(station, path, t):
     hit = _STATS_CACHE.get(key)
     if hit is not None:
         return hit
-    img = _imread_ok(path)
+    img = imread_cached(path)
     st = None
     if img is not None:
         keep, lay = mask_for(station, img, t, layers=True)
@@ -417,6 +466,22 @@ def meter_set(stations, allow_grab=False):
                 si = (lay or {}).get("sun_info") or {}
                 out[st.id] = dict(s, t=time.time(), sun_in_fov=bool(si.get("in_fov")))
     return out, slot
+
+
+_HL_CACHE = {}
+
+
+def highlight_maps_cached(path, bgr, keep, peak_value):
+    """highlight_maps for a saved frame, cached per (path, mask params)."""
+    key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2), round(MOON_RADIUS_DEG[0], 2))
+    hit = _HL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    r = highlight_maps(bgr, keep, peak_value)
+    if len(_HL_CACHE) > 12:
+        _HL_CACHE.clear()
+    _HL_CACHE[key] = r
+    return r
 
 
 def highlight_maps(bgr, keep, peak_value=None, clip_level=250):

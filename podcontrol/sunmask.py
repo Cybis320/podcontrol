@@ -265,7 +265,7 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
                 excl = fl if excl is None else (excl | fl)
     if excl is not None:
         info["frac"] = float(excl.mean())
-    if len(_CACHE) > 24:                 # entries hold full-res maps: keep it small
+    if len(_CACHE) > 12:                 # entries hold full-res maps: keep it small
         _CACHE.clear()
     _CACHE[key] = (excl, info)
     return excl, info
