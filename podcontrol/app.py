@@ -149,8 +149,8 @@ class Tile(tk.Frame):
                 and (self.canvas.winfo_width(), self.canvas.winfo_height()) == getattr(self, "_sig_wh", None))
         self._sig = sig
         self._sig_wh = (self.canvas.winfo_width(), self.canvas.winfo_height())
-        if same:
-            pass                                    # image + overlays unchanged
+        if same or (img is None and self._img_id is not None):
+            pass                                    # unchanged, or keep the last image
         elif img is None:
             if self._img_id:
                 self.canvas.delete(self._img_id); self._img_id = None
@@ -289,6 +289,7 @@ class App(tk.Tk):
         self.flare_w = tk.DoubleVar(value=F.FLARE_HALF_WIDTH_DEG[0])
         self.min_blob = tk.IntVar(value=F.CLIP_MIN_BLOB_PX[0])
         self.moon_radius = tk.DoubleVar(value=F.MOON_RADIUS_DEG[0])
+        self.clip_pct = tk.DoubleVar(value=100.0 * self.ae.cfg.clip_limit)
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
 
@@ -337,6 +338,10 @@ class App(tk.Tk):
         lab("pt-src <", padx=(8, 0))
         tk.Spinbox(bar, from_=0, to=5000, increment=100, width=5, textvariable=self.min_blob).pack(side="left")
         lab("px")
+        lab("clip \u2264", padx=(8, 0))
+        tk.Spinbox(bar, from_=0.0, to=5.0, increment=0.01, width=5, textvariable=self.clip_pct,
+                   format="%.3f").pack(side="left")
+        lab("%")
         self.status = tk.Label(bar, text="starting…", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="e")
         self.status.pack(side="right")
 
@@ -354,6 +359,7 @@ class App(tk.Tk):
                 F.set_flare_width(self.flare_w.get())
                 F.set_clip_min_blob(self.min_blob.get())
                 F.set_moon_radius(self.moon_radius.get())
+                self.ae.cfg.clip_limit = max(0.0, float(self.clip_pct.get())) / 100.0
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:

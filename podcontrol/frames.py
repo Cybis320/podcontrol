@@ -176,7 +176,9 @@ def latest_rms_frame(station):
     """(bgr, path) of the newest READABLE saved frame; falls back to the
     previous file if the newest is still being written."""
     now = time.time()
-    for t, p in scan_station(station)[:3]:
+    # RMS flushes a 10-frame block at once: right after a flush the newest
+    # files may still be being written, so look back past the whole block
+    for t, p in scan_station(station)[:14]:
         try:
             if now - os.path.getmtime(p) < 1.5:     # RMS may still be writing it
                 continue

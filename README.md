@@ -304,6 +304,16 @@ GUI (2026-09-14, six cameras).
   (resolved like RMS does, relative to the RMS checkout), day vs night chosen
   by the sun altitude with RMS's -9° rule; without a settings file it is
   rebuilt from the camera's reported ranges. `Auto All` sends the day line.
+- **Clouds and the diurnal trend.** A passing cloud that clips asks for less
+  light, then more again a minute later, which pumps the pod. Rather than a
+  hard "high-water mark" (which fails when an overcast morning clears), moves
+  *against* the diurnal trend (less light while the sun sets, more while it
+  rises) run at `slew_against` (0.015 stop/cycle, a third of the normal rate)
+  unless clipping is extended (`clip_emergency`, 1%); moves with the trend run
+  at the full slew. A one-minute cloud then costs ~0.1 stop; a real change still
+  arrives within minutes. The clip threshold is also a toolbar knob
+  (**clip ≤ %**, default 0.005% = ~100 px of the frame; try 0.05% for a
+  timelapse if cloud edges still pump it).
 - Shared AE on the Goke pod: validated on the IMX291 bench only. On the Goke
   science config, night exposure/gain is already pinned identically by
   `camera_settings.json`; shared AE matters at twilight/day where the cameras'

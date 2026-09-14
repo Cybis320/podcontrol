@@ -59,6 +59,13 @@ class AEConfig:
     period_s = 5.0              # loop cadence = RMS frame cadence (timelapse frame)
     settle_s = 1.5              # an apply is in effect this long after it was sent
     slew = 0.05                 # max stops the POD moves per cycle (timelapse-smooth)
+    slew_against = 0.015        # max stops per cycle for a move AGAINST the diurnal trend
+                                # (less light while the sun sets, more while it rises):
+                                # such moves are cloud transients more often than not,
+                                # so they are taken slowly; a persistent change still
+                                # gets there in minutes (a soft "high-water mark")
+    clip_emergency = 0.01       # clipped fraction above which an against-trend
+                                # reduction runs at the full slew (extended blow-out)
     night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n);
                                 # RMS writes its night line here -- we re-pin and keep driving
     latch_deg = -12.0           # dusk: latch at the night line here or when the ladder reaches
@@ -335,9 +342,20 @@ class SharedAE:
         if ramp is not None and ramp > target:
             target = ramp                    # dusk: climb to the night line by the switch
         err = target - self.li
-        d = max(-c.slew, min(c.slew, err))
+        rate = c.slew
+        against = False
+        if self.sun_rising is not None and abs(err) > 1e-3:
+            # diurnal trend: sun rising -> the pod should need LESS light over
+            # time; sun setting -> MORE. A move the other way is suspect.
+            trend_up = not self.sun_rising
+            against = (err > 0) != trend_up
+            pod_clip = max(clips) if clips else 0.0
+            if against and not (err < 0 and pod_clip > c.clip_emergency):
+                rate = c.slew_against
+        d = max(-rate, min(rate, err))
         if abs(err) < 1e-3:
             d = 0.0
+        self._against = against and d != 0.0
         self.li = max(0.0, min(self.li + d, self._max_li()))
         just_latched = self._maybe_latch()
         exp, analog, boost = self._li_to_exp_gain(self.li)
@@ -345,6 +363,8 @@ class SharedAE:
             reason = "reached night line -> latched"
         elif ramp is not None and ramp > self.target and d > 0:
             reason = "dusk ramp to night line \u2191"
+        elif d and getattr(self, "_against", False):
+            reason = ("slew\u2191" if d > 0 else "slew\u2193") + " (against trend, slow)"
         elif d:
             reason = "slew\u2191" if d > 0 else "slew\u2193"
         elif self.waiting and not self.needs:
