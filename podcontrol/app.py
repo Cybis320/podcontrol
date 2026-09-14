@@ -470,10 +470,19 @@ class App(tk.Tk):
             self.hist_win.destroy(); self.hist_win = None; self.hist_canvas = None
             return
         w = tk.Toplevel(self); w.title("Pod Control \u2014 last 12 h"); w.configure(bg=BG)
-        w.geometry("1100x560"); w.minsize(600, 320)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w.geometry("%dx%d+0+%d" % (sw - 20, int(sh * 0.45), int(sh * 0.52)))   # full width, lower half
+        w.minsize(600, 320)
         c = tk.Canvas(w, bg=BG, highlightthickness=0); c.pack(fill="both", expand=True, padx=6, pady=6)
         self.hist_win, self.hist_canvas = w, c
-        c.bind("<Configure>", lambda e: self._draw_history())
+        self._hist_job = None
+
+        def on_resize(_e):
+            # redraw once the drag settles (the chart has thousands of items)
+            if self._hist_job:
+                self.after_cancel(self._hist_job)
+            self._hist_job = self.after(120, self._draw_history)
+        c.bind("<Configure>", on_resize)
         w.protocol("WM_DELETE_WINDOW", self.toggle_history)
         self.after(50, self._draw_history)
 
