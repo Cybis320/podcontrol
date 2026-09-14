@@ -259,6 +259,18 @@ A1 lamp's verdict from "darker" into "headroom" without touching the mask; it
 also stops headlights or a planet from dipping the pod. The peak metric is
 unaffected (a lamp is far below 0.1% of the frame).
 
+## History
+
+Every cycle is logged to `~/.local/share/podcontrol/history.jsonl`
+(`$PODCONTROL_HISTORY` overrides; the last 12 h are kept and reloaded on
+start): shared-AE state (light index, target, exposure, gain, state, driver),
+pod metering (mean, peak, clip), sun altitude, and every camera's own
+exposure/gain. The **History** button opens a window with three strips over
+the last 12 h: the pod light index (green) with the cameras' own band (blue),
+the night-line top rung, latched/night and AE-on shading and the sun altitude;
+pod mean and 99.9% peak luma against the 234 ceiling; clipped fraction with a
+tick in the driving camera's colour. Plain Tk canvas, no extra dependencies.
+
 ## Footprint
 
 The app is meant to sit beside six RMS captures. Per 5 s cycle it does one

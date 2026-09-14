@@ -33,6 +33,7 @@ from podcontrol import frames as F
 from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, highlight_maps,
                                highlight_maps_cached, stats_for_path)
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
+from podcontrol.history import HistoryLog, make_record, draw_history
 
 COLS = 3
 BG, PANEL = "#0f0d08", "#14110c"
@@ -306,50 +307,63 @@ class App(tk.Tk):
             t.grid(row=i // COLS, column=i % COLS, padx=4, pady=4, sticky="nsew")
             self.tiles[s.id] = t
 
-        bar = tk.Frame(self, bg=BG); bar.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Button(bar, text="Auto All", command=self.auto_all).pack(side="left")
-        self.ae_btn = tk.Button(bar, text="Shared AE: OFF", command=self.toggle_ae)
+        # ---- toolbar: grouped controls on two rows, status on its own row ----
+        tb = tk.Frame(self, bg=BG); tb.pack(fill="x", padx=8, pady=(0, 6))
+        row1 = tk.Frame(tb, bg=BG); row1.pack(fill="x")
+        row2 = tk.Frame(tb, bg=BG); row2.pack(fill="x", pady=(4, 0))
+
+        def group(parent, title):
+            g = tk.LabelFrame(parent, text=title, fg="#a4967c", bg=BG, bd=1, relief="groove",
+                              font=(MONO, 8), padx=6, pady=2)
+            g.pack(side="left", padx=(0, 8), fill="y")
+            return g
+
+        def lab(parent, txt, **kw):
+            tk.Label(parent, text=txt, fg="#c8bfa8", bg=BG).pack(side="left", **kw)
+
+        def spin(parent, var, lo, hi, inc, width, fmt=None):
+            kw = {"format": fmt} if fmt else {}
+            tk.Spinbox(parent, from_=lo, to=hi, increment=inc, width=width, textvariable=var, **kw).pack(side="left")
+
+        def check(parent, txt, var, **kw):
+            tk.Checkbutton(parent, text=txt, variable=var, fg="#c8bfa8", bg=BG, selectcolor=BG,
+                           activebackground=BG).pack(side="left", **kw)
+
+        g = group(row1, "control")
+        tk.Button(g, text="Auto All", command=self.auto_all).pack(side="left")
+        self.ae_btn = tk.Button(g, text="Shared AE: OFF", command=self.toggle_ae)
         self.ae_btn.pack(side="left", padx=6)
-        self.cal_btn = tk.Button(bar, text="Calibrate WB (cloud)", command=self.calibrate_wb)
-        self.cal_btn.pack(side="left", padx=6)
-        def lab(txt, **kw):
-            tk.Label(bar, text=txt, fg="#c8bfa8", bg=BG).pack(side="left", **kw)
-        lab("  refresh")
-        tk.Spinbox(bar, from_=2, to=60, width=4, textvariable=self.interval).pack(side="left")
-        lab("s")
-        lab("  slew")
-        tk.Spinbox(bar, from_=0.01, to=0.5, increment=0.01, width=5, textvariable=self.slew,
-                   format="%.2f").pack(side="left")
-        lab("stop/cycle")
-        tk.Checkbutton(bar, text="overlay", variable=self.overlay, fg="#c8bfa8", bg=BG,
-                       selectcolor=BG, activebackground=BG).pack(side="left", padx=(12, 0))
-        lab("sun r", padx=(8, 0))
-        tk.Spinbox(bar, from_=0, to=45, increment=1, width=4, textvariable=self.sun_radius).pack(side="left")
-        lab("°")
-        lab("moon r", padx=(8, 0))
-        tk.Spinbox(bar, from_=0, to=30, increment=1, width=4, textvariable=self.moon_radius).pack(side="left")
-        lab("°")
-        lab("flare r", padx=(8, 0))
-        tk.Spinbox(bar, from_=0, to=15, increment=0.5, width=4, textvariable=self.flare_w,
-                   format="%.1f").pack(side="left")
-        lab("°")
-        tk.Checkbutton(bar, text="sun cam votes", variable=self.sun_votes, fg="#c8bfa8", bg=BG,
-                       selectcolor=BG, activebackground=BG).pack(side="left", padx=(8, 0))
-        lab("pt-src <", padx=(8, 0))
-        tk.Spinbox(bar, from_=0, to=5000, increment=100, width=5, textvariable=self.min_blob).pack(side="left")
-        lab("px")
-        lab("clip \u2264", padx=(8, 0))
-        tk.Spinbox(bar, from_=0.0, to=5.0, increment=0.01, width=5, textvariable=self.clip_pct,
-                   format="%.3f").pack(side="left")
-        lab("%")
-        self.status = tk.Label(bar, text="starting…", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="e")
-        self.status.pack(side="right")
+        self.cal_btn = tk.Button(g, text="Calibrate WB (cloud)", command=self.calibrate_wb)
+        self.cal_btn.pack(side="left", padx=(0, 6))
+        tk.Button(g, text="History", command=self.toggle_history).pack(side="left")
+
+        g = group(row1, "loop")
+        lab(g, "refresh"); spin(g, self.interval, 2, 60, 1, 4); lab(g, "s", padx=(0, 8))
+        lab(g, "slew"); spin(g, self.slew, 0.01, 0.5, 0.01, 5, "%.2f"); lab(g, "stop/cycle", padx=(0, 8))
+        lab(g, "clip \u2264"); spin(g, self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f"); lab(g, "%", padx=(0, 8))
+        lab(g, "pt-src <"); spin(g, self.min_blob, 0, 5000, 100, 5); lab(g, "px")
+
+        g = group(row2, "masks & overlay")
+        check(g, "overlay", self.overlay, padx=(0, 8))
+        lab(g, "sun r"); spin(g, self.sun_radius, 0, 45, 1, 4); lab(g, "\u00b0", padx=(0, 8))
+        lab(g, "moon r"); spin(g, self.moon_radius, 0, 30, 1, 4); lab(g, "\u00b0", padx=(0, 8))
+        lab(g, "flare r"); spin(g, self.flare_w, 0, 15, 0.5, 4, "%.1f"); lab(g, "\u00b0")
+
+        g = group(row2, "policy")
+        check(g, "sun cam votes", self.sun_votes)
+
+        self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
+        self.status.pack(fill="x", padx=12, pady=(0, 6))
+        self.hist_win = None
+        self.hist_canvas = None
+        self.history = HistoryLog()
 
         threading.Thread(target=self._updater, daemon=True).start()
         self.after(200, self._drain)
         self.protocol("WM_DELETE_WINDOW", self._close)
         if self.dry:
             self.after(800, self.toggle_ae)
+            self.after(1200, self.toggle_history)
 
     def _updater(self):
         while self.running:
@@ -365,7 +379,7 @@ class App(tk.Tk):
             except Exception:
                 pass
             poll = self.pod.poll_all(timeout=4)
-            feed_sun(self.ae, self.pod)
+            sun = feed_sun(self.ae, self.pod)
             futs = {self._pool.submit(frame_for, s, self.allow_grab, True, True): s.id
                     for s in self.stations}
             frames, lumas, layers = {}, {}, {}
@@ -401,6 +415,12 @@ class App(tk.Tk):
                     except Exception:
                         pass
                 self.ae_info = info
+            try:
+                met_for_log = ctl if (self.ae_on and self.ae.t_seed) else lumas
+                self.history.append(make_record(poll, self.ae_info if self.ae_on else None, met_for_log,
+                                                sun, self.ae_on, self.ae._max_li(), self.ae_slot))
+            except Exception:
+                pass
             self.q.put((frames, poll, lumas, layers, time.time() - t0))
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
@@ -444,6 +464,27 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(200, self._drain)
+
+    def toggle_history(self):
+        if self.hist_win and self.hist_win.winfo_exists():
+            self.hist_win.destroy(); self.hist_win = None; self.hist_canvas = None
+            return
+        w = tk.Toplevel(self); w.title("Pod Control \u2014 last 12 h"); w.configure(bg=BG)
+        w.geometry("1100x560"); w.minsize(600, 320)
+        c = tk.Canvas(w, bg=BG, highlightthickness=0); c.pack(fill="both", expand=True, padx=6, pady=6)
+        self.hist_win, self.hist_canvas = w, c
+        c.bind("<Configure>", lambda e: self._draw_history())
+        w.protocol("WM_DELETE_WINDOW", self.toggle_history)
+        self.after(50, self._draw_history)
+
+    def _draw_history(self):
+        if self.hist_canvas and self.hist_win and self.hist_win.winfo_exists():
+            try:
+                draw_history(self.hist_canvas, self.history.records, hours=self.history.hours,
+                             cam_order=[s.id for s in self.stations])
+            except Exception as e:
+                self.hist_canvas.delete("all")
+                self.hist_canvas.create_text(20, 20, text="history: %s" % e, fill="#b3402a", anchor="nw")
 
     def toggle_ae(self):
         self.ae_on = not self.ae_on
