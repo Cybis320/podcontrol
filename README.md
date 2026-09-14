@@ -241,6 +241,15 @@ Still open: a lease in the camera daemon so a dead podcontrol can never
 strand the pod (today a hard kill leaves it pinned until the next switch), and
 daemon-side metering to drop the ~50 s frame latency.
 
+## What counts as clipped
+
+A pixel is clipped when its **brightest channel** is at 250 or above, and the
+headroom peak is the 99.9th percentile of the per-pixel maximum channel. The
+earlier luma rule (0.299R + 0.587G + 0.114B ≥ 250) was effectively "green
+clipped" and ignored red or blue at 255 when green sat lower; on 2026-09-14
+afternoon frames the any-channel count was 2–7× the luma count. The pod mean
+stays luma. On top of that, `raw_sat` / `rb_only` say which stage clipped.
+
 ## The WB rung: a lever below the exposure floor
 
 At the 30 µs / 1x floor the sensor cannot be darkened further, but the WB

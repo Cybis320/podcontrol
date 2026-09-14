@@ -500,7 +500,7 @@ def highlight_maps(bgr, keep, peak_value=None, clip_level=250):
     (the pixels the highlight-priority AE reacts to)."""
     if bgr is None:
         return None, None
-    y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    y = bgr.max(axis=2) if bgr.ndim == 3 else bgr          # per-pixel max channel, like luma_stats
     k = np.ones(y.shape, bool) if keep is None else keep
     clipped = (y >= clip_level) & k
     if peak_value is None:
@@ -531,13 +531,17 @@ def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
     if bgr is None:
         return None
     y = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    # clipping and the headroom peak are judged on the per-pixel MAXIMUM
+    # channel: a pixel whose red or blue is at 255 is clipped data even when
+    # luma (green-weighted) reads 220. The mean stays luma.
+    mx = bgr.max(axis=2) if bgr.ndim == 3 else bgr
     masked = 0.0
     keep = None
     if mask is not None and mask.shape == y.shape:
         masked = float(1.0 - mask.mean())
         keep = mask
     mb = CLIP_MIN_BLOB_PX[0] if min_blob_px is None else int(min_blob_px)
-    clipped = (y >= 250) if keep is None else ((y >= 250) & keep)
+    clipped = (mx >= 250) if keep is None else ((mx >= 250) & keep)
     n_keep = int(keep.sum()) if keep is not None else y.size
     if n_keep == 0:
         return None
@@ -548,9 +552,10 @@ def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
         big = sum(int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= mb)
         clip = float(big) / n_keep
     v = y if keep is None else y[keep]
+    vm = mx if keep is None else mx[keep]
     out = {"mean": float(v.mean()), "clip": clip, "clip_raw": clip_raw,
-           "peak": float(np.percentile(v, 99.9)), "masked": masked,
-           "raw_sat": 0.0, "rb_only": 0.0}
+           "peak": float(np.percentile(vm, 99.9)), "peak_luma": float(np.percentile(v, 99.9)),
+           "masked": masked, "raw_sat": 0.0, "rb_only": 0.0}
     if bgr.ndim == 3:
         # Which stage clipped? Green carries WB gain ~1.0, so green at its
         # plateau means the SENSOR saturated (unrecoverable downstream); red
