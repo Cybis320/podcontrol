@@ -5,7 +5,8 @@ the shared-AE engine and the WB cloud-gray calibrator. The frame source is
 RMS-safe (reads RMS's saved frames while RMS captures; grabs only when RMS
 is idle). Tiles scale with the window; the overlay shows what the metering
 ignores (red = RMS mask, orange = sun zone) and what drives the exposure
-(magenta = clipped pixels, cyan = the peak pixels of the driving camera).
+(magenta = clipped pixels, cyan = the peak pixels of the driving camera). The
+small orange circle labelled "sun" only marks the computed sun position.
 
 Run:  python -m podcontrol            (pod from ~/source/Stations if present,
                                        else 192.168.42.101-.106)
@@ -161,9 +162,14 @@ class Tile(tk.Frame):
                     _tint(small, layers["hot"], TINT_HOT, 0.75, (dw, dh))
                 si = layers.get("sun_info")
                 if si and si.get("in_fov") and si.get("x") is not None:
+                    # the computed SUN position (centre of the exclusion zone);
+                    # purely informational -- not an AE indicator
                     fw, fh = self.frame_wh
-                    cv2.circle(small, (int(si["x"] * dw / fw), int(si["y"] * dh / fh)),
-                               max(3, dw // 70), (255, 255, 255), 1)
+                    cx, cy = int(si["x"] * dw / fw), int(si["y"] * dh / fh)
+                    r = max(4, dw // 60)
+                    cv2.circle(small, (cx, cy), r, TINT_SUN, 2)
+                    cv2.putText(small, "sun", (cx + r + 3, cy + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.4, TINT_SUN, 1, cv2.LINE_AA)
             if is_driver:
                 col = DRIVE_COLOR.get(why, "#ff5ad6")
                 c = tuple(int(col[i:i + 2], 16) for i in (1, 3, 5))
