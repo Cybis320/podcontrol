@@ -109,8 +109,13 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
     canvas.delete("all")
     W = max(200, canvas.winfo_width()); H = max(200, canvas.winfo_height())
     now = now or time.time()
-    t0 = now - hours * 3600
-    recs = [r for r in records if r.get("t", 0) >= t0]
+    recs = [r for r in records if r.get("t", 0) >= now - hours * 3600]
+    # the time axis fits the data: from the oldest record (at least 10 min
+    # wide, at most `hours`), so a young log is readable and grows into 12 h
+    span = hours * 3600
+    if recs:
+        span = min(hours * 3600, max(600.0, now - recs[0]["t"] + 30.0))
+    t0 = now - span
     L, R, T, B = 58, 58, 16, 30
     gap = 14
     ph = (H - T - B - 3 * gap) / 4.0
@@ -120,19 +125,21 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
     colors = {sid: CAM_COLORS[i % len(CAM_COLORS)] for i, sid in enumerate(cams)}
 
     def X(t):
-        return L + (t - t0) / (hours * 3600) * (W - L - R)
+        return L + (t - t0) / span * (W - L - R)
 
-    # time grid: every hour
-    first_hour = math.ceil(t0 / 3600) * 3600
+    # time grid: tick step chosen for the span (about 8-14 ticks)
+    step = next(st for st in (60, 120, 300, 600, 900, 1800, 3600, 7200) if span / st <= 14)
     for panel_y0, panel_y1 in panels:
         canvas.create_rectangle(L, panel_y0, W - R, panel_y1, outline=grid, fill="#0c0a06")
-    h = first_hour
+    h = math.ceil(t0 / step) * step
     while h <= now:
         x = X(h)
         for panel_y0, panel_y1 in panels:
             canvas.create_line(x, panel_y0, x, panel_y1, fill=grid)
         canvas.create_text(x, H - B + 10, text=time.strftime("%H:%M", time.gmtime(h)), fill=dim, font=("JetBrains Mono", 8))
-        h += 3600
+        h += step
+    canvas.create_text(L, H - B + 22, text="span %s" % ("%.0f min" % (span / 60) if span < 3600 else "%.1f h" % (span / 3600)),
+                       fill=dim, anchor="w", font=("JetBrains Mono", 8))
     canvas.create_text(W - R, H - B + 22, text="UTC", fill=dim, anchor="e", font=("JetBrains Mono", 8))
     if not recs:
         canvas.create_text(W / 2, H / 2, text="no history yet", fill=dim, font=("JetBrains Mono", 14))
