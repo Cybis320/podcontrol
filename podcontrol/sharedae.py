@@ -67,7 +67,8 @@ class AEConfig:
     clip_emergency = 0.01       # clipped fraction above which an against-trend
                                 # reduction runs at the full slew (extended blow-out)
     night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n);
-                                # RMS writes its night line here -- we re-pin and keep driving
+                                # RMS writes its night line here -- we re-pin and keep driving.
+                                # Overwritten from RMS at import (see below).
     latch_deg = -12.0           # dusk: latch at the night line here or when the ladder reaches
                                 # the top rung, whichever comes first (operator: -9 is still twilight)
     dawn_unlatch_deg = -12.0    # may unlatch once the sun is rising above this
@@ -94,6 +95,13 @@ class AEConfig:
         self.analog_max_x = int(m["a"]) / 1024.0
         self.boost_max_x = int(m.get("i", 1024)) / 1024.0
         return True
+
+
+try:
+    from podcontrol.sunmask import SWITCH_HORIZON_DEG as _RMS_SWITCH
+    AEConfig.night_switch_deg = float(_RMS_SWITCH)
+except Exception:
+    pass
 
 
 class SharedAE:

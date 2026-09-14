@@ -127,9 +127,17 @@ def moon_altaz(station, t=None):
 DEFAULT_MOON_RADIUS_DEG = 10.0   # not yet measured (no moon-in-field frames saved as of 2026-09-14)
 
 
-# RMS switches day/night capture modes when the sun crosses this altitude
-# (RMS.CaptureModeSwitcher.SWITCH_HORIZON_DEG)
-SWITCH_HORIZON_DEG = -9.0
+# RMS switches day/night capture modes when the sun crosses this altitude.
+# Read from RMS itself so the two can never disagree; -9 if RMS is absent.
+def _rms_switch_horizon():
+    try:
+        from RMS.CaptureModeSwitcher import SWITCH_HORIZON_DEG as v
+        return float(str(v).split(":")[0])          # ephem-style "-9" or "-5:26"
+    except Exception:
+        return -9.0
+
+
+SWITCH_HORIZON_DEG = _rms_switch_horizon()
 
 
 def mode_for(station, t=None):
