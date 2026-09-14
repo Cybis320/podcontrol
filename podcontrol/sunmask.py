@@ -91,6 +91,20 @@ def sun_altaz(station, t=None):
             "ra": math.degrees(s.a_ra), "dec": math.degrees(s.a_dec)}
 
 
+# RMS switches day/night capture modes when the sun crosses this altitude
+# (RMS.CaptureModeSwitcher.SWITCH_HORIZON_DEG)
+SWITCH_HORIZON_DEG = -9.0
+
+
+def mode_for(station, t=None):
+    """'day' or 'night' as RMS would have it for this station at epoch t, or
+    None when the station has no platepar to locate the sun."""
+    sa = sun_altaz(station, t)
+    if sa is None:
+        return None
+    return "day" if sa["alt"] > SWITCH_HORIZON_DEG else "night"
+
+
 def _sun_pixel(station, sa, t):
     from RMS.Astrometry.ApplyAstrometry import raDecToXYPP
     from RMS.Astrometry.Conversions import datetime2JD

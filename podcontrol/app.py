@@ -155,10 +155,15 @@ class Tile(tk.Frame):
         si = (layers or {}).get("sun_info")
         if si and si.get("alt") is not None and si["alt"] > -si["radius_deg"]:
             masked += "  sun %.0f\u00b0%s" % (si["alt"], " IN FOV" if si.get("in_fov") else "")
-        self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\nAGain %.2fx  ISO %s  %s\n%s" % (
+        gains = "A%.2f" % (tel.get("again_x") or 0)
+        if tel.get("dgain_x"):
+            gains += " D%.2f" % tel["dgain_x"]
+        if tel.get("ispdgain_x"):
+            gains += " I%.2f" % tel["ispdgain_x"]
+        self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\n%s  ISO %s  %s\n%s" % (
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
             (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
-            tel.get("exp_us"), tel.get("again_x") or 0, tel.get("iso"),
+            tel.get("exp_us"), gains, tel.get("iso"),
             ("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or ""),
             line2))
 
@@ -288,7 +293,7 @@ class App(tk.Tk):
             # start from the cameras' current (darkest) exposure, not a fixed
             # mid-ladder guess that blows out a daytime scene
             self.ae_info = None
-            threading.Thread(target=lambda: self.ae.seed(self.pod.poll_all(timeout=4)),
+            threading.Thread(target=lambda: self.ae.takeover(self.pod.poll_all(timeout=4)),
                              daemon=True).start()
         else:
             threading.Thread(target=lambda: self.ae.release(), daemon=True).start()

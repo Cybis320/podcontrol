@@ -164,6 +164,19 @@ so the glow around a just-set sun is excluded as well.
   darkest exposure instead of a fixed mid-ladder guess. A SIGTERM/SIGINT
   releases the cameras to auto like a window close. If an app dies hard, run
   `Auto All` or `python -m podcontrol.podctl` + `auto` per camera.
+- **All four exposure stages are pinned** on every shared-AE push (`manual -a
+  … -d 1024 -i … -e …`). A stage left in AUTO keeps floating per camera: live
+  on 2026-09-14 the sensor DGain sat at 1.0x on one camera and 1.7–3.4x on the
+  others at the same `-a/-e`, which showed up as different ISOs (ISO = 100 ×
+  total gain) and a darker sun camera. Tiles now show `A D I` gains.
+- **Cameras are handed back with RMS's own mode line**, never a bare `auto`:
+  on the Goke a bare `auto` resets every AE range to the driver default
+  (sensor DGain max 126x), silently breaking the science config's DGain = 1x
+  (and it would have carried into the night, where the night line leaves
+  DGain in auto). The line comes from the station's `camera_settings*.json`
+  (resolved like RMS does, relative to the RMS checkout), day vs night chosen
+  by the sun altitude with RMS's -9° rule; without a settings file it is
+  rebuilt from the camera's reported ranges. `Auto All` sends the day line.
 - Shared AE on the Goke pod: validated on the IMX291 bench only. On the Goke
   science config, night exposure/gain is already pinned identically by
   `camera_settings.json`; shared AE matters at twilight/day where the cameras'

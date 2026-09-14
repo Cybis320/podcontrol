@@ -61,6 +61,7 @@ class SharedAE:
         self.last = {}
         self.t_apply = 0.0                   # epoch of the last change pushed
         self.waiting = 0                     # consecutive cycles held for fresh frames
+        self.restore = None                  # {cam: cmd} taken at takeover
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -110,6 +111,11 @@ class SharedAE:
         self.li = max(0.0, min(min(lis), self._max_li()))
         self.last = {}
         return self.li
+
+    def takeover(self, poll):
+        """Seed the ladder AND remember how to hand every camera back."""
+        self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
+        return self.seed(poll)
 
     # --- freshness gate ----------------------------------------------------
     def fresh(self, metering):
@@ -164,15 +170,19 @@ class SharedAE:
             return None
         exp = int(self.last["exp_us"])
         analog = int(round(self.last["analog_x"] * 1024))
-        boost = int(round(self.last["boost_x"] * 1024))
-        kw = {"again": analog, "exp_us": exp}
-        if self.last["boost_x"] > 1.001:
-            kw["ispdgain"] = boost           # ISP-digital (-i) on both platforms
+        boost = int(round(max(1.0, self.last["boost_x"]) * 1024))
+        # pin ALL four stages: any stage left in AUTO keeps floating per camera
+        # (sensor DGain went 1.0x..3.4x across the pod at the same -a/-e)
+        kw = {"again": analog, "dgain": 1024, "ispdgain": boost, "exp_us": exp}
         r = self.pod.manual_all(timeout=timeout, **kw)
         self.t_apply = time.time()
         return r
 
     def release(self, timeout=5.0):
+        """Hand the cameras back exactly as they were (snapshot), never a bare
+        'auto' (it resets the Goke AE ranges, e.g. sensor DGain max -> 126x)."""
+        if hasattr(self.pod, "release"):
+            return self.pod.release(self.restore, timeout=timeout)
         return self.pod.auto_all(timeout=timeout)
 
 
@@ -188,7 +198,7 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
     """Headless shared-AE loop. meter_fn() -> {cam:{mean,clip}}. Releases to auto on exit."""
     ae = SharedAE(pod, cfg)
     cfg = ae.cfg
-    ae.seed(pod.poll_all(timeout=4))         # start from where the cameras are
+    ae.takeover(pod.poll_all(timeout=4))     # start from where the cameras are
     try:
         while not stop():
             poll = pod.poll_all(timeout=4)

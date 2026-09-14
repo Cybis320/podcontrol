@@ -22,14 +22,70 @@ import os, re, glob, json
 DEFAULT_IPS = ["192.168.42.%d" % n for n in range(101, 107)]
 
 
+def rms_root():
+    """The RMS checkout RMS runs from ($PODCONTROL_RMS_DIR, the installed RMS
+    package's parent, or ~/source/RMS). RMS resolves a relative
+    camera_settings_path against this directory (its cwd), not the station's."""
+    d = os.environ.get("PODCONTROL_RMS_DIR")
+    if d and os.path.isdir(os.path.expanduser(d)):
+        return os.path.expanduser(d)
+    try:
+        import RMS
+        d = os.path.dirname(os.path.dirname(os.path.abspath(RMS.__file__)))
+        if os.path.isdir(d):
+            return d
+    except Exception:
+        pass
+    return os.path.expanduser("~/source/RMS")
+
+
+def resolve_settings_path(spec, config_dir):
+    """Mirror RMS: an explicit camera_settings_path is taken relative to the
+    RMS root (its cwd) -- we also accept it next to the station config; the
+    default is <config dir>/camera_settings.json, else RMS's own."""
+    cands = []
+    if spec:
+        spec = os.path.expanduser(spec)
+        if os.path.isabs(spec):
+            cands.append(spec)
+        else:
+            cands += [os.path.join(config_dir, spec), os.path.join(rms_root(), spec)]
+    cands += [os.path.join(config_dir, "camera_settings.json"),
+              os.path.join(rms_root(), "camera_settings.json")]
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return ""
+
+
 class Station:
-    def __init__(self, station_id, ip, data_dir="", mask_path="", platepar_path=""):
+    def __init__(self, station_id, ip, data_dir="", mask_path="", platepar_path="",
+                 settings_path=""):
         self.id = station_id
         self.ip = ip
         self.data_dir = os.path.expanduser(data_dir) if data_dir else ""
         self.mask_path = os.path.expanduser(mask_path) if mask_path else ""
         # RMS platepar: lets us place the sun in the frame (sun exclusion mask)
         self.platepar_path = os.path.expanduser(platepar_path) if platepar_path else ""
+        # RMS camera_settings*.json: the authoritative day/night exposure lines,
+        # used to hand a camera back EXACTLY as RMS configures it
+        self.settings_path = os.path.expanduser(settings_path) if settings_path else ""
+
+    def mode_cmd(self, mode):
+        """The daemon exposure command RMS sends for `mode` ('day'|'night'),
+        e.g. 'auto --min-exptime 30 --max-exptime 39970 --max-dgain 1024', or
+        None if the settings file is missing or has no such line."""
+        if not self.settings_path or not os.path.isfile(self.settings_path):
+            return None
+        try:
+            data = json.load(open(self.settings_path))
+        except Exception:
+            return None
+        for entry in data.get(mode, []) or []:
+            if (isinstance(entry, list) and len(entry) >= 3 and entry[0] == "Isp"
+                    and entry[1] in ("auto", "manual")):
+                return " ".join(str(t) for t in entry[1:])
+        return None
 
     @property
     def frames_dir(self):
@@ -69,7 +125,7 @@ def from_pod_file(path):
     """JSON: {"cameras":[{"id":..,"ip":..,"data_dir":..}, ...]}."""
     data = json.load(open(os.path.expanduser(path)))
     return [Station(c.get("id") or c["ip"], c["ip"], c.get("data_dir", ""), c.get("mask", ""),
-                    c.get("platepar", ""))
+                    c.get("platepar", ""), c.get("settings", ""))
             for c in data.get("cameras", data if isinstance(data, list) else [])]
 
 
@@ -87,9 +143,11 @@ def discover_stations(stations_dir):
             # RMS: mask = <config dir>/<basename of [Capture] mask>, default mask.bmp
             mask_name = os.path.basename(_get(txt, "mask", "") or "mask.bmp")
             pp_name = os.path.basename(_get(txt, "platepar_name", "") or "platepar_cmn2010.cal")
+            sp = resolve_settings_path(_get(txt, "camera_settings_path", ""),
+                                       os.path.dirname(cfg))
             out.append(Station(sid, m.group(1), _get(txt, "data_dir", ""),
                                os.path.join(os.path.dirname(cfg), mask_name),
-                               os.path.join(os.path.dirname(cfg), pp_name)))
+                               os.path.join(os.path.dirname(cfg), pp_name), sp))
     return out
 
 
@@ -124,4 +182,5 @@ if __name__ == "__main__":
     for s in get_pod():
         print(s, "data_dir:", s.data_dir or "(none -> RTSP grab)",
               "mask:", s.mask_path if s.mask_path and os.path.isfile(s.mask_path) else "(none)",
-              "platepar:", "ok" if s.platepar_path and os.path.isfile(s.platepar_path) else "(none)")
+              "platepar:", "ok" if s.platepar_path and os.path.isfile(s.platepar_path) else "(none)",
+              "day:", s.mode_cmd("day") or "(none)")

@@ -50,15 +50,29 @@ def _parse_goke(q):
     def n(k):
         v = _f(q, k + r":\s*(-?\d+)")
         return int(v) if v is not None else None
-    again = n("AGain"); ispd = n("ISPDGain")
+    again = n("AGain"); dg = n("DGain"); ispd = n("ISPDGain")
+    # "Auto ranges" block: ExpTime: [30 .. 39970] / AGain: [1024 .. 22924] ...
+    ranges = {}
+    for k in ("ExpTime", "AGain", "DGain", "ISPDGain", "SysGain"):
+        m = re.search(k + r":\s*\[(\d+)\s*\.\.\s*(\d+)\]", q)
+        if m:
+            ranges[k] = (int(m.group(1)), int(m.group(2)))
+    # per-stage op types + pinned values: "AGain: OpType=MANUAL val=1513"
+    stages = {}
+    for k in ("ExpTime", "AGain", "DGain", "ISPDGain"):
+        m = re.search(k + r":\s*OpType=(\w+)\s+val=(\d+)", q)
+        if m:
+            stages[k] = (m.group(1), int(m.group(2)))
     return {
         "again_x": (again / 1024.0) if again else None,
+        "dgain_x": (dg / 1024.0) if dg else None,
         "ispdgain_x": (ispd / 1024.0) if ispd else None,
         "sysgain_x": None,   # derivable if needed
         "exp_us": n("ExpTime"), "iso": n("ISO"),
         "avelum": n("AveLum"), "chiptemp": n("ChipTemp"),
         "optype": _f(q, r"OpType:\s*(\w+)"),
         "exp_max": (_f(q, r"ExposureMAX:\s*(\w+)") or "").lower() == "yes",
+        "ranges": ranges, "stages": stages,
     }
 
 
@@ -68,7 +82,7 @@ def _parse_ae_line(text):
         return float(v) if v else None
     us = _f(text, r"~(\d+)\s*us")
     return {
-        "again_x": x("AGain"), "sysgain_x": x("SysGain"), "ispdgain_x": None,
+        "again_x": x("AGain"), "sysgain_x": x("SysGain"), "dgain_x": None, "ispdgain_x": None,
         "exp_us": int(us) if us else None,
         "iso": int(_f(text, r"ISO=(\d+)") or 0) or None,
         "avelum": None, "chiptemp": None, "optype": None, "exp_max": None,
@@ -145,6 +159,10 @@ class PodController:
         return {sid: f.result() for sid, f in futs.items()}
 
     def manual_all(self, again=None, dgain=None, ispdgain=None, exp_us=None, timeout=5.0):
+        """Pin exposure/gains on every camera. Any stage left None stays in
+        AUTO on the camera and keeps floating per camera (seen live: sensor
+        DGain 1.0x..3.4x across the pod at the same -a/-e) -- callers that
+        want the pod in sync must pass ALL of again/dgain/ispdgain/exp_us."""
         p = ["manual"]
         if again is not None:    p += ["-a", str(int(again))]
         if dgain is not None:    p += ["-d", str(int(dgain))]
@@ -152,8 +170,67 @@ class PodController:
         if exp_us is not None:   p += ["-e", str(int(exp_us))]
         return self._bcast(" ".join(p), timeout)
 
+    # --- handing cameras back --------------------------------------------
+    @staticmethod
+    def restore_cmd(station, tel):
+        """The command that puts a camera back exactly as it was before we took
+        over, from its telemetry snapshot `tel` (poll()). Prefers RMS's own
+        day/night line from the station's camera_settings file (day if the
+        camera was in AUTO, night if MANUAL); otherwise rebuilds it from the
+        reported auto ranges / pinned values. A bare 'auto' is NEVER used: on
+        the Goke it resets every AE range to the driver default (sensor DGain
+        max 126x), silently breaking the science config's DGain=1x."""
+        # which mode RMS is in: from the sun (its -9 deg rule), NOT from the
+        # camera's op type -- a camera we pinned looks "manual" either way
+        mode = None
+        try:
+            from podcontrol import sunmask
+            mode = sunmask.mode_for(station)
+        except Exception:
+            mode = None
+        auto = (tel or {}).get("optype", "AUTO") != "MANUAL" if mode is None else (mode == "day")
+        line = station.mode_cmd("day" if auto else "night") if hasattr(station, "mode_cmd") else None
+        if line:
+            return line
+        r = (tel or {}).get("ranges") or {}
+        st = (tel or {}).get("stages") or {}
+        if auto:
+            cmd = "auto"
+            if "ExpTime" in r:
+                cmd += " --min-exptime %d --max-exptime %d" % r["ExpTime"]
+            if "AGain" in r:
+                cmd += " --max-again %d" % r["AGain"][1]
+            cmd += " --max-dgain %d" % (r["DGain"][1] if "DGain" in r else 1024)
+            if "SysGain" in r:
+                cmd += " --max-sysgain %d" % r["SysGain"][1]
+            return cmd
+        if st:
+            a = st.get("AGain", (None, 1024))[1]; e = st.get("ExpTime", (None, 39941))[1]
+            i = st.get("ISPDGain", (None, 1024))[1]
+            return "manual -a %d -d 1024 -i %d -e %d" % (a, i, e)
+        return "auto --max-dgain 1024"
+
+    def snapshot(self, poll):
+        """{station_id: restore command} for every online camera."""
+        out = {}
+        for s in self.stations:
+            t = poll.get(s.id) or {}
+            if t.get("online"):
+                out[s.id] = self.restore_cmd(s, t)
+        return out
+
+    def release(self, snap=None, timeout=5.0):
+        """Hand every camera back: its snapshot command if we have one, else
+        the station's day line, else a DGain-safe auto."""
+        futs = {}
+        for s in self.stations:
+            cmd = (snap or {}).get(s.id) or s.mode_cmd("day") or "auto --max-dgain 1024"
+            futs[s.id] = self._pool.submit(send, s.ip, cmd, timeout)
+        return {sid: f.result() for sid, f in futs.items()}
+
     def auto_all(self, timeout=5.0):
-        return self._bcast("auto", timeout)
+        """'Auto All': every camera to RMS's DAY exposure line (never bare auto)."""
+        return self.release(None, timeout)
 
     def wb_all(self, R, G, B, timeout=5.0):
         """Set the same manual WB (x256 gains, 256=1.0x) on every camera."""
@@ -196,8 +273,9 @@ if __name__ == "__main__":
         wb = d.get("wb") or {}; qp = d.get("qp") or {}; gop = d.get("gop") or {}
         g = wb.get("gains") or []
         wbs = ("%s %s" % (wb.get("op"), "/".join("%.2f" % x for x in (g[0], g[1], g[-1])) if len(g) >= 3 else "")).strip()
-        print("%-8s %-7s %6.2f %6s %7s %5s %-6s %-16s %-9s %-4s %s" % (
+        print("%-8s %-7s %6.2f %6s %7s %5s %-6s %-16s %-9s %-4s %s  D%.2f I%.2f" % (
             sid, d.get("platform"), d.get("again_x") or 0, d.get("exp_us"),
             d.get("avelum"), d.get("iso"), d.get("optype") or d.get("chiptemp") or "",
             wbs, "%s/%s" % (qp.get("maxqp"), qp.get("minqp")), d.get("cqp"),
-            "%s/%s" % (gop.get("gop"), gop.get("bitrate_kbps"))))
+            "%s/%s" % (gop.get("gop"), gop.get("bitrate_kbps")),
+            d.get("dgain_x") or 0, d.get("ispdgain_x") or 0))
