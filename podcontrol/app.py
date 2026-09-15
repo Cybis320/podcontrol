@@ -415,7 +415,12 @@ class App(tk.Tk):
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:
                 pass
-            poll = self.pod.poll_all(timeout=4)
+            # one daemon connection per camera per cycle; the encoder/WB
+            # fields (which only change when something writes them) are read
+            # in full once a minute or right after we pushed something
+            self._cycle_n = getattr(self, "_cycle_n", 0) + 1
+            full = (self._cycle_n % 12 == 1) or (time.time() - self.ae.t_apply < 15)
+            poll = self.pod.poll_all(timeout=4, full=full)
             sun = feed_sun(self.ae, self.pod)
             futs = {self._pool.submit(frame_for, s, self.allow_grab, True, True): s.id
                     for s in self.stations}

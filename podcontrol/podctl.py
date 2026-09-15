@@ -131,17 +131,19 @@ def _encoder_telemetry(ip, timeout):
     }
 
 
-def poll(ip, timeout=5.0):
-    """Unified telemetry for one camera. platform in {goke, imx291, None}."""
+def poll(ip, timeout=5.0, full=True):
+    """Unified telemetry for one camera. platform in {goke, imx291, None}.
+    full=False asks only `query` (exposure) and skips the wb/venc_* reads --
+    those never change on their own, so the app reads them once a minute and
+    keeps the per-cycle load on the camera daemons to one connection."""
     q = send(ip, "query", timeout)
     if q is None:
         return {"online": False, "platform": None}
+    enc = _encoder_telemetry(ip, timeout) if full else {}
     if "Exposure Info" in q:                     # Goke isp_ctl
-        return {"online": True, "platform": "goke", **_parse_goke(q),
-                **_encoder_telemetry(ip, timeout)}
+        return {"online": True, "platform": "goke", **_parse_goke(q), **enc}
     if "ae:" in q or "AGain=" in q:              # IMX291 hisp_ctl
-        return {"online": True, "platform": "imx291", **_parse_ae_line(q),
-                **_encoder_telemetry(ip, timeout)}
+        return {"online": True, "platform": "imx291", **_parse_ae_line(q), **enc}
     return {"online": True, "platform": "unknown", "raw": q}
 
 
@@ -150,9 +152,23 @@ class PodController:
         self.stations = list(stations)
         self._pool = ThreadPoolExecutor(max_workers=max(4, 2 * len(self.stations)))
 
-    def poll_all(self, timeout=5.0):
-        futs = {s.id: self._pool.submit(poll, s.ip, timeout) for s in self.stations}
-        return {sid: f.result() for sid, f in futs.items()}
+    def __init_cache(self):
+        if not hasattr(self, "_enc_cache"):
+            self._enc_cache = {}
+
+    def poll_all(self, timeout=5.0, full=True):
+        """full=False: exposure only per camera; the encoder/WB fields are
+        filled from the last full poll so callers see a complete record."""
+        self.__init_cache()
+        futs = {s.id: self._pool.submit(poll, s.ip, timeout, full) for s in self.stations}
+        out = {sid: f.result() for sid, f in futs.items()}
+        for sid, d in out.items():
+            if full and d.get("online"):
+                self._enc_cache[sid] = {k: d.get(k) for k in ("wb", "qp", "cqp", "gop")}
+            elif not full and d.get("online"):
+                for k, v in (self._enc_cache.get(sid) or {}).items():
+                    d.setdefault(k, v)
+        return out
 
     def _bcast(self, cmd, timeout=5.0):
         futs = {s.id: self._pool.submit(send, s.ip, cmd, timeout) for s in self.stations}
