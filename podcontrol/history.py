@@ -167,10 +167,16 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
         canvas.create_line(L, Ye(us), W - R, Ye(us), fill=grid)
         canvas.create_text(L - 6, Ye(us), text=lab, fill=dim, anchor="e", font=("JetBrains Mono", 8))
     for sid in cams:
-        pts = [(X(r["t"]), Ye(r["cams"][sid]["exp_us"])) for r in recs
-               if r.get("cams") and r["cams"].get(sid) and r["cams"][sid].get("exp_us")]
-        if len(pts) > 1:
-            canvas.create_line(*[c for p in pts for c in p], fill=colors[sid], width=1)
+        seg = []
+        for r in recs:
+            v = (r.get("cams") or {}).get(sid)
+            if v and v.get("exp_us"):
+                seg.append((X(r["t"]), Ye(v["exp_us"])))
+            else:
+                if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill=colors[sid], width=1)
+                seg = []
+        if len(seg) > 1:
+            canvas.create_line(*[c for p in seg for c in p], fill=colors[sid], width=1)
     seg = []
     for r in recs:
         if r.get("ae_on") and r.get("exp_us"):
@@ -195,11 +201,21 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
         canvas.create_text(L - 6, Yg(g), text="%dx" % g, fill=dim, anchor="e", font=("JetBrains Mono", 8))
         canvas.create_text(W - R + 6, Yg(g), text="ISO %d" % (100 * g), fill="#5a6a7a", anchor="w", font=("JetBrains Mono", 8))
     def cam_gain(v):
+        if v.get("again_x") is None or not v.get("exp_us"):
+            return None                       # poll failed for that cycle: no sample
         return (v.get("again_x") or 1.0) * (v.get("dgain_x") or 1.0) * (v.get("ispdgain_x") or 1.0)
     for sid in cams:
-        pts = [(X(r["t"]), Yg(cam_gain(r["cams"][sid]))) for r in recs if r.get("cams") and r["cams"].get(sid)]
-        if len(pts) > 1:
-            canvas.create_line(*[c for p in pts for c in p], fill=colors[sid], width=1)
+        seg = []
+        for r in recs:
+            v = (r.get("cams") or {}).get(sid)
+            g = cam_gain(v) if v else None
+            if g is None:
+                if len(seg) > 1: canvas.create_line(*[c for p in seg for c in p], fill=colors[sid], width=1)
+                seg = []
+            else:
+                seg.append((X(r["t"]), Yg(g)))
+        if len(seg) > 1:
+            canvas.create_line(*[c for p in seg for c in p], fill=colors[sid], width=1)
     seg = []
     for r in recs:
         if r.get("ae_on") and r.get("gain"):
