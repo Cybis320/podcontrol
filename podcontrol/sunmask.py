@@ -47,7 +47,7 @@ FLARE_GHOSTS = [(-0.55, 1.0, 22.0), (-0.20, 0.7, 1e9)]
 DEFAULT_GHOST_RADIUS_DEG = 6.0
 FLARE_K_MIN, FLARE_K_MAX = -1.6, 1.0
 FLARE_CORRIDOR_HALF_WIDTH_DEG = 3.0
-FLARE_MAX_SEP_DEG = 30.0                      # ghosts appear with the sun well outside the field
+FLARE_MAX_SEP_DEG = 15.0                      # ghosts seen with the sun 2 and 12 deg outside the field; nothing at 26+
 
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
 _CACHE = {}              # (station, 30 s bucket, radius, shape) -> (excl, info)
