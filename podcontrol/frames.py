@@ -427,7 +427,7 @@ def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
 def stats_for_path(station, path, t, wb_scale=1.0):
     """luma_stats of a saved frame (masked, sun at t), cached by path."""
     key = (path, round(F_SUN_RADIUS(), 2), round(FLARE_HALF_WIDTH_DEG[0], 2), CLIP_MIN_BLOB_PX[0],
-           round(MOON_RADIUS_DEG[0], 2), round(float(wb_scale), 3))
+           round(MOON_RADIUS_DEG[0], 2), round(float(wb_scale), 3), round(MAGENTA_TOL_DEG[0], 2))
     hit = _STATS_CACHE.get(key)
     if hit is not None:
         return hit
@@ -435,7 +435,12 @@ def stats_for_path(station, path, t, wb_scale=1.0):
     st = None
     if img is not None:
         keep, lay = mask_for(station, img, t, layers=True)
-        st = luma_stats(img, keep, wb_scale=wb_scale)
+        magenta_ok = None
+        if MAGENTA_TOL_DEG[0] > 0:
+            from podcontrol import sunmask
+            # the sun disc alone at the tolerance radius (no flare, no moon)
+            magenta_ok, _ = sunmask.exclusion(station, t, MAGENTA_TOL_DEG[0], img.shape[:2], 0.0, 0.0)
+        st = luma_stats(img, keep, wb_scale=wb_scale, magenta_ok=magenta_ok)
         if st is not None:
             si = (lay or {}).get("sun_info") or {}
             st["sun_in_fov"] = bool(si.get("in_fov"))
@@ -518,6 +523,25 @@ def highlight_maps(bgr, keep, peak_value=None, clip_level=250):
 # only bounds the search window; RAW_SAT_G_MARGIN is the fallback when no
 # plateau stands out.
 RAW_SAT_G_MARGIN = 8.0
+
+# Where a magenta highlight is acceptable: within this angle of the sun.
+#
+# Attenuating the WB turns every RAW-saturated pixel magenta -- the ceiling that
+# clamps red and blue back down to green at scale 1 stops clamping as soon as
+# the gains are scaled, and no uniform scale avoids it. So the rung has to be
+# vetoed by raw saturation, but vetoing on ANY of it disabled the rung all
+# through daylight, because one of six cameras nearly always faces the sun.
+#
+# Measured 2026-09-24: the raw saturation outside the sun-zone mask is not
+# scattered cloud, it is the sun's own glare ring just past the mask edge, and
+# it stops by 42 deg (C1 nothing beyond 32 deg, F1 nothing beyond 42). So the
+# useful test is ANGLE FROM THE SUN, not the mask: magenta inside this radius is
+# the sun's glare and is accepted, magenta anywhere else still vetoes the rung.
+MAGENTA_TOL_DEG = [45.0]
+
+
+def set_magenta_tol(deg):
+    MAGENTA_TOL_DEG[0] = max(0.0, float(deg))
 PLATEAU_WINDOW_BELOW = 25   # search this far below the predicted plateau
 PLATEAU_SPIKE = 5.0         # the plateau level must hold > this x the levels 4-10 below it
 
@@ -555,7 +579,7 @@ def set_clip_min_blob(px):
     CLIP_MIN_BLOB_PX[0] = max(0, int(px))
 
 
-def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
+def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0, magenta_ok=None):
     """Metering from a frame: mean luma (0-255), clipped-pixel fraction (0-1)
     and the 99.9th-percentile peak -- over the UNMASKED pixels only when a mask
     (True = count) of the same size is given. The universal exposure signal:
@@ -612,6 +636,14 @@ def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
         # the rung ran to its bottom with the halo violet). Counted only when
         # a plateau stands out; without one the frame has no clipped green.
         out["raw_sat_all"] = float(gs_all.mean()) if plateau is not None else 0.0
+        # raw saturation that would go magenta somewhere we care about: outside
+        # `magenta_ok` (the disc around the sun). This is what vetoes the WB rung.
+        if plateau is None:
+            out["raw_sat_far"] = 0.0
+        elif magenta_ok is not None and getattr(magenta_ok, "shape", None) == gs_all.shape:
+            out["raw_sat_far"] = float((gs_all & ~magenta_ok).mean())
+        else:
+            out["raw_sat_far"] = out["raw_sat_all"]
         if keep is not None:
             G, R, B, gs = G[keep], R[keep], B[keep], gs_all[keep]
         else:

@@ -270,12 +270,31 @@ controller goes down for `rb_only`, holds for `raw_sat`, and does not climb
 back until there is clear headroom. The base WB is captured at takeover
 (manual WB only), the attenuated `wb` is pushed with each step, restored on
 release, re-asserted if RMS rewrites WB, and the History records `wb_scale`.
-**Magenta guard.** A raw-saturated pixel is R 1.8s / G 1.0s / B 1.9s after
-WB: at s = 1 it clips to white, at any s < 1 it turns magenta (the classic
-raw-highlight problem; the gain-clipped pixels have that cast *today* and the
-rung removes it). So the rung is only used while raw saturation is below
+**Magenta guard.** A raw-saturated pixel starts at the sensor ceiling in all
+three channels. At s = 1 the WB gains push red and blue past the 12-bit ceiling
+and they clamp back down to green, so the pixel clips to white for free. Scale
+everything by s and that clamp stops working: green falls to 4095s while red
+and blue stay pinned, and the pixel turns magenta, worse the lower s goes. No
+uniform scale avoids it, and the chip has no highlight-reconstruction block to
+pin those pixels to white (HLC is a luma-target suppressor, the WhiteLevel
+fields are AWB statistics and DNG metadata). So raw saturation has to veto the
+rung. So the rung is only used while raw saturation is below
 `wb_rung_raw_sat_max` (0.02% of the frame), and the pod climbs back to s = 1
-as soon as a raw-saturated zone appears. `wb_lever = False` disables it.
+as soon as a raw-saturated zone appears.
+
+**Except near the sun.** Vetoing on raw saturation *anywhere* disabled the rung
+through the whole of daylight, since one of six cameras nearly always faces the
+sun: measured 2026-09-24, the pod was on the rung for 7% of daylight cycles and
+never got past s = 0.94, while C1 and F1 each had 9-11% of their frame in
+recoverable red/blue gain clipping. But that raw saturation is not scattered
+cloud, it is the sun's own glare ring just outside the sun-zone mask, and it
+stops by 42 deg (C1 had none beyond 32 deg, F1 none beyond 42). So the veto now
+tests ANGLE FROM THE SUN rather than the mask: raw saturation within
+`frames.MAGENTA_TOL_DEG` (45 deg) is the sun's glare, magenta there is accepted,
+and raw saturation anywhere else still vetoes. On the same frames that blocked
+the rung, the veto fraction goes to zero on every camera at 45 deg (F1 still
+blocks at 35 deg). Re-measure the glare radius per lens with
+`python -m podcontrol.sunmask --measure STATION`. `wb_lever = False` disables it.
 Two blind spots closed 2026-09-16, after the pod ran to the rung's bottom
 with a violet sun halo (gains 1.0/0.555/1.06): the guard counted raw
 saturation over the *unmasked* pixels only, and the halo, the raw-saturated
