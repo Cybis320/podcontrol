@@ -390,6 +390,7 @@ class App(tk.Tk):
         self.overlay = tk.BooleanVar(value=sv("overlay", True))
         self.sun_radius = tk.DoubleVar(value=sv("sun_radius_deg", F.SUN_RADIUS_DEG[0]))
         self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
+        self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
         self.sun_votes = tk.BooleanVar(value=sv("sun_cam_votes", self.ae.cfg.sun_cam_votes))
         self.flare_w = tk.DoubleVar(value=sv("flare_radius_deg", F.FLARE_HALF_WIDTH_DEG[0]))
         self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
@@ -403,7 +404,7 @@ class App(tk.Tk):
         self._save_job = None
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
-        for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.sun_votes,
+        for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
                     self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
@@ -520,6 +521,12 @@ class App(tk.Tk):
              "Maximum stops the pod exposure may move per cycle while tracking normally.\n"
              "0.05 stop is about 3.5% brightness per frame, invisible in a timelapse.\n"
              "Moves against the diurnal trend run slower still, to ride out passing clouds.")
+        pair(g, "fast", self.slew_fast, 0.1, 4.0, 0.1, 4, "%.1f", tip=
+             "Maximum stops per cycle in the FAST regime, which applies only to a gross error:\n"
+             "a frame more than 10% clipped, or a dark seed just after takeover. Mild errors\n"
+             "keep the smooth slew. This is what recovers 16 stops in minutes instead of half\n"
+             "an hour when a camera is handed the night line in daylight.",
+             unit="stop/cycle", unit_pad=8)
         pair(g, "clip ≤", self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f", tip=
              "Clipped fraction the AE aims to stay under. Above it the pod asks for less light.\n"
              "0.005% is roughly 100 pixels of the frame. Raise it for a timelapse if cloud\n"
@@ -603,6 +610,7 @@ class App(tk.Tk):
                 F.set_moon_radius(self.moon_radius.get())
                 self.ae.cfg.clip_limit = max(0.0, float(self.clip_pct.get())) / 100.0
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
+                self.ae.cfg.slew_fast = max(0.05, float(self.slew_fast.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
             except Exception:
                 pass
@@ -884,6 +892,7 @@ class App(tk.Tk):
     def _settings_dict(self):
         d = {"refresh_s": float(self.interval.get()), "overlay": bool(self.overlay.get()),
              "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
+             "slew_fast": float(self.slew_fast.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),

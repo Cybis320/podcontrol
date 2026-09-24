@@ -24,7 +24,12 @@ camera drive every 5 s and the pod chased up and down. Instead:
   * the pod target is the darkest need across cameras (highlight priority);
   * the pod SLEWS toward the target by at most `slew` stops per cycle (5 s,
     the RMS frame cadence): the default 0.05 stop is a 3.5% brightness change
-    per frame, invisible in a 30 fps timelapse of 5 s frames.
+    per frame, invisible in a 30 fps timelapse of 5 s frames;
+  * two exceptions run at `slew_fast` (1 stop/cycle): the STARTUP phase after
+    a takeover (until the pod first reaches its target) and a GROSS error --
+    a frame more than `clip_gross` clipped may move the target up to
+    `max_step_gross` stops at once, since a white frame only says "far too
+    bright" and 16 stops at 0.5 per ~50 s set took 30 min (2026-09-16).
 
 Cross-platform: the ladder is in stops; the secondary gain stage is the ISP
 digital gain (-i) on BOTH platforms. The sensor digital gain (-d) is left at
@@ -66,6 +71,22 @@ class AEConfig:
                                 # gets there in minutes (a soft "high-water mark")
     clip_emergency = 0.01       # clipped fraction above which an against-trend
                                 # reduction runs at the full slew (extended blow-out)
+    # Fast regime (2026-09-16: the pod was handed the night line at 09:00
+    # local; at 0.05 stop/cycle and 0.5 stop per frame set the shared AE
+    # needed 30 min to bring the 16 stops back, every frame white meanwhile).
+    slew_fast = 1.0             # max stops per cycle while STARTING UP (after a takeover,
+                                # until the pod first reaches its target) or correcting a
+                                # GROSS error; the smooth `slew` applies otherwise
+    clip_gross = 0.10           # clipped fraction above which a frame is a gross error: it
+                                # may move the target max_step .. max_step_gross at once
+                                # (0.5 stop at 10 % clipped, 3 stops at 100 %)
+    max_step_gross = 3.0        # stops a fully blown-out frame moves the target
+    startup_calib_peak = 180.0  # startup only: while the 99.9th-pctile luma is below this the
+                                # headroom step is CALIBRATED (log2 of ceiling/peak, up to
+                                # max_step_gross) instead of kp * error; above it the normal
+                                # law settles the last fraction of a stop
+    startup_max_s = 600.0       # the startup phase ends when the pod first reaches a
+                                # post-takeover target, or after this long
     night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n);
                                 # RMS writes its night line here -- we re-pin and keep driving.
                                 # Overwritten from RMS at import (see below).
@@ -138,7 +159,10 @@ class SharedAE:
         self.sun_rising = None
         self.state = "day"                   # day | dusk | night | dawn (for display)
         self.driver = None                   # cam whose need set the target
-        self.driver_why = None               # 'clipping' | 'headroom' | 'at target'
+        self.driver_why = None               # 'clipping' | 'headroom' | 'at target' | 'gross ...'
+        self.startup = False                 # fast phase after a takeover (see step)
+        self.fast = False                    # last step ran at slew_fast
+        self.driver_li_f = None              # light index the driver's frame was captured at
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -205,6 +229,7 @@ class SharedAE:
             return None
         self.li = self.target = max(0.0, min(min(lis), self._max_li()))
         self.last = {}
+        self.startup = True                  # converge fast from wherever we start
         self.t_seed = time.time()
         self.hist = [(self.t_seed, self.li)]
         self._applied_li = None
@@ -240,6 +265,7 @@ class SharedAE:
         if self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg:
             self.li = self.target = self._max_li()
             self.latched = True
+            self.startup = False                 # dawn must come down at the smooth slew
             self.state = "night"
             self._applied_li = self.li           # nothing to push
         return li
@@ -282,6 +308,7 @@ class SharedAE:
         if at_top or deep:
             self.li = self.target = self._max_li()
             self.latched = True
+            self.startup = False
             self.state = "night"
             return True
         return False
@@ -340,10 +367,26 @@ class SharedAE:
                 # on the rung with the clipping just gone: hold (hysteresis),
                 # climbing back would only re-clip the R/B channels
                 return li_f, "at target (WB rung)"
-        if clip > c.clip_limit:
+        if clip > c.clip_gross:
+            # GROSS blow-out: a mostly-white frame only says "far too bright",
+            # and trailing it max_step per ~50 s frame set is hopeless (30 min
+            # for 16 stops on 2026-09-16). Step max_step at clip_gross rising
+            # linearly to max_step_gross at 100 % clipped; monotone in the
+            # clip fraction, so successive sets converge without pumping.
+            frac = (clip - c.clip_gross) / max(1e-6, 1.0 - c.clip_gross)
+            d = -min(c.max_step_gross, c.max_step + (c.max_step_gross - c.max_step) * frac)
+            why = "gross clipping %.0f%%" % (100 * clip)
+        elif clip > c.clip_limit:
             # AIM FOR 0% CLIP: any clipping -> less light. Scales with severity
             # (gentle near zero so it settles, hard when badly blown out).
             d, why = -min(c.max_step, max(0.05, clip * c.kp_clip)), "clipping"
+        elif self.startup and peak < c.startup_calib_peak and mean < c.target_luma:
+            # startup from a dark seed: a CALIBRATED jump toward the ceiling
+            # (log2 of the ceiling/peak ratio, gamma taken as 1; the real
+            # sensor gamma 0.5 makes the true need larger, so this never
+            # overshoots) instead of kp * error per ~50 s frame set
+            d = min(c.max_step_gross, math.log2(c.peak_ceiling / max(peak, 4.0)))
+            why = "gross dark (peak %.0f)" % peak
         elif peak < c.peak_ceiling and mean < c.target_luma:
             # headroom below saturation AND not over-bright -> more light,
             # tapering as the peak nears the ceiling
@@ -405,6 +448,7 @@ class SharedAE:
         self.needs = needs
         self.driver = min(needs, key=lambda k: needs[k][0])
         self.driver_why = needs[self.driver][1]
+        self.driver_li_f = self.li_at((metering.get(self.driver) or {}).get("t"))
         self.target = max(self._min_li(), min(needs[self.driver][0], self._max_li()))
         return self.target
 
@@ -435,9 +479,28 @@ class SharedAE:
         if ramp is not None and ramp > target:
             target = ramp                    # dusk: climb to the night line by the switch
         err = target - self.li
-        rate = c.slew
+        # FAST regime: correcting a GROSS error -- the driver's frame was mostly
+        # clipped, or (startup only) far too dark. Only these big calibrated
+        # steps are worth taking at once: with frame sets ~50 s old, jumping to
+        # a small step's target and waiting is no faster than creeping there,
+        # so the smooth slew keeps the mild cases. The startup phase ends when
+        # a frame taken at the current setting says "at target", or
+        # startup_max_s after the takeover; a takeover at night never starts one.
+        gross = bool(self.driver_why) and self.driver_why.startswith("gross")
+        if gross and err > 0 and not self.startup:
+            err = 0.0            # a blown-out frame is a lower bound on the excess, never a reason to climb
+        if self.startup:
+            lf = self.driver_li_f
+            if (self.needs and not gross and abs(err) <= c.deadband
+                    and lf is not None and abs(lf - self.li) <= c.deadband):
+                self.startup = False         # a frame taken at THIS setting says: at target
+            elif self.t_seed and time.time() - self.t_seed > c.startup_max_s:
+                self.startup = False
+        fast = gross
+        self.fast = fast
+        rate = c.slew_fast if fast else c.slew
         against = False
-        if self.sun_rising is not None and abs(err) > 1e-3:
+        if not fast and self.sun_rising is not None and abs(err) > 1e-3:
             # diurnal trend: sun rising -> the pod should need LESS light over
             # time; sun setting -> MORE. A move the other way is suspect.
             trend_up = not self.sun_rising
@@ -461,6 +524,9 @@ class SharedAE:
             reason = "reached night line -> latched"
         elif ramp is not None and ramp > self.target and d > 0:
             reason = "dusk ramp to night line \u2191"
+        elif d and fast:
+            reason = ("slew\u2191" if d > 0 else "slew\u2193") + " (fast: %s)" % (
+                "startup" if self.startup else "gross error")
         elif d and getattr(self, "_against", False):
             reason = ("slew\u2191" if d > 0 else "slew\u2193") + " (against trend, slow)"
         elif d:
@@ -482,6 +548,7 @@ class SharedAE:
                      "needs": {k: (v[0] - self.li, v[1]) for k, v in
                                list(self.needs.items()) + list(self.followers.items())},
                      "state": self.state, "ramp": ramp, "wb_scale": self.wb_scale_for(self.li),
+                     "fast": fast, "startup": self.startup,
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
 
