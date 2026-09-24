@@ -276,6 +276,29 @@ raw-highlight problem; the gain-clipped pixels have that cast *today* and the
 rung removes it). So the rung is only used while raw saturation is below
 `wb_rung_raw_sat_max` (0.02% of the frame), and the pod climbs back to s = 1
 as soon as a raw-saturated zone appears. `wb_lever = False` disables it.
+Two blind spots closed 2026-09-16, after the pod ran to the rung's bottom
+with a violet sun halo (gains 1.0/0.555/1.06): the guard counted raw
+saturation over the *unmasked* pixels only, and the halo, the raw-saturated
+zone par excellence, sits inside the sun-zone mask, so it now counts raw
+saturation anywhere in the frame (`raw_sat_all`); and it ran only for frames
+captured *at* the floor, while heavily clipped frames from just above it
+drove the target straight past it, so a target that would cross below the
+floor is now checked too. Two more closed 2026-09-17, after C1 and F1 went
+magenta again at midday (R 240 G 178 B 251, pod at the rung bottom): the
+guard was per camera while the WB is pod-wide, so a camera whose clipping
+was purely gain-induced kept asking for the rung and darkest-need-wins
+took it while another camera's halo went violet; now raw saturation on
+**any** frame of the set pins every need at the floor, and a pod already on
+the rung climbs out at the full slew (a magenta fix is not a cloud
+transient). And the plateau was *predicted* from the WB scale the AE assumed
+in effect, which differed from the cameras' actual scale (0.568 vs 0.527)
+by more than the 8-level margin, so the guard saw nothing; the plateau is
+now *detected* (`frames.g_plateau`): the most populated green level near
+the top of the histogram, accepted when it stands out as a spike above the
+levels just below it, which a clipped highlight always produces and a
+smooth sky never does. Note the rung is armed only when the takeover finds a
+manual WB with gains above 1x; an app armed at night (`wb unity`) never
+attenuates, which is why the cast appeared only after the daytime restart.
 
 ## Point sources at twilight and night
 

@@ -324,7 +324,9 @@ class SharedAE:
         if at_floor and self.cfg.wb_lever and self.wb_base:
             # at/below the exposure floor only WB attenuation is left: it fixes
             # gain-induced R/B clipping but not raw (green) saturation
-            rb, rs = m.get("rb_only", clip), m.get("raw_sat", 0.0)
+            # raw saturation counts wherever it is in the frame (masked zones
+            # included): the magenta it would take is visible there all the same
+            rb, rs = m.get("rb_only", clip), max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
             if rs > c.wb_rung_raw_sat_max:
                 # raw-saturated zones would go magenta under attenuation: stay
                 # (or go back) to s = 1 where they clip to white
@@ -348,7 +350,16 @@ class SharedAE:
             d, why = min(c.max_step, c.kp * (c.peak_ceiling - peak) / c.peak_ceiling), "headroom"
         else:
             d, why = 0.0, "at target"
-        return li_f + d, why
+        t_new = li_f + d
+        if t_new < 0.0 and c.wb_lever and self.wb_base:
+            # about to enter the WB rung from above the floor: the same guard
+            # as on the rung. Until 2026-09-16 only frames captured AT the
+            # floor were checked, so heavily clipped frames from just above it
+            # drove the target straight to the rung's bottom past the guard.
+            rs = max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
+            if rs > c.wb_rung_raw_sat_max:
+                return 0.0, "raw-saturated: staying at the floor"
+        return t_new, why
 
     def evaluate(self, metering):
         """Update the pod target from whatever frames we have: the darkest need
@@ -367,6 +378,25 @@ class SharedAE:
                 needs[cam] = r
         if not needs and followers:          # every camera sees the sun: vote anyway
             needs, followers = followers, {}
+        # POD-WIDE magenta guard. The WB is shared, so the per-frame guard in
+        # _need is not enough: a camera without a sun halo asks for the rung
+        # (its clipping is gain-induced), darkest-need-wins takes it, and the
+        # shared attenuation turns ANOTHER camera's raw-saturated halo magenta
+        # (2026-09-17 11:50 local: C1/F1 halos at R 240 G 178 B 251 with the
+        # pod at the rung bottom, driven by A1/B1/D1/E1). If any frame of the
+        # set shows raw saturation, nobody may ask for less than the floor.
+        c = self.cfg
+        if c.wb_lever and self.wb_base:
+            sat = {cam: max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
+                   for cam, m in metering.items() if m}
+            worst = max(sat, key=sat.get) if sat else None
+            if worst is not None and sat[worst] > c.wb_rung_raw_sat_max:
+                for cam in list(needs):
+                    if needs[cam][0] < 0.0:
+                        needs[cam] = (0.0, "raw-saturated on %s: floor, no WB rung" % worst)
+                for cam in list(followers):
+                    if followers[cam][0] < 0.0:
+                        followers[cam] = (0.0, followers[cam][1])
         self.followers = followers
         if not needs:
             self.waiting += 1
@@ -413,6 +443,11 @@ class SharedAE:
             trend_up = not self.sun_rising
             against = (err > 0) != trend_up
             pod_clip = max(clips) if clips else 0.0
+            # leaving the WB rung because a halo is raw-saturated is a magenta
+            # fix, not a cloud transient: full slew even against the trend
+            leaving_rung = self.li < 0 and err > 0 and (self.driver_why or "").startswith("raw-saturated")
+            if leaving_rung:
+                against = False
             if against and not (err < 0 and pod_clip > c.clip_emergency):
                 rate = c.slew_against
         d = max(-rate, min(rate, err))

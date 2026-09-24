@@ -488,8 +488,8 @@ def highlight_maps_cached(path, bgr, keep, peak_value):
     if hit is not None:
         return hit
     r = highlight_maps(bgr, keep, peak_value)
-    if len(_HL_CACHE) > 12:
-        _HL_CACHE.clear()
+    while len(_HL_CACHE) >= 16:          # tiles + sky-set frames; evict the oldest, never all
+        _HL_CACHE.pop(next(iter(_HL_CACHE)))
     _HL_CACHE[key] = r
     return r
 
@@ -508,6 +508,40 @@ def highlight_maps(bgr, keep, peak_value=None, clip_level=250):
     hot = (y >= peak_value) & k & ~clipped
     return clipped, hot
 
+
+# Raw (green) saturation: a clipped highlight is a PLATEAU -- many pixels
+# sharing one green level near the top of the histogram (255 with the WB
+# unattenuated, ~255*sqrt(scale) under the WB rung). It is found as a spike
+# (g_plateau), not predicted from the scale: predicting it missed by ~10
+# levels on 2026-09-17 when the AE's assumed scale (0.568) and the cameras'
+# actual one (0.527) differed, and the magenta guard went blind. The model
+# only bounds the search window; RAW_SAT_G_MARGIN is the fallback when no
+# plateau stands out.
+RAW_SAT_G_MARGIN = 8.0
+PLATEAU_WINDOW_BELOW = 25   # search this far below the predicted plateau
+PLATEAU_SPIKE = 5.0         # the plateau level must hold > this x the levels 4-10 below it
+
+
+def g_plateau(G, wb_scale=1.0):
+    """Green level of the raw-saturation plateau in this frame, or None.
+    Looks in [255*sqrt(scale) - PLATEAU_WINDOW_BELOW, top] where top is the
+    99.99th percentile (hot pixels excluded), takes the most populated level,
+    and accepts it only if it stands out as a spike above the histogram just
+    below it and holds at least 0.01 % of the pixels."""
+    h = np.bincount(G.ravel(), minlength=256)
+    n = G.size
+    if n == 0:
+        return None
+    cum = np.cumsum(h)
+    top = int(np.searchsorted(cum, 0.9999 * n))
+    lo = max(1, int(255.0 * math.sqrt(min(1.0, max(1e-3, float(wb_scale))))) - PLATEAU_WINDOW_BELOW, top - 12)
+    if top <= lo:
+        return None
+    p = lo + int(np.argmax(h[lo:top + 1]))
+    below = float(h[max(0, p - 10):max(1, p - 4)].mean()) + 1.0
+    if h[p] > PLATEAU_SPIKE * below and h[p:top + 1].sum() >= 0.0001 * n:
+        return p
+    return None
 
 # Point-source tolerance for the CLIP metric: clipped blobs smaller than this
 # many pixels (a lamp, a planet, headlights) are not counted as clipping --
@@ -563,11 +597,25 @@ def luma_stats(bgr, mask=None, min_blob_px=None, wb_scale=1.0):
         # applied in 12-bit before demosaic) clipped it -- recoverable by
         # attenuating the WB gains. With a WB attenuation wb_scale < 1 the
         # green plateau of a raw-saturated pixel sits at 255*sqrt(wb_scale).
-        g_level = max(60.0, 255.0 * math.sqrt(min(1.0, max(1e-3, float(wb_scale)))) - 4.0)
         G = bgr[:, :, 1]; R = bgr[:, :, 2]; B = bgr[:, :, 0]
+        plateau = g_plateau(G, wb_scale)
+        if plateau is not None:
+            g_level = plateau - 3                     # the plateau's own spread
+        else:
+            g_level = max(60.0, 255.0 * math.sqrt(min(1.0, max(1e-3, float(wb_scale)))) - RAW_SAT_G_MARGIN)
+        gs_all = G >= g_level
+        out["g_plateau"] = plateau
+        # raw saturation ANYWHERE in the frame, mask or not: an attenuated WB
+        # turns every raw-saturated zone magenta, and the sun halo -- the
+        # raw-saturated zone par excellence -- sits inside the sun-zone mask
+        # (2026-09-16: the guard only looked at unmasked pixels, saw none, and
+        # the rung ran to its bottom with the halo violet). Counted only when
+        # a plateau stands out; without one the frame has no clipped green.
+        out["raw_sat_all"] = float(gs_all.mean()) if plateau is not None else 0.0
         if keep is not None:
-            G, R, B = G[keep], R[keep], B[keep]
-        gs = G >= g_level
+            G, R, B, gs = G[keep], R[keep], B[keep], gs_all[keep]
+        else:
+            gs = gs_all
         out["raw_sat"] = float(gs.mean())
         out["rb_only"] = float((((R >= 250) | (B >= 250)) & ~gs).mean())
     return out

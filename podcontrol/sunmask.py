@@ -51,6 +51,11 @@ FLARE_MAX_SEP_DEG = 15.0                      # ghosts seen with the sun 2 and 1
 
 _STATE = {}              # station.id -> precomputed grid (or None if unavailable)
 _CACHE = {}              # (station, 30 s bucket, radius, shape) -> (excl, info)
+# Entries hold full-res maps (a few MB each). Evict the OLDEST when full, never
+# clear everything: the tiles keep 6 live keys (one per station) and the sky
+# view up to 6 more (its frame set sits in another 30 s bucket), and a cache
+# that clears itself at the limit recomputed every zone on every cycle.
+CACHE_MAX = 16
 _WARNED = set()
 
 
@@ -278,8 +283,8 @@ def exclusion(station, t=None, radius_deg=DEFAULT_RADIUS_DEG, shape=None,
                 excl = fl if excl is None else (excl | fl)
     if excl is not None:
         info["frac"] = float(excl.mean())
-    if len(_CACHE) > 12:                 # entries hold full-res maps: keep it small
-        _CACHE.clear()
+    while len(_CACHE) >= CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
     _CACHE[key] = (excl, info)
     return excl, info
 
