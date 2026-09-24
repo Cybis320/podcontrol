@@ -64,6 +64,84 @@ def _fit_to(rgb, wh):
     return cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
 
 
+class Tip:
+    """Delayed hover help for one widget: a small borderless popup, plain Tk.
+
+    The toolbar carries a lot of levers whose meaning is not obvious from a
+    four-character label -- what `fast` bounds, why `satu` can be inert -- so
+    each control explains itself on hover instead of growing its label."""
+
+    ACTIVE = None
+    DELAY_MS = 450
+
+    def __init__(self, widget, text, delay=None):
+        self.w, self.text = widget, text
+        self.delay = Tip.DELAY_MS if delay is None else delay
+        self._job = self._win = None
+        widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<ButtonPress>", self._leave, add="+")
+
+    def _enter(self, _e=None):
+        self._cancel()
+        try:
+            self._job = self.w.after(self.delay, self._show)
+        except Exception:
+            self._job = None
+
+    def _leave(self, _e=None):
+        self._cancel()
+        self._hide()
+
+    def _cancel(self):
+        if self._job:
+            try:
+                self.w.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self):
+        self._job = None
+        if self._win is not None:
+            return
+        try:
+            if not self.w.winfo_exists():
+                return
+            if Tip.ACTIVE is not None and Tip.ACTIVE is not self:
+                Tip.ACTIVE._hide()
+            t = tk.Toplevel(self.w)
+            t.wm_overrideredirect(True)
+            try:
+                t.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            tk.Label(t, text=self.text, justify="left", bg="#1b1810", fg="#d8cfb4",
+                     font=(MONO, 9), bd=1, relief="solid", padx=7, pady=5).pack()
+            t.update_idletasks()
+            x = self.w.winfo_rootx() + 10
+            y = self.w.winfo_rooty() + self.w.winfo_height() + 6
+            sw, sh = t.winfo_screenwidth(), t.winfo_screenheight()
+            x = max(4, min(x, sw - t.winfo_width() - 4))            # keep it on screen
+            if y + t.winfo_height() > sh - 4:
+                y = self.w.winfo_rooty() - t.winfo_height() - 6     # flip above
+            t.wm_geometry("+%d+%d" % (x, y))
+            self._win = t
+            Tip.ACTIVE = self
+        except Exception:
+            self._hide()
+
+    def _hide(self):
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+        if Tip.ACTIVE is self:
+            Tip.ACTIVE = None
+
+
 def _tint(small, mask_full, tint, alpha, size):
     m = cv2.resize(mask_full.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
     if m.any():
@@ -369,53 +447,130 @@ class App(tk.Tk):
         row1 = tk.Frame(tb, bg=BG); row1.pack(fill="x")
         row2 = tk.Frame(tb, bg=BG); row2.pack(fill="x", pady=(4, 0))
 
-        def group(parent, title):
+        def group(parent, title, tip=None):
             g = tk.LabelFrame(parent, text=title, fg="#a4967c", bg=BG, bd=1, relief="groove",
                               font=(MONO, 8), padx=6, pady=2)
             g.pack(side="left", padx=(0, 8), fill="y")
+            if tip:
+                Tip(g, tip)
             return g
 
-        def lab(parent, txt, **kw):
-            tk.Label(parent, text=txt, fg="#c8bfa8", bg=BG).pack(side="left", **kw)
+        def lab(parent, txt, tip=None, **kw):
+            w = tk.Label(parent, text=txt, fg="#c8bfa8", bg=BG)
+            w.pack(side="left", **kw)
+            if tip:
+                Tip(w, tip)
+            return w
 
-        def spin(parent, var, lo, hi, inc, width, fmt=None):
+        def spin(parent, var, lo, hi, inc, width, fmt=None, tip=None):
             kw = {"format": fmt} if fmt else {}
-            tk.Spinbox(parent, from_=lo, to=hi, increment=inc, width=width, textvariable=var, **kw).pack(side="left")
+            w = tk.Spinbox(parent, from_=lo, to=hi, increment=inc, width=width, textvariable=var, **kw)
+            w.pack(side="left")
+            if tip:
+                Tip(w, tip)
+            return w
 
-        def check(parent, txt, var, **kw):
-            tk.Checkbutton(parent, text=txt, variable=var, fg="#c8bfa8", bg=BG, selectcolor=BG,
-                           activebackground=BG).pack(side="left", **kw)
+        def check(parent, txt, var, tip=None, **kw):
+            w = tk.Checkbutton(parent, text=txt, variable=var, fg="#c8bfa8", bg=BG, selectcolor=BG,
+                               activebackground=BG)
+            w.pack(side="left", **kw)
+            if tip:
+                Tip(w, tip)
+            return w
 
-        g = group(row1, "control")
-        tk.Button(g, text="Auto All", command=self.auto_all).pack(side="left")
-        self.ae_btn = tk.Button(g, text="Shared AE: OFF", command=self.toggle_ae)
-        self.ae_btn.pack(side="left", padx=6)
-        self.cal_btn = tk.Button(g, text="Calibrate WB (cloud)", command=self.calibrate_wb)
-        self.cal_btn.pack(side="left", padx=(0, 6))
-        tk.Button(g, text="History", command=self.toggle_history).pack(side="left")
+        def btn(parent, txt, cmd, tip=None, **kw):
+            w = tk.Button(parent, text=txt, command=cmd)
+            w.pack(side="left", **kw)
+            if tip:
+                Tip(w, tip)
+            return w
 
-        g = group(row1, "loop")
-        lab(g, "refresh"); spin(g, self.interval, 2, 60, 1, 4); lab(g, "s", padx=(0, 8))
-        lab(g, "slew"); spin(g, self.slew, 0.01, 0.5, 0.01, 5, "%.2f"); lab(g, "stop/cycle", padx=(0, 8))
-        lab(g, "clip \u2264"); spin(g, self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f"); lab(g, "%", padx=(0, 8))
-        lab(g, "pt-src <"); spin(g, self.min_blob, 0, 5000, 50, 5); lab(g, "px")
+        def pair(parent, txt, var, lo, hi, inc, width, fmt=None, tip=None, unit=None, unit_pad=0):
+            """label + spinbox (+ unit) sharing one tip, so hovering any of them helps."""
+            lab(parent, txt, tip=tip)
+            spin(parent, var, lo, hi, inc, width, fmt, tip=tip)
+            if unit is not None:
+                lab(parent, unit, tip=tip, padx=(0, unit_pad))
 
-        g = group(row2, "masks & overlay")
-        check(g, "overlay", self.overlay, padx=(0, 8))
-        lab(g, "sun r"); spin(g, self.sun_radius, 0, 45, 1, 4); lab(g, "\u00b0", padx=(0, 8))
-        lab(g, "moon r"); spin(g, self.moon_radius, 0, 30, 1, 4); lab(g, "\u00b0", padx=(0, 8))
-        lab(g, "flare r"); spin(g, self.flare_w, 0, 15, 0.5, 4, "%.1f"); lab(g, "\u00b0")
+        g = group(row1, "control", "Pod-wide actions. Everything here acts on all six cameras at once.")
+        btn(g, "Auto All", self.auto_all,
+            "Hand every camera back to RMS's own day exposure line and switch Shared AE off.\n"
+            "Never sends a bare `auto`: on the Goke that would reset the AE ranges and break\n"
+            "the science config's fixed sensor digital gain.")
+        self.ae_btn = btn(g, "Shared AE: OFF", self.toggle_ae,
+            "Drive ONE exposure and gain onto the whole pod, metered from the newest complete\n"
+            "frame set. The darkest need wins, so if any camera clips, everyone backs off.\n"
+            "Off leaves each camera on whatever it currently holds.", padx=6)
+        self.cal_btn = btn(g, "Calibrate WB (cloud)", self.calibrate_wb,
+            "Drag a box over a grey cloud on one tile, then click. Iterates the white-balance\n"
+            "gains until that region is neutral and pushes the result to every camera.\n"
+            "Takes minutes on a capturing pod: each step waits for a fresh RMS frame.", padx=(0, 6))
+        btn(g, "History", self.toggle_history,
+            "Open the 12-hour chart: exposure and total gain per camera, pod luma against the\n"
+            "clipping ceiling, and the clipped fraction, with night and latched shading.")
+        self.view_btn = btn(g, "View: tiles", self.toggle_view,
+            "Switch between the six preview tiles and one all-sky composite of the whole pod,\n"
+            "projected from the stations' RMS platepars.", padx=(6, 0))
+
+        g = group(row1, "loop", "Loop timing and how fast the shared AE is allowed to move.")
+        pair(g, "refresh", self.interval, 2, 60, 1, 4, tip=
+             "Seconds between cycles. RMS saves a frame about every 5 s and flushes in blocks,\n"
+             "so below ~5 s this costs CPU without seeing new data.", unit="s", unit_pad=8)
+        pair(g, "slew", self.slew, 0.01, 0.5, 0.01, 5, "%.2f", tip=
+             "Maximum stops the pod exposure may move per cycle while tracking normally.\n"
+             "0.05 stop is about 3.5% brightness per frame, invisible in a timelapse.\n"
+             "Moves against the diurnal trend run slower still, to ride out passing clouds.")
+        pair(g, "clip ≤", self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f", tip=
+             "Clipped fraction the AE aims to stay under. Above it the pod asks for less light.\n"
+             "0.005% is roughly 100 pixels of the frame. Raise it for a timelapse if cloud\n"
+             "edges make the pod pump.", unit="%", unit_pad=8)
+        pair(g, "pt-src <", self.min_blob, 0, 5000, 50, 5, tip=
+             "Clipped blobs smaller than this many pixels do not count as clipping: a street\n"
+             "lamp, a planet, headlights. They clip at any night-worthy exposure, so dimming\n"
+             "the whole pod for them is pointless. 0 counts every clipped pixel.", unit="px")
+
+        g = group(row2, "masks & overlay",
+                  "What the metering ignores, and how it is shown. These zones are excluded from\n"
+                  "every measurement podcontrol makes, on top of each station's RMS mask.")
+        check(g, "overlay", self.overlay, tip=
+              "Tint the excluded zones and what drives the exposure, on the tiles and the sky view:\n"
+              "red = RMS mask, orange = sun zone, violet = lens flare, blue = moon zone,\n"
+              "magenta = clipped pixels, cyan = the peak pixels on the driving camera.", padx=(0, 8))
+        pair(g, "sun r", self.sun_radius, 0, 45, 1, 4, tip=
+             "Radius of the exclusion disc around the sun, from the platepar and an ephemeris.\n"
+             "Applied whenever the disc can touch the sky, so the glow around a just-set sun is\n"
+             "excluded too. 0 disables it. Measure the right value with `sunmask --measure`.",
+             unit="°", unit_pad=8)
+        pair(g, "moon r", self.moon_radius, 0, 30, 1, 4, tip=
+             "Radius of the exclusion disc around the moon, applied only while the sun is below\n"
+             "the horizon: a daytime moon cannot clip. 0 disables it.", unit="°", unit_pad=8)
+        pair(g, "flare r", self.flare_w, 0, 15, 0.5, 4, "%.1f", tip=
+             "Radius of the lens-flare ghost discs, which sit on the line from the sun through\n"
+             "the lens's principal point at fixed fractions of its distance. 0 disables the\n"
+             "whole flare model.", unit="°")
 
         g = group(row2, "policy")
-        check(g, "sun cam votes", self.sun_votes)
+        check(g, "sun cam votes", self.sun_votes, tip=
+              "Checked: a camera with the sun in its field votes on the pod exposure like any\n"
+              "other, so the sun-zone radius is your only lever. Cleared: it follows the pod\n"
+              "without voting. If every camera sees the sun they all vote regardless.")
 
-        g = group(row2, "white balance (x gains, pod-wide)")
+        g = group(row2, "white balance (x gains, pod-wide)",
+                  "Manual white balance for the whole pod. RMS owns colour at its day/night\n"
+                  "switches, so anything set here is replaced at the next switch unless it is\n"
+                  "also in the station's camera_settings file.")
+        wb_tip = ("Per-channel white-balance gain as a multiplier: 1.00 is the daemon's 256.\n"
+                  "Applied in 12-bit before demosaic, so gains above 1x can clip red or blue\n"
+                  "before green. The shared AE's WB rung attenuates all three together below\n"
+                  "the exposure floor.")
         for txt, var in (("R", self.wb_r), ("G", self.wb_g), ("B", self.wb_b)):
-            lab(g, txt); spin(g, var, 0.25, 4.0, 0.01, 5, "%.2f"); lab(g, "", padx=(0, 4))
-        tk.Button(g, text="Apply", command=self.apply_wb).pack(side="left", padx=(4, 4))
-        tk.Button(g, text="Auto", command=self.wb_auto).pack(side="left")
-        self.kelvin = tk.Label(g, text="", fg="#f0a830", bg=BG, font=(MONO, 9, "bold"))
-        self.kelvin.pack(side="left", padx=(8, 0))
+            lab(g, txt, tip=wb_tip)
+            spin(g, var, 0.25, 4.0, 0.01, 5, "%.2f", tip=wb_tip)
+            lab(g, "", tip=wb_tip, padx=(0, 4))
+        btn(g, "Apply", self.apply_wb,
+            "Push these three gains to every camera as a manual white balance.", padx=(4, 4))
+        btn(g, "Auto", self.wb_auto,
+            "Hand white balance back to each camera's own AWB.")
         self._update_kelvin()
 
         self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
