@@ -429,6 +429,54 @@ clip metric answers with a slightly darker pod on colourful skies; the WB
 rung's magenta guard, the cloud-grey calibrator and the Kelvin readout are
 unaffected because the matrix is neutral-preserving.
 
+## Who owns colour, and when (2026-09-22)
+
+RMS owns colour across its day/night switches: the night line sets `satu 0`
+for mono science frames, the day line `ccm off` / `satu 128`. podcontrol's
+colour group therefore follows the same rule the shared AE already follows
+for exposure, and runs unattended through every transition:
+
+| Sun altitude | podcontrol |
+|---|---|
+| above the switch + 1° | asserts the toolbar colour when `hold` is on |
+| within 1° above the switch | goes quiet, hands colour back to RMS |
+| below the switch (night) | silent; RMS's `satu 0` stands |
+| back above the switch + 1° at dawn | re-asserts within a cycle |
+
+The 1° margin (about four minutes at this site) exists because the two must
+never race. On 2026-09-22 they did: RMS set `satu 0` at 02:06:49, podcontrol's
+`hold` read that as drift and pushed `satu 255` back within the minute, and the
+whole pod recorded a colour night. Going quiet *before* RMS switches removes
+the race entirely, and re-asserting after the dawn switch is what makes the
+setting survive unattended. Clicking **Apply** after dusk warns and needs a
+second click within 10 s, so it cannot happen by reflex. On exit podcontrol
+hands colour back using the station's own `camera_settings` values for the
+current mode.
+
+**Nothing podcontrol writes reaches camera flash.** The daemon gained a
+`transient <cmd>` prefix (2026-09-22) that runs a command without saving it to
+`/mnt/mtd/isp_persist`, and podcontrol uses it for every white-balance,
+saturation and matrix write. This matters because the persisted file is the
+camera's *boot* default: the `satu 255` written that night survived three
+reboots and kept restoring colour long after the app had stopped asking for
+it. It also spares the flash a write on every step of the AE's WB rung. A
+daemon predating the prefix is detected once per camera and the bare command
+is used instead, so an un-updated pod still works.
+
+**Measured on E1, daylight, matrix stage verified active at each step:**
+
+| Matrix | satu | Chroma |
+|---|---|---|
+| identity | 0 | 0.00 (true mono) |
+| identity | 128 = 1.00x | 26.8 |
+| identity | 255 = 1.99x | 56.5 |
+| auto (IQ table) | 0 | 0.00 (true mono) |
+| auto (IQ table) | 128 = 1.00x | 55.1 |
+
+So the IQ table at unity costs about the same chroma as the identity matrix at
+its 1.99x ceiling, but gets there by mixing channels. Both reach true mono at
+`satu 0`, which means leaving `matrix identity` installed does not interfere
+with RMS's mono night.
 
 ## Settings
 

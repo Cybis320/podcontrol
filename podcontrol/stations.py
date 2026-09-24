@@ -87,6 +87,23 @@ class Station:
                 return " ".join(str(t) for t in entry[1:])
         return None
 
+    def mode_colour_cmds(self, mode, keys=("ccm", "satu")):
+        """The colour commands RMS replays for `mode` ('day'|'night'), in order,
+        e.g. ['ccm off', 'satu 128'] for day and ['ccm on', 'satu 0'] for night.
+        Taken from the station's camera_settings file, so handing colour back
+        uses RMS's own authoritative values rather than a guess."""
+        if not self.settings_path or not os.path.isfile(self.settings_path):
+            return []
+        try:
+            data = json.load(open(self.settings_path))
+        except Exception:
+            return []
+        out = []
+        for entry in data.get(mode, []) or []:
+            if isinstance(entry, list) and len(entry) >= 3 and entry[0] == "Isp" and entry[1] in keys:
+                out.append(" ".join(str(t) for t in entry[1:]))
+        return out
+
     @property
     def frames_dir(self):
         return os.path.join(self.data_dir, "FramesFiles") if self.data_dir else ""

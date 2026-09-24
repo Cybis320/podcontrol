@@ -376,6 +376,11 @@ class PodController:
             cmd += " %d" % int(bitrate_kbps)
         return self._bcast(cmd, timeout)
 
+    def one_live(self, station_id, cmd, timeout=5.0):
+        """one() for state podcontrol owns only while it runs: never persisted."""
+        st = next((s for s in self.stations if s.id == station_id), None)
+        return send_live(st.ip, cmd, timeout) if st else None
+
     def one(self, station_id, cmd, timeout=5.0):
         st = next((s for s in self.stations if s.id == station_id), None)
         return send(st.ip, cmd, timeout) if st else None

@@ -50,6 +50,11 @@ OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
 MONO = "JetBrains Mono"
 SKY_SIZE = 900        # internal size of the sky composite (px); scaled to the canvas
+# Degrees of sun altitude ABOVE RMS's day/night switch at which podcontrol
+# stops touching colour. RMS owns colour across its switches, so going quiet
+# early (about four minutes here) means a push can never land between its
+# night line and our next poll.
+COLOUR_QUIET_MARGIN_DEG = 1.0
 
 
 def _fit_to(rgb, wh):
@@ -383,6 +388,7 @@ class App(tk.Tk):
             self.pod.wb_auto_all = lambda *a, **k: {}
             self.pod.satu_all = lambda *a, **k: {}
             self.pod.ccm_all = lambda *a, **k: {}
+            self.pod.one_live = lambda *a, **k: {}
         self.allow_grab = allow_grab
         self.ae = SharedAE(self.pod)
         configure_from_pod(self.ae, self.pod)      # top rung = RMS night line
@@ -413,6 +419,10 @@ class App(tk.Tk):
         cm = saved.get("ccm_mode")
         self.ccm_mode = tk.StringVar(value=cm if cm in ("identity", "auto", "off") else "identity")
         self.colour_hold = tk.BooleanVar(value=bool(sv("colour_hold", False)))
+        self._colour_asserted = False    # have we pushed colour this session?
+        self._colour_force_t = 0.0       # second-click window for an Apply at night
+        self._colour_note = ""
+        self._colour_note_t = 0.0
         for var in (self.satu, self.ccm_mode, self.colour_hold):
             var.trace_add("write", lambda *_: (self._update_satu_label(), self._schedule_save()))
         self.wb_r = tk.DoubleVar(value=sv("wb_r", 1.0))
@@ -702,7 +712,9 @@ class App(tk.Tk):
             self._cycle_n = getattr(self, "_cycle_n", 0) + 1
             full = (self._cycle_n % 12 == 1) or (time.time() - self.ae.t_apply < 15)
             poll = self.pod.poll_all(timeout=4, full=full)
-            sun = feed_sun(self.ae, self.pod)
+            sun = feed_sun(self.ae, self.pod)      # colour discipline needs the sun first
+            if full:
+                self._colour_keep(poll)
             futs = {self._pool.submit(frame_for, s, self.allow_grab, True, True): s.id
                     for s in self.stations}
             frames, lumas, layers = {}, {}, {}
@@ -805,10 +817,15 @@ class App(tk.Tk):
                         (" wb\u00d7%.2f" % info["wb_scale"]) if info.get("wb_scale", 1.0) < 0.999 else "",
                         info.get("to_go", 0.0),
                         ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
-                self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s" % (
+                note = ""
+                if self._colour_note and time.time() - self._colour_note_t < 90:
+                    note = "  [%s]" % self._colour_note
+                elif self.colour_hold.get() and self._colour_quiet():
+                    note = "  [colour: RMS owns it until dawn]"
+                self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s%s" % (
                     daemons, len(self.stations),
                     ("%d–%d" % (int(min(brights)), int(max(brights)))) if brights else "—",
-                    ae, dt, time.strftime("%H:%M:%S")))
+                    ae, dt, time.strftime("%H:%M:%S"), note))
         except queue.Empty:
             pass
         # live chart: redraw once per completed cycle (the queue drained)
@@ -981,6 +998,72 @@ class App(tk.Tk):
             self.wb_r.set(round(r, 2)); self.wb_b.set(round(b, 2))
         finally:
             self._wb_sync = False
+
+    def _colour_quiet(self):
+        """True when RMS owns colour and podcontrol must not touch it: from
+        COLOUR_QUIET_MARGIN_DEG above its night switch, through the night, until
+        the sun climbs back above the same altitude at dawn. A pod with no
+        platepar has no sun, and is never quiet, so it still works."""
+        alt = getattr(self.ae, "sun_alt", None)
+        if alt is None:
+            return False
+        return alt <= self.ae.cfg.night_switch_deg + COLOUR_QUIET_MARGIN_DEG
+
+    def _note_colour(self, msg):
+        self._colour_note, self._colour_note_t = msg, time.time()
+
+    def _colour_keep(self, poll):
+        """Unattended colour discipline, once per full poll (about a minute).
+
+        RMS owns colour at its switches: the night line sets `satu 0` for mono
+        science frames, the day line `ccm off` / `satu 128`. So podcontrol
+        asserts the toolbar colour only in DAY mode, and only while `hold` is on:
+
+          dusk   it goes quiet a degree of sun altitude BEFORE RMS switches, so
+                 a push can never land between RMS's night line and the next
+                 poll. That race held the pod in colour all night on 2026-09-22.
+          night  silent. Whatever RMS set stands.
+          dawn   once the sun is back above that altitude, RMS has already
+                 replayed its day line, so the next poll sees the drift and
+                 re-asserts the operator's settings unattended.
+
+        The writes are live-only, so nothing reaches camera flash and any
+        reboot comes up on the science baseline."""
+        if self._colour_quiet():
+            if self._colour_asserted:
+                self._colour_asserted = False
+                self._note_colour("colour handed to RMS for the night")
+            return
+        if not self.colour_hold.get():
+            return
+        drifted = [sid for sid, t in poll.items()
+                   if t.get("online") and self._colour_matches(t) is False]
+        if not drifted:
+            return
+        try:
+            mode, v = self._colour_target()
+            self.pod.ccm_all(mode)
+            self.pod.satu_all(v)
+            self._colour_asserted = True
+            self._note_colour("colour re-asserted on %s" % ",".join(sorted(drifted)))
+        except Exception as e:
+            self._note_colour("colour re-assert failed: %s" % e)
+
+    def _restore_colour(self):
+        """Hand colour back exactly as RMS wants it for the current mode, from
+        the station's own camera_settings file. Only when we actually asserted
+        something, so a run that never touched colour changes nothing."""
+        if not self._colour_asserted:
+            return
+        mode = "night" if self._colour_quiet() else "day"
+        for st in self.stations:
+            for cmd in st.mode_colour_cmds(mode):
+                try:
+                    self.pod.one_live(st.id, cmd, timeout=3)
+                except Exception:
+                    pass
+        self._colour_asserted = False
+
     def _update_satu_label(self):
         """The multiplier beside the satu box -- or "inert", because with the
         colour matrix bypassed the ISP saturation does nothing at all."""
@@ -1011,6 +1094,17 @@ class App(tk.Tk):
 
     def apply_colour(self):
         mode, v = self._colour_target()
+        if self._colour_quiet():
+            # RMS owns colour now; its night line sets satu 0 for mono frames.
+            # Require a deliberate second click so this cannot happen by reflex.
+            now = time.time()
+            if now - self._colour_force_t > 10:
+                self._colour_force_t = now
+                self.status.config(
+                    text="NIGHT: RMS owns colour (its night line sets satu 0 for mono science "
+                         "frames). Click Apply again within 10 s to override anyway.", fg="#f0a830")
+                return
+            self._colour_force_t = 0.0
         self.status.config(text="colour: ccm %s, satu %d (x%.2f) pushed to the pod"
                                 % (mode, v, v / 128.0), fg="#a4967c")
         def _push():
@@ -1176,6 +1270,10 @@ class App(tk.Tk):
         self.running = False
         try:
             SETTINGS.save(self._settings_dict())
+        except Exception:
+            pass
+        try:
+            self._restore_colour()
         except Exception:
             pass
         if self.ae_on:
