@@ -323,9 +323,13 @@ unaffected (a lamp is far below 0.1% of the frame).
 The **white balance** group holds R, G, B gain multipliers (the daemons' ×256
 gains shown as ×1.00; seeded from the first camera's current WB at start,
 then remembered), **Apply** pushes the same `wb` to every camera, **Auto**
-hands WB back to the cameras' AWB. The **≈ K** readout is an estimated
-correlated colour temperature for the entered gains: the gains are inverted
-to an illuminant colour, taken through the sRGB matrix to chromaticity and
+hands WB back to the cameras' AWB. A **Calibrate WB (cloud)** run leaves its
+result in these boxes (so it is visible, persisted and re-applicable) and
+every tile's third line shows the gains the camera actually holds, R/G/B,
+in auto mode too. The **≈ K** box is a colour
+temperature that works both ways. As a readout it is the estimated correlated
+colour temperature of the R/G/B gains: the gains are inverted to an
+illuminant colour, taken through the sRGB matrix to chromaticity and
 McCamy's formula, anchored so the config's daylight preset (460/256/490)
 reads as D65. Edit it (3800–20000 K, steps of 100) and R and B are set to
 neutralise a daylight-locus illuminant of that temperature, G kept as it is,
@@ -391,6 +395,39 @@ Headless / for a timelapse:
 ~/vRMS/bin/python -m podcontrol.skymap --size 1000 --loop 5 --out sky.png
 ~/vRMS/bin/python -m podcontrol.skymap --proj pano --size 1440   # az/alt panorama (CLI only)
 ```
+
+## Colour: identity matrix + saturation (pod-wide)
+
+The least destructive place to boost colour is the ISP's ColorMatrix stage,
+which sits in linear RGB before gamma and before the 8-bit RGB→YUV
+conversion, and whose saturation attribute (`satu`, 128 = 1.0x, 255 ≈ 2x) is
+applied *inside* it (active CCM = saturation matrix × CCM). With the stage
+bypassed, as the science day line had it (`ccm off`), `satu` is inert and
+daytime colour is the raw sensor colour, muted by the Bayer filters'
+spectral overlap. With the IQ colour-temperature table (`ccm auto`) it is
+colour correction plus chroma gain, but the table is strong (diagonals
+1.85–1.92 on the IMX307), doubles chroma noise and follows the AWB's
+temperature estimate. The daemon (`isp_ctl`, 2026-09-17) therefore gained
+**`ccm identity`**: a manual identity matrix with saturation enabled, so that
+`satu` becomes a pure chroma gain around the luma axis: grey stays grey, hue
+is kept, each channel keeps its sensor response, and the transform is
+invertible while nothing clips. `ccm manual <9 signed 8.8 values>` and
+`ccm auto` are there too; `ccm on|off` is still the stage bypass. Setting a
+matrix switches the stage on. The matrix persists under its own key
+(`matrix …`) beside the bypass line, and `ccm` / `pipeline` report it.
+
+The **colour (pod-wide)** toolbar group holds the matrix mode (identity /
+auto / off) and the saturation (0–255, shown as a multiplier); **Apply**
+pushes both to every camera, each tile's third line shows what the camera
+holds (`satu x1.25 ccm identity`), and the values are remembered. RMS's day
+line replays `ccm off` / `satu 128` at every dawn switch: either update the
+`day` entry of `camera_settings_openipc.json` to `["Isp","ccm","identity"]`
+and `["Isp","satu","<v>"]` (durable), or tick **hold**, which re-asserts the
+setting on a camera that lost it once a minute. Expect strongly coloured
+highlights to clip in one channel sooner, which the shared AE's any-channel
+clip metric answers with a slightly darker pod on colourful skies; the WB
+rung's magenta guard, the cloud-grey calibrator and the Kelvin readout are
+unaffected because the matrix is neutral-preserving.
 
 
 ## Settings

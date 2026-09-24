@@ -120,15 +120,81 @@ def _parse_gop(text):
             "rcmode": _f(text, r"RcMode=(\w+)")}
 
 
+def _parse_satu(text):
+    """'ISP saturation: opType=MANUAL manual=128 (128=1.00x -> 1.00x)'."""
+    if not text or "saturation" not in text:
+        return None
+    v = _f(text, r"manual=(\d+)")
+    return {"op": _f(text, r"opType=(\w+)"), "value": int(v) if v else None}
+
+
+def _parse_ccm(text):
+    """'CCM: opType=MANUAL satEn=1 stage=active mode=identity matrix=[...]'
+    (isp_ctl >= 2026-09-17); an older daemon answers ERROR -> None."""
+    if not text or "CCM:" not in text:
+        return None
+    return {"op": _f(text, r"opType=(\w+)"), "mode": _f(text, r"mode=(\w+)"),
+            "stage": _f(text, r"stage=(\w+)"), "sat_en": _f(text, r"satEn=(\d)") == "1"}
+
+
+ENC_FIELDS = ("wb", "qp", "cqp", "gop", "satu", "ccm")
+
+
 def _encoder_telemetry(ip, timeout):
-    """wb / venc_qp / venc_cqp / venc_gop -- same syntax on both daemons.
-    A daemon without one of them just returns an ERROR line -> None field."""
+    """wb / venc_qp / venc_cqp / venc_gop / satu / ccm -- same syntax on both
+    daemons. A daemon without one of them just returns an ERROR line -> None."""
     return {
         "wb": _parse_wb(send(ip, "wb", timeout)),
         "qp": _parse_qp(send(ip, "venc_qp", timeout)),
         "cqp": _parse_cqp(send(ip, "venc_cqp", timeout)),
         "gop": _parse_gop(send(ip, "venc_gop", timeout)),
+        "satu": _parse_satu(send(ip, "satu", timeout)),
+        "ccm": _parse_ccm(send(ip, "ccm", timeout)),
     }
+
+
+# Does this camera's daemon understand the "transient <cmd>" prefix? Probed on
+# first use and remembered per camera, so an older daemon still works.
+_TRANSIENT_OK = {}
+
+
+def send_live(ip, cmd, timeout=5.0):
+    """Send a command that must NOT reach the camera's flash.
+
+    podcontrol's white balance, saturation and colour-matrix writes are LIVE,
+    revocable state: RMS owns the durable configuration and replays it at every
+    day/night switch. A write that lands in /mnt/mtd/isp_persist becomes the
+    camera's boot default and outlives the app that set it -- on 2026-09-22 a
+    persisted `satu 255` survived three reboots and held the whole pod in colour
+    all night, undoing RMS's `satu 0`. It also spares the flash a write on every
+    step of the shared AE's WB rung.
+
+    A daemon predating the prefix answers "ERROR unknown command: transient";
+    that is detected once per camera and the bare command is used thereafter."""
+    if _TRANSIENT_OK.get(ip) is not False:
+        r = send(ip, "transient " + cmd, timeout)
+        if r is None:
+            return None
+        if "unknown command: transient" not in r:
+            _TRANSIENT_OK[ip] = True
+            return r
+        _TRANSIENT_OK[ip] = False
+    return send(ip, cmd, timeout)
+
+
+# Encoder channel per camera, learned once. venc's channel is 1 on both
+# platforms today, but it is the daemon's no-argument read that knows for sure
+# (it probes 0..3 and reports "venc_qp chnN ...").
+_VENC_CHN = {}
+
+
+def venc_chn(ip, timeout=5.0):
+    if ip not in _VENC_CHN:
+        m = re.search(r"chn(\d+)", send(ip, "venc_qp", timeout) or "")
+        if not m:
+            return None
+        _VENC_CHN[ip] = int(m.group(1))
+    return _VENC_CHN[ip]
 
 
 def poll(ip, timeout=5.0, full=True):
@@ -164,7 +230,7 @@ class PodController:
         out = {sid: f.result() for sid, f in futs.items()}
         for sid, d in out.items():
             if full and d.get("online"):
-                self._enc_cache[sid] = {k: d.get(k) for k in ("wb", "qp", "cqp", "gop")}
+                self._enc_cache[sid] = {k: d.get(k) for k in ENC_FIELDS}
             elif not full and d.get("online"):
                 for k, v in (self._enc_cache.get(sid) or {}).items():
                     d.setdefault(k, v)
@@ -172,6 +238,12 @@ class PodController:
 
     def _bcast(self, cmd, timeout=5.0):
         futs = {s.id: self._pool.submit(send, s.ip, cmd, timeout) for s in self.stations}
+        return {sid: f.result() for sid, f in futs.items()}
+
+    def _bcast_live(self, cmd, timeout=5.0):
+        """_bcast for state podcontrol owns only while it runs (see send_live):
+        applied now, never written to the cameras' flash."""
+        futs = {s.id: self._pool.submit(send_live, s.ip, cmd, timeout) for s in self.stations}
         return {sid: f.result() for sid, f in futs.items()}
 
     def manual_all(self, again=None, dgain=None, ispdgain=None, exp_us=None, timeout=5.0):
@@ -264,11 +336,27 @@ class PodController:
         return self.release(None, timeout)
 
     def wb_all(self, R, G, B, timeout=5.0):
-        """Set the same manual WB (x256 gains, 256=1.0x) on every camera."""
-        return self._bcast("wb %d %d %d" % (int(R), int(G), int(B)), timeout)
+        """Set the same manual WB (x256 gains, 256=1.0x) on every camera.
+        Live only: never persisted to the cameras' flash (see send_live)."""
+        return self._bcast_live("wb %d %d %d" % (int(R), int(G), int(B)), timeout)
 
     def wb_auto_all(self, timeout=5.0):
-        return self._bcast("wb auto", timeout)
+        return self._bcast_live("wb auto", timeout)
+
+    # --- colour: matrix mode + CCM-domain saturation (pod-wide) ---------------
+    def satu_all(self, v, timeout=5.0):
+        """ISP saturation on every camera: applied inside the ColorMatrix stage
+        in linear RGB, before gamma and the 8-bit CSC; 128 = 1.0x, 255 ~ 2x.
+        With `ccm identity` it is a pure chroma gain around the luma axis."""
+        return self._bcast_live("satu %d" % max(0, min(255, int(v))), timeout)
+
+    def ccm_all(self, mode, timeout=5.0):
+        """Colour matrix mode on every camera: 'identity' (manual identity,
+        satu = chroma gain), 'auto' (the IQ colour-temperature table), 'on' /
+        'off' (stage bypass only). identity/auto need isp_ctl >= 2026-09-17."""
+        if mode not in ("identity", "auto", "on", "off"):
+            raise ValueError("ccm mode %r" % mode)
+        return self._bcast_live("ccm %s" % mode, timeout)
 
     def wb_read(self, station_id, timeout=5.0):
         return _parse_wb(self.one(station_id, "wb", timeout))

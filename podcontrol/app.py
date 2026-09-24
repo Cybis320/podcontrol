@@ -324,9 +324,15 @@ class Tile(tk.Frame):
         wb = tel.get("wb"); qp = tel.get("qp")
         line3 = ""
         if wb and wb.get("gains"):
-            line3 += "wb %s " % ("auto" if wb.get("op") == "auto" else "%.2f/%.2f" % (wb["gains"][0], wb["gains"][-1]))
+            g = wb["gains"]                     # R, Gr[, Gb], B as the daemon reports them
+            line3 += "wb %s%.2f/%.2f/%.2f " % ("auto " if wb.get("op") == "auto" else "", g[0], g[1], g[-1])
         if qp and qp.get("maxqp") is not None:
-            line3 += "qp %s" % qp["maxqp"]
+            line3 += "qp %s " % qp["maxqp"]
+        sa, cm = tel.get("satu"), tel.get("ccm")
+        if sa and sa.get("value") is not None:
+            line3 += "satu x%.2f " % (sa["value"] / 128.0)
+        if cm:
+            line3 += "ccm %s " % ("off" if cm.get("stage") == "bypassed" else (cm.get("mode") or "?"))
         if need is not None:
             line3 += "   need %+.2f stop (%s)" % (need, why or "")
         masked = (" mask%.0f%%" % (100 * luma["masked"])) if luma and luma.get("masked") else ""
@@ -373,6 +379,10 @@ class App(tk.Tk):
             self.pod.manual_all = lambda *a, **k: {}
             self.pod.release = lambda *a, **k: {}
             self.pod.auto_all = lambda *a, **k: {}
+            self.pod.wb_all = lambda *a, **k: {}          # the WB rung / Apply push wb
+            self.pod.wb_auto_all = lambda *a, **k: {}
+            self.pod.satu_all = lambda *a, **k: {}
+            self.pod.ccm_all = lambda *a, **k: {}
         self.allow_grab = allow_grab
         self.ae = SharedAE(self.pod)
         configure_from_pod(self.ae, self.pod)      # top rung = RMS night line
@@ -396,6 +406,15 @@ class App(tk.Tk):
         self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
         self.moon_radius = tk.DoubleVar(value=sv("moon_radius_deg", F.MOON_RADIUS_DEG[0]))
         self.clip_pct = tk.DoubleVar(value=sv("clip_limit_pct", 100.0 * self.ae.cfg.clip_limit))
+        # colour: matrix mode + CCM-domain saturation, pushed pod-wide by Apply;
+        # `hold` re-asserts them after RMS's dawn replay (its day line says
+        # `ccm off` / `satu 128` unless camera_settings is updated)
+        self.satu = tk.IntVar(value=int(sv("satu", 128)))
+        cm = saved.get("ccm_mode")
+        self.ccm_mode = tk.StringVar(value=cm if cm in ("identity", "auto", "off") else "identity")
+        self.colour_hold = tk.BooleanVar(value=bool(sv("colour_hold", False)))
+        for var in (self.satu, self.ccm_mode, self.colour_hold):
+            var.trace_add("write", lambda *_: (self._update_satu_label(), self._schedule_save()))
         self.wb_r = tk.DoubleVar(value=sv("wb_r", 1.0))
         self.wb_g = tk.DoubleVar(value=sv("wb_g", 1.0))
         self.wb_b = tk.DoubleVar(value=sv("wb_b", 1.0))
@@ -593,6 +612,55 @@ class App(tk.Tk):
         spin(g, self.wb_k, 3800, 20000, 100, 6, tip=k_tip)
         lab(g, "K", tip=k_tip)
         self._update_kelvin()
+
+        g = group(row2, "colour (pod-wide)",
+                  "Colour matrix and saturation. Both act in the ISP's ColorMatrix stage, in\n"
+                  "linear RGB before gamma and before the 8-bit conversion, which is the least\n"
+                  "destructive place to change colour.")
+        ccm_tip = ("Colour matrix stage, and what `satu` next to it multiplies:\n"
+                   "  identity  a neutral matrix, so satu is a PURE chroma gain around the luma\n"
+                   "            axis. Grey stays grey, hue is kept, each channel keeps its own\n"
+                   "            sensor response. The least destructive boost.\n"
+                   "  auto      the sensor's IQ colour-temperature table. A real colour\n"
+                   "            correction, but it mixes channels, so it amplifies chroma noise\n"
+                   "            and follows the AWB's temperature estimate. Measured on E1 in\n"
+                   "            daylight, auto at 1.00x gives about the same chroma as identity\n"
+                   "            at 1.99x (55.1 against 56.5).\n"
+                   "  off       the stage is bypassed, which makes satu INERT. Raw sensor colour.\n"
+                   "Both identity and auto reach TRUE mono at satu 0 (measured chroma exactly\n"
+                   "0.00), so RMS's night line gives mono science frames either way.")
+        lab(g, "ccm", tip=ccm_tip)
+        om = tk.OptionMenu(g, self.ccm_mode, "identity", "auto", "off")
+        om.config(width=7, bg=BG, fg="#c8bfa8", activebackground=BG, highlightthickness=0)
+        om.pack(side="left", padx=(0, 6))
+        Tip(om, ccm_tip)
+        satu_tip = ("Chroma gain applied inside the colour matrix, in linear RGB before gamma and\n"
+                    "before the 8-bit conversion. 128 = 1.00x; 0 is true greyscale (measured\n"
+                    "chroma exactly 0.00), which is how RMS makes the night frames mono.\n"
+                    "255 = 1.99x is the ceiling because the ISP register is 8-bit: 2.00x would\n"
+                    "need 256, which does not fit, so 1.99x is as high as the hardware goes.\n"
+                    "Does nothing while the matrix on the left is `off`.")
+        lab(g, "satu", tip=satu_tip)
+        spin(g, self.satu, 0, 255, 8, 4, tip=satu_tip)
+        self.satu_x = tk.Label(g, text="", fg="#f0a830", bg=BG, font=(MONO, 9, "bold"))
+        self.satu_x.pack(side="left", padx=(4, 6))
+        Tip(self.satu_x, satu_tip)
+        btn(g, "Apply", self.apply_colour,
+            "Push the matrix mode and the saturation to every camera.", padx=(0, 6))
+        check(g, "hold", self.colour_hold, tip=
+              "Keep these settings on the pod unattended, checked once a minute.\n"
+              "  DAY    re-asserts the matrix and saturation on any camera that lost them.\n"
+              "         RMS replays `ccm off` / `satu 128` at every dawn switch, and a\n"
+              "         rebooted camera comes up on the science baseline, so without this\n"
+              "         the group silently stops applying.\n"
+              "  DUSK   goes quiet one degree of sun altitude BEFORE RMS's night switch,\n"
+              "         about four minutes, so a push can never land after RMS's night line.\n"
+              "  NIGHT  silent. RMS sets `satu 0` for mono science frames and that stands.\n"
+              "  DAWN   re-asserts by itself once the sun is back above that altitude.\n"
+              "Writes are live only and never reach camera flash, so a reboot always comes\n"
+              "up on the science baseline. The durable place for a permanent change is the\n"
+              "day entry of camera_settings.json.")
+        self._update_satu_label()
 
         self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
         self.status.pack(fill="x", padx=12, pady=(0, 6))
@@ -925,6 +993,35 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _colour_target(self):
+        return self.ccm_mode.get(), max(0, min(255, int(self.satu.get())))
+
+    def _colour_matches(self, tel):
+        """True when a camera's polled ccm/satu equal the toolbar setting
+        (None when the daemon does not report them)."""
+        mode, v = self._colour_target()
+        sa, cm = tel.get("satu"), tel.get("ccm")
+        if not sa or not cm or sa.get("value") is None:
+            return None
+        if sa["value"] != v:
+            return False
+        if mode == "off":
+            return cm.get("stage") == "bypassed"
+        return cm.get("stage") == "active" and cm.get("mode") == mode
+
+    def apply_colour(self):
+        mode, v = self._colour_target()
+        self.status.config(text="colour: ccm %s, satu %d (x%.2f) pushed to the pod"
+                                % (mode, v, v / 128.0), fg="#a4967c")
+        def _push():
+            try:
+                self.pod.ccm_all(mode)
+                self.pod.satu_all(v)
+                self._colour_asserted = True
+            except Exception as e:
+                self.status.config(text="colour push failed: %s" % e)
+        threading.Thread(target=_push, daemon=True).start()
+
     def apply_wb(self):
         try:
             r, g, b = (int(round(self.wb_r.get() * 256)), int(round(self.wb_g.get() * 256)),
@@ -945,6 +1042,8 @@ class App(tk.Tk):
         d = {"refresh_s": float(self.interval.get()), "overlay": bool(self.overlay.get()),
              "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
              "slew_fast": float(self.slew_fast.get()),
+             "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
+             "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
@@ -1057,6 +1156,14 @@ class App(tk.Tk):
                     mask_fn=mask_for)
                 self.status.config(text="WB pushed to pod: %.2f/%.2f/%.2fx  err=%.3f (%d iters)" % (
                     gains[0]/256, gains[1]/256, gains[2]/256, err, n))
+                # keep the result where it can be seen and re-applied: the
+                # toolbar R/G/B boxes (persisted, with the Kelvin estimate);
+                # the status line is overwritten by the next cycle
+                r, g, b = (round(v / 256.0, 2) for v in gains[:3])
+                self.after(0, lambda: (self.wb_r.set(r), self.wb_g.set(g), self.wb_b.set(b)))
+                if self.ae_on and self.ae.wb_base:
+                    self.ae.wb_base = (gains[0] / 256.0, gains[1] / 256.0, gains[2] / 256.0)   # new base for the WB rung
+                    self.ae._applied_wb_scale = 1.0
             except Exception as e:
                 self.status.config(text="WB cal failed: %s" % e)
             finally:
