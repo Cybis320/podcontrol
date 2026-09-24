@@ -28,14 +28,20 @@ coordinator on top of all of them:
 ## Install
 
 ```bash
-git clone <this repo> && cd podcontrol
-pip install .            # or: pip install -e .   for development
+curl -fsSL https://raw.githubusercontent.com/Cybis320/podcontrol/master/install.sh | bash
 ```
 
-System packages (not pip-installable):
+This clones (or updates) the repo into `~/source/CC_Utils/podcontrol`, moving an
+existing `~/source/podcontrol` clone there along with its `pod.json`. It installs
+the package into the RMS venv (see below), checks the system packages, and puts
+a **Pod Control** icon on the Desktop and in the app menu. Re-run it any time.
+Updates install themselves through the shared hourly
+[cc-utils](cc-utils/README.md) updater.
+
+System packages (not pip-installable; the installer lists any that are missing):
 
 ```bash
-sudo apt install python3-tk ffmpeg
+sudo apt install python3-tk python3-pil.imagetk python3-opencv python3-numpy ffmpeg
 ```
 
 ## Run
@@ -86,8 +92,10 @@ system `python3-opencv` (4.6) and `python3-numpy` (1.26). Install podcontrol
 opencv-python 5 drags in numpy 2, which breaks RMS's compiled extensions):
 
 ```
-~/vRMS/bin/pip install --no-deps -e ~/source/podcontrol
+~/vRMS/bin/pip install --no-deps -e ~/source/CC_Utils/podcontrol
 ```
+
+The installer does exactly this.
 
 ## Frame source (RMS-safe) — what changed 2026-09-14
 
