@@ -256,7 +256,18 @@ class PodController:
         if dgain is not None:    p += ["-d", str(int(dgain))]
         if ispdgain is not None: p += ["-i", str(int(ispdgain))]
         if exp_us is not None:   p += ["-e", str(int(exp_us))]
-        return self._bcast(" ".join(p), timeout)
+        # LIVE, not persisted -- the same rule as WB, saturation and the colour
+        # matrix (see send_live). This is the shared-AE loop's output, not
+        # configuration: it changes every few seconds, and RMS owns the durable
+        # exposure. Sent bare, every step landed in each camera's ae_state.bin, so
+        # a reboot or power cut restored podcontrol's LAST exposure instead of
+        # RMS's mode setting -- violating the rule that a reboot must never
+        # change a setting, and outliving the app exactly like the persisted
+        # "satu 255" of 2026-09-22. release() still sends RMS's line bare, so the
+        # hand-back is what persists. Needs an isp_ctl whose "transient" also
+        # covers exposure (silicon_research 7ef0e6eb+); older daemons still wrote
+        # ae_state.bin even under "transient".
+        return self._bcast_live(" ".join(p), timeout)
 
     # --- handing cameras back --------------------------------------------
     @staticmethod
@@ -361,20 +372,34 @@ class PodController:
     def wb_read(self, station_id, timeout=5.0):
         return _parse_wb(self.one(station_id, "wb", timeout))
 
-    # --- encoder (same syntax both platforms; chn 0 = "the" channel) --------
+    # --- encoder (same syntax both platforms) --------------------------------
+    # These used to hard-code channel 0 ("chn 0 = the channel"). There is no
+    # channel 0: venc creates channel 1 on both Goke and CV300, so every one of
+    # these failed with "GetChnAttr FAILED" and the encoder panel changed
+    # nothing (verified on .205, 2026-09-23). The channel cannot simply be left
+    # out either: isp_ctl reads a LEADING NUMBER as the channel, so
+    # "venc_gop 25" would address channel 25 and a positive chroma offset would
+    # too. So ask each camera which channel is live and send it explicitly.
+    def _bcast_venc(self, fmt, timeout=5.0):
+        def one(s):
+            chn = venc_chn(s.ip, timeout)
+            return send(s.ip, fmt.format(chn=chn), timeout) if chn is not None else None
+        futs = {s.id: self._pool.submit(one, s) for s in self.stations}
+        return {sid: f.result() for sid, f in futs.items()}
+
     def venc_qp_all(self, maxqp, minqp, timeout=5.0):
         """Luma QP window on every camera (min==max pins a constant QP)."""
-        return self._bcast("venc_qp 0 cap %d %d" % (int(maxqp), int(minqp)), timeout)
+        return self._bcast_venc("venc_qp {chn} cap %d %d" % (int(maxqp), int(minqp)), timeout)
 
     def venc_cqp_all(self, offset, timeout=5.0):
         """Chroma QP index offset [-12..12] on every camera."""
-        return self._bcast("venc_cqp 0 %d" % int(offset), timeout)
+        return self._bcast_venc("venc_cqp {chn} %d" % int(offset), timeout)
 
     def venc_gop_all(self, gop, bitrate_kbps=None, timeout=5.0):
-        cmd = "venc_gop 0 %d" % int(gop)
+        cmd = "venc_gop {chn} %d" % int(gop)
         if bitrate_kbps is not None:
             cmd += " %d" % int(bitrate_kbps)
-        return self._bcast(cmd, timeout)
+        return self._bcast_venc(cmd, timeout)
 
     def one_live(self, station_id, cmd, timeout=5.0):
         """one() for state podcontrol owns only while it runs: never persisted."""
