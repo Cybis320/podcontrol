@@ -227,20 +227,35 @@ class PodController:
         return "auto --max-dgain 1024"
 
     def snapshot(self, poll):
-        """{station_id: restore command} for every online camera."""
+        """{station_id: telemetry} of every online camera at takeover. The
+        restore command is built at RELEASE time (restore_cmd), because the
+        right hand-back line depends on the sun THEN, not at takeover: on
+        2026-09-16 the snapshot was taken at night and replayed at 09:00
+        local when the app was closed -> the night line (40 ms, 45x) in full
+        sun, every frame white, and the restarted shared AE needed 30 min to
+        slew the 16 stops back down."""
         out = {}
         for s in self.stations:
             t = poll.get(s.id) or {}
             if t.get("online"):
-                out[s.id] = self.restore_cmd(s, t)
+                out[s.id] = dict(t)
         return out
 
     def release(self, snap=None, timeout=5.0):
-        """Hand every camera back: its snapshot command if we have one, else
-        the station's day line, else a DGain-safe auto."""
+        """Hand every camera back with RMS's line for the CURRENT day/night
+        mode (restore_cmd on the takeover telemetry), else the station's day
+        line, else a DGain-safe auto. A snapshot entry may also be a ready
+        command string (older callers)."""
         futs = {}
         for s in self.stations:
-            cmd = (snap or {}).get(s.id) or s.mode_cmd("day") or "auto --max-dgain 1024"
+            tel = (snap or {}).get(s.id)
+            if isinstance(tel, str):
+                cmd = tel
+            elif tel:
+                cmd = self.restore_cmd(s, tel)
+            else:
+                cmd = None
+            cmd = cmd or s.mode_cmd("day") or "auto --max-dgain 1024"
             futs[s.id] = self._pool.submit(send, s.ip, cmd, timeout)
         return {sid: f.result() for sid, f in futs.items()}
 

@@ -378,8 +378,34 @@ GUI (2026-09-14, six cameras).
   (and it would have carried into the night, where the night line leaves
   DGain in auto). The line comes from the station's `camera_settings*.json`
   (resolved like RMS does, relative to the RMS checkout), day vs night chosen
-  by the sun altitude with RMS's -9° rule; without a settings file it is
-  rebuilt from the camera's reported ranges. `Auto All` sends the day line.
+  by the sun altitude with RMS's -9° rule **at the moment of the hand-back**;
+  without a settings file it is rebuilt from the camera's reported ranges.
+  `Auto All` sends the day line. (Until 2026-09-16 the hand-back line was
+  fixed at takeover: an app armed at night and closed at 09:00 local replayed
+  the night line, 40 ms at 45x, into full sun; every frame was white and the
+  restarted shared AE needed 30 min to slew the 16 stops back down. The
+  takeover now stores the cameras' telemetry and the line is chosen when the
+  cameras are released.)
+- **Fast slew at startup and on gross errors (2026-09-16).** The smooth
+  slew is right for tracking the sky but hopeless for a gross error: when the
+  pod was handed the night line in full sun, every frame was white and the
+  AE needed 30 min to bring 16 stops back (0.5 stop per ~50 s frame set,
+  trailed at 0.05 stop/cycle). Two exceptions now run at **fast** (toolbar,
+  default 1 stop/cycle): the **startup phase** after a takeover, which ends
+  when the pod first reaches a post-takeover target (or after 10 min), and a
+  **gross error**, a frame more than 10 % clipped, which may move the target
+  from 0.5 stop (at 10 %) up to 3 stops (at 100 %) at once, monotone in the
+  clip fraction so successive sets converge without pumping, and never
+  upward (a white frame is a lower bound on the excess). During the startup
+  phase a dark seed (99.9 % peak under 180) gets a calibrated jump toward the
+  ceiling (log2 of ceiling/peak, gamma taken as 1 so it never overshoots)
+  instead of the proportional nudge. Mild errors keep the smooth slew on
+  purpose: with frame sets ~50 s old, jumping to a small step's target and
+  waiting is no faster than creeping there. A takeover at night latches and
+  starts no fast phase, so dawn still comes down at the smooth slew.
+  Replayed in simulation against the recorded incident: 16 stops in 5 min
+  instead of 30; a 2-stop dark seed in 2.5 min instead of 12; a 1-stop bright
+  seed and a one-minute cloud transient unchanged.
 - **Clouds and the diurnal trend.** A passing cloud that clips asks for less
   light, then more again a minute later, which pumps the pod. Rather than a
   hard "high-water mark" (which fails when an overcast morning clears), moves
