@@ -137,6 +137,17 @@ except Exception:
     pass
 
 
+def _wb_ints_from_reply(text):
+    """The x256 (R, G, B) a `wb` reply reports, or None. Every wb command --
+    set or read -- echoes the resulting gains, so the reply is the camera's own
+    confirmation and needs no extra round trip."""
+    m = re.search(r"R=([\d.]+)\s+Gr=([\d.]+)\s+Gb=([\d.]+)\s+B=([\d.]+)", text or "")
+    if not m:
+        return None
+    r, gr, _gb, b = (float(x) for x in m.groups())
+    return (int(round(r * 256)), int(round(gr * 256)), int(round(b * 256)))
+
+
 class SharedAE:
     def __init__(self, pod, cfg=None):
         self.pod = pod
@@ -154,6 +165,9 @@ class SharedAE:
         self.followers = {}                  # cam -> (li_needed, why) not voting (sun in FOV)
         self.wb_base = None                  # (R,G,B) multipliers the pod had at takeover
         self._applied_wb_scale = 1.0
+        self._wb_target = None               # x256 triple every camera must hold
+        self._wb_force = False               # a camera missed it: push again next cycle
+        self.wb_unconfirmed = []             # cameras that did not echo the WB we sent
         self.latched = False                 # night: pinned at the night line, silent
         self.sun_alt = None                  # deg, updated by update_sun()
         self.sun_rising = None
@@ -182,6 +196,15 @@ class SharedAE:
 
     def wb_scale_for(self, li):
         return 2.0 ** min(0.0, li) if (self.cfg.wb_lever and self.wb_base) else 1.0
+
+    def wb_ints(self, scale):
+        """The exact x256 triple sent for a WB attenuation `scale`. Comparing
+        against these integers rather than a percentage catches a single 1/256
+        step, which is what a camera drifts by when it misses one push."""
+        if not self.wb_base:
+            return None
+        R, G, B = self.wb_base
+        return (int(round(R * scale * 256)), int(round(G * scale * 256)), int(round(B * scale * 256)))
 
     def wb_scale_at(self, t):
         li = self.li_at(t)
@@ -549,6 +572,7 @@ class SharedAE:
                                list(self.needs.items()) + list(self.followers.items())},
                      "state": self.state, "ramp": ramp, "wb_scale": self.wb_scale_for(self.li),
                      "fast": fast, "startup": self.startup,
+                     "wb_unconfirmed": list(self.wb_unconfirmed),
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
 
@@ -566,11 +590,19 @@ class SharedAE:
                 continue
             if (d.get("optype") or "").upper() == "AUTO":
                 return True
-            if ws < 0.999 and self.wb_base:
+            # While the rung is engaged, WB is ours and must be EXACT on every
+            # camera: the old test allowed 5% on red, about thirteen 1/256 steps,
+            # so a camera one or two steps behind never looked wrong and never got
+            # corrected. Off the rung, WB belongs to RMS and we leave it alone;
+            # a camera stranded at an old attenuation is then picked up by the
+            # confirmed push that apply() makes on the way back to scale 1.0.
+            if ws < 0.999 and self.wb_base and self._wb_target:
                 g = (d.get("wb") or {}).get("gains") or []
-                if len(g) >= 3 and abs(g[0] - self.wb_base[0] * ws) > 0.05 * max(0.1, self.wb_base[0] * ws):
-                    self._applied_wb_scale = 1.0     # force the WB push on the next apply
-                    return True
+                if len(g) >= 3:
+                    got = (int(round(g[0] * 256)), int(round(g[1] * 256)), int(round(g[-1] * 256)))
+                    if got != self._wb_target:
+                        self._wb_force = True        # force the WB push on the next apply
+                        return True
             e, a = d.get("exp_us"), d.get("again_x")
             if e is not None and abs(e - exp) > max(30, tol * exp):
                 return True
@@ -590,11 +622,33 @@ class SharedAE:
         kw = {"again": analog, "dgain": 1024, "ispdgain": boost, "exp_us": exp}
         r = self.pod.manual_all(timeout=timeout, **kw)
         ws = self.wb_scale_for(self.li)
-        if abs(ws - self._applied_wb_scale) > 0.01 and hasattr(self.pod, "wb_all"):
-            R, G, B = self.wb_base
-            self.pod.wb_all(int(round(R * ws * 256)), int(round(G * ws * 256)), int(round(B * ws * 256)),
-                            timeout=timeout)
+        if (self.wb_base and hasattr(self.pod, "wb_all")
+                and (abs(ws - self._applied_wb_scale) > 0.01 or self._wb_force)):
+            # CONFIRM EVERY CAMERA. The scale used to be marked applied the moment
+            # the broadcast returned, without reading the per-camera replies, so a
+            # camera that timed out kept an older attenuation for good and nothing
+            # ever retried: on 2026-09-24 the pod sat on three different scales at
+            # once (.206 two 1/256 steps behind .201), identical in balance and
+            # visibly different in level. The daemon echoes the resulting gains,
+            # so the reply confirms it; anything else is re-sent to that camera,
+            # and if it still will not take, the push is repeated next cycle.
+            ints = self.wb_ints(ws)
+            res = self.pod.wb_all(*ints, timeout=timeout) or {}
+            bad = [sid for sid, rep_ in res.items() if _wb_ints_from_reply(rep_) != ints]
+            if bad and hasattr(self.pod, "one_live"):
+                still = []
+                for sid in bad:
+                    try:
+                        again = self.pod.one_live(sid, "wb %d %d %d" % ints, timeout=timeout)
+                    except Exception:
+                        again = None
+                    if _wb_ints_from_reply(again) != ints:
+                        still.append(sid)
+                bad = still
             self._applied_wb_scale = ws
+            self._wb_target = ints
+            self._wb_force = bool(bad)
+            self.wb_unconfirmed = bad
         self.t_apply = time.time()
         self._applied_li = self.li
         self.hist.append((self.t_apply, self.li))

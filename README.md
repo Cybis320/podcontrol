@@ -453,6 +453,22 @@ second click within 10 s, so it cannot happen by reflex. On exit podcontrol
 hands colour back using the station's own `camera_settings` values for the
 current mode.
 
+**Every white-balance push is confirmed on every camera.** The rung's
+attenuation is pod-wide, so all six must hold the same x256 triple. They did
+not: on 2026-09-24 the pod sat on three scales at once, .206 two 1/256 steps
+behind .201, identical in balance and visibly different in level. Two things
+caused it. `apply()` marked the scale applied the moment the broadcast
+returned, without reading the per-camera replies, so a camera that timed out
+kept an older attenuation for good and nothing retried. And the drift check
+allowed 5% on red, about thirteen 1/256 steps, so one or two steps never
+looked wrong. Now the reply is the confirmation, since every `wb` command
+echoes the resulting gains: a camera that does not echo the exact triple is
+re-sent individually, and if it still will not take, the push repeats next
+cycle and the status line names it. While the rung is engaged the drift check
+compares integers, so a single step is caught; off the rung white balance
+belongs to RMS and podcontrol leaves it alone, and a camera stranded at an old
+attenuation is picked up by the confirmed push on the way back to scale 1.
+
 **Nothing podcontrol writes reaches camera flash.** The daemon gained a
 `transient <cmd>` prefix (2026-09-22) that runs a command without saving it to
 `/mnt/mtd/isp_persist`, and podcontrol uses it for every white-balance,

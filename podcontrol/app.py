@@ -818,6 +818,8 @@ class App(tk.Tk):
                         info.get("to_go", 0.0),
                         ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
                 note = ""
+                if (info or {}).get("wb_unconfirmed"):
+                    note = "  [WB not confirmed on %s -- retrying]" % ",".join((info or {})["wb_unconfirmed"])
                 if self._colour_note and time.time() - self._colour_note_t < 90:
                     note = "  [%s]" % self._colour_note
                 elif self.colour_hold.get() and self._colour_quiet():
