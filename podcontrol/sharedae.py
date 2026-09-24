@@ -137,16 +137,6 @@ except Exception:
     pass
 
 
-def _raw_sat_veto(m):
-    """The raw-saturated fraction that must veto the WB rung: the part far
-    enough from the sun that magenta there would be a real artefact rather than
-    the sun's own glare. Falls back to the whole-frame figure for a metering
-    dict that predates `raw_sat_far`."""
-    if "raw_sat_far" in m:
-        return m["raw_sat_far"]
-    return max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
-
-
 def _wb_ints_from_reply(text):
     """The x256 (R, G, B) a `wb` reply reports, or None. Every wb command --
     set or read -- echoes the resulting gains, so the reply is the camera's own
@@ -384,10 +374,9 @@ class SharedAE:
         if at_floor and self.cfg.wb_lever and self.wb_base:
             # at/below the exposure floor only WB attenuation is left: it fixes
             # gain-induced R/B clipping but not raw (green) saturation
-            # Raw saturation vetoes the rung -- but only where the magenta would
-            # matter. Near the sun it is the glare ring and is accepted (see
-            # frames.MAGENTA_TOL_DEG); anywhere else it still vetoes.
-            rb, rs = m.get("rb_only", clip), _raw_sat_veto(m)
+            # raw saturation counts wherever it is in the frame (masked zones
+            # included): the magenta it would take is visible there all the same
+            rb, rs = m.get("rb_only", clip), max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
             if rs > c.wb_rung_raw_sat_max:
                 # raw-saturated zones would go magenta under attenuation: stay
                 # (or go back) to s = 1 where they clip to white
@@ -433,7 +422,8 @@ class SharedAE:
             # as on the rung. Until 2026-09-16 only frames captured AT the
             # floor were checked, so heavily clipped frames from just above it
             # drove the target straight to the rung's bottom past the guard.
-            if _raw_sat_veto(m) > c.wb_rung_raw_sat_max:
+            rs = max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
+            if rs > c.wb_rung_raw_sat_max:
                 return 0.0, "raw-saturated: staying at the floor"
         return t_new, why
 
@@ -463,7 +453,8 @@ class SharedAE:
         # set shows raw saturation, nobody may ask for less than the floor.
         c = self.cfg
         if c.wb_lever and self.wb_base:
-            sat = {cam: _raw_sat_veto(m) for cam, m in metering.items() if m}
+            sat = {cam: max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
+                   for cam, m in metering.items() if m}
             worst = max(sat, key=sat.get) if sat else None
             if worst is not None and sat[worst] > c.wb_rung_raw_sat_max:
                 for cam in list(needs):
