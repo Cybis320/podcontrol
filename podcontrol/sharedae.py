@@ -276,13 +276,34 @@ class SharedAE:
         night (sun below the RMS switch) we latch immediately and touch
         nothing: RMS's night line is in place and is exactly our top rung."""
         self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
+        # wb_base must be the UNATTENUATED white balance, because everything the
+        # rung does is relative to it. Reading it from the cameras breaks on any
+        # restart that happens while the rung is engaged: the attenuated gains
+        # become the new base, the AE then believes it is already at scale 1, it
+        # never restores them, and the pod is left permanently darkened and
+        # magenta -- with a second restart ratcheting it down again. That is what
+        # happened on 2026-09-24: a restart at scale 0.566 turned 1.80/1.00/1.92
+        # into 1.02/0.57/1.09 and called it unity.
+        # RMS's own day line is the authoritative unattenuated value, so prefer
+        # it and fall back to the cameras only when the station has none.
         self.wb_base = None
-        for d in poll.values():
-            wb = d.get("wb") or {}
-            g = wb.get("gains") or []
-            if d.get("online") and wb.get("op") == "manual" and len(g) >= 3 and min(g) > 0:
-                self.wb_base = (float(g[0]), float(g[1]), float(g[-1]))
+        for st in getattr(self.pod, "stations", []) or []:
+            if not hasattr(st, "mode_colour_cmds"):
+                continue
+            for cmd in st.mode_colour_cmds("day", keys=("wb",)):
+                p_ = cmd.split()
+                if len(p_) == 4 and all(x.isdigit() for x in p_[1:]):
+                    self.wb_base = tuple(int(x) / 256.0 for x in p_[1:])
+                    break
+            if self.wb_base:
                 break
+        if self.wb_base is None:
+            for d in poll.values():
+                wb = d.get("wb") or {}
+                g = wb.get("gains") or []
+                if d.get("online") and wb.get("op") == "manual" and len(g) >= 3 and min(g) > 0:
+                    self.wb_base = (float(g[0]), float(g[1]), float(g[-1]))
+                    break
         self._applied_wb_scale = 1.0
         li = self.seed(poll)
         if self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg:
@@ -291,6 +312,13 @@ class SharedAE:
             self.startup = False                 # dawn must come down at the smooth slew
             self.state = "night"
             self._applied_li = self.li           # nothing to push
+        else:
+            # By day, push the base WB on the first apply even though the scale
+            # has not "changed": the cameras may still be carrying an attenuation
+            # from a previous run that died on the rung, and without this they
+            # would keep it until RMS's next switch. At night RMS owns WB (it
+            # sets `wb unity`), so nothing is forced there.
+            self._wb_force = True
         return li
 
     def update_sun(self, alt_deg, rising):
