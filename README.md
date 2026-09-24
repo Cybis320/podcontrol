@@ -327,8 +327,16 @@ hands WB back to the cameras' AWB. The **≈ K** readout is an estimated
 correlated colour temperature for the entered gains: the gains are inverted
 to an illuminant colour, taken through the sRGB matrix to chromaticity and
 McCamy's formula, anchored so the config's daylight preset (460/256/490)
-reads as D65. Relative shifts are meaningful (more R gain = bluer light =
-higher K); absolute values are approximate, not a calibrated colorimeter.
+reads as D65. Edit it (3800–20000 K, steps of 100) and R and B are set to
+neutralise a daylight-locus illuminant of that temperature, G kept as it is,
+with the same anchor (6500 K gives 461/256/491; 8000 K gives 515/256/410,
+next to the 523/256/411 a cloud calibration found on 2026-09-16). It is one
+axis only: the green–magenta tint is fixed to the locus, so a calibrated
+balance is not reproducible from its Kelvin readout alone, and the calibrator
+stays the source of truth. Relative shifts are meaningful (more R gain =
+bluer light = higher K); absolute values are approximate, not a calibrated
+colorimeter, and the readout drifts above ~12000 K.
+
 ## Sky view (the pod on one sky map)
 
 The **View: tiles / sky** button swaps the tile grid for one all-sky

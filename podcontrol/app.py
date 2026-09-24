@@ -35,7 +35,7 @@ from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, hig
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
-from podcontrol.colour import cct_from_gains
+from podcontrol.colour import cct_from_gains, gains_from_cct
 from podcontrol import skymap
 
 COLS = 3
@@ -400,6 +400,12 @@ class App(tk.Tk):
         self.wb_g = tk.DoubleVar(value=sv("wb_g", 1.0))
         self.wb_b = tk.DoubleVar(value=sv("wb_b", 1.0))
         self._wb_seeded = "wb_r" in saved          # else seed from the first camera poll
+        # colour temperature: a readout of the R/G/B gains, and an input that
+        # sets R and B on the daylight locus (G kept). _wb_sync breaks the
+        # loop between the two directions.
+        self.wb_k = tk.IntVar(value=6500)
+        self._wb_sync = False
+        self.wb_k.trace_add("write", lambda *_: self._kelvin_edited())
         self._saved = saved
         self._save_job = None
         for var in (self.wb_r, self.wb_g, self.wb_b):
@@ -578,6 +584,14 @@ class App(tk.Tk):
             "Push these three gains to every camera as a manual white balance.", padx=(4, 4))
         btn(g, "Auto", self.wb_auto,
             "Hand white balance back to each camera's own AWB.")
+        k_tip = ("Colour temperature, both ways. As a readout it estimates the temperature of the\n"
+                 "gains on the left. Type one and R and B are set to neutralise a daylight-locus\n"
+                 "illuminant of that temperature, with G kept as it is.\n"
+                 "One axis only: the green-magenta tint is fixed to the locus, so this cannot\n"
+                 "reproduce every balance. The cloud calibrator stays the source of truth.")
+        lab(g, "≈", tip=k_tip, padx=(8, 0))
+        spin(g, self.wb_k, 3800, 20000, 100, 6, tip=k_tip)
+        lab(g, "K", tip=k_tip)
         self._update_kelvin()
 
         self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
@@ -867,9 +881,47 @@ class App(tk.Tk):
                 self._render_tiles(*self._last_cycle)  # the tiles were not drawn while hidden
 
     def _update_kelvin(self):
+        """Gains -> the Kelvin box (readout); skipped while the box is driving."""
+        if self._wb_sync:
+            return
         try:
             c = cct_from_gains(self.wb_r.get(), self.wb_g.get(), self.wb_b.get())
-            self.kelvin.config(text=("\u2248 %d K" % (round(c / 50) * 50)) if c else "\u2248 ? K")
+        except Exception:
+            return
+        if c:
+            self._wb_sync = True
+            try:
+                self.wb_k.set(int(round(c / 50) * 50))
+            finally:
+                self._wb_sync = False
+
+    def _kelvin_edited(self):
+        """The Kelvin box -> R and B on the daylight locus (G kept)."""
+        if self._wb_sync:
+            return
+        try:
+            k = int(self.wb_k.get())            # partial input while typing raises
+            g = float(self.wb_g.get())
+        except Exception:
+            return
+        gains = gains_from_cct(k, g) if 3800 <= k <= 20000 else None
+        if not gains:
+            return
+        r, _, b = (min(4.0, max(0.25, v)) for v in gains)
+        self._wb_sync = True
+        try:
+            self.wb_r.set(round(r, 2)); self.wb_b.set(round(b, 2))
+        finally:
+            self._wb_sync = False
+    def _update_satu_label(self):
+        """The multiplier beside the satu box -- or "inert", because with the
+        colour matrix bypassed the ISP saturation does nothing at all."""
+        try:
+            v, mode = int(self.satu.get()), self.ccm_mode.get()
+            if mode == "off":
+                self.satu_x.config(text="inert", fg="#726650")
+            else:
+                self.satu_x.config(text="x%.2f" % (v / 128.0), fg="#f0a830")
         except Exception:
             pass
 
