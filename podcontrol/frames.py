@@ -127,7 +127,7 @@ def scan_station(station, ttl=DIR_SCAN_TTL):
 
 
 _IMG_CACHE = {}          # path -> decoded BGR (frames are immutable once written)
-IMG_CACHE_MAX = 8
+IMG_CACHE_MAX = 14      # 6 newest tile frames + 6 sky-set frames (often the same files) + slack
 
 
 def imread_cached(path):

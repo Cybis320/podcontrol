@@ -329,12 +329,67 @@ to an illuminant colour, taken through the sRGB matrix to chromaticity and
 McCamy's formula, anchored so the config's daylight preset (460/256/490)
 reads as D65. Relative shifts are meaningful (more R gain = bluer light =
 higher K); absolute values are approximate, not a calibrated colorimeter.
+## Sky view (the pod on one sky map)
+
+The **View: tiles / sky** button swaps the tile grid for one all-sky
+composite of the whole pod (`skymap.py`), built from the station
+platepars: for every map pixel each platepar says which sensor pixel looks
+that way (RMS `raDecToXYPP` at the platepar's own epoch, so a fixed
+camera's pixel to alt/az map is computed once and never involves an
+ephemeris; directions behind the camera, which the gnomonic projection
+folds back into the frame, are rejected by a round trip through
+`xyToRaDecPP`). The map is zenith-centred azimuthal equidistant, north up
+and east *left* like an all-sky camera, with altitude circles at 30° and
+60°, the cardinal points, each camera's footprint outlined in its colour
+with its id, exposure and total gain (and the `<< DRIVING` badge), and the
+sun/moon markers. With the **overlay** on, the same exclusion zones as on
+the tiles are tinted on the map (red RMS mask, orange sun zone, violet
+flare, blue moon, magenta clipped pixels), warped through the same lookup.
+The composite always uses the **newest complete frame set** (the six
+coherent frames the shared AE meters); the caption shows its capture time
+and age. The chosen view is remembered across restarts.
+
+First render (2026-09-16): 93% of the sky above the horizon is covered; the
+four uncovered wedges sit at the diagonal azimuths below ~8° altitude, where
+adjacent horizon cameras' bottom corners do not quite meet.
+
+**Cost** (measured in the running app, 2026-09-16). Lookup tables take
+~1.5 s per camera (900 px map) the first time and are cached in
+`~/.cache/podcontrol/skymap/` (keyed by platepar, mask and map parameters).
+The renderer then keeps three cache levels: the blended composite with its
+static decorations (grid, outlines) is redone only when the frame set
+changes (~60 ms, every ~50 s on a capturing pod: six INTER_AREA downscales
+and six remaps over each camera's bounding box, with normalised blend
+weights precomputed so there is no division); the overlay tints are redone
+only when a zone map changes (the sun zone moves in 30 s buckets, the clip
+map per frame), the per-camera warps being reused while their maps are the
+same arrays; every other cycle costs a copy plus the labels: **~5 ms**
+without the overlay, **~10–15 ms** with it. The render runs in the updater
+thread from the same cached frames as the tiles, only while the sky view is
+shown, and reuses the tiles' own zone maps whenever a camera's set frame is
+the file its tile shows; the hidden tiles are not drawn at all. The finished
+map is pre-scaled to the canvas in the worker, so the Tk thread only converts
+it to a photo (~14 ms per cycle; a full redraw of the six tiles is ~150 ms,
+which the tile view pays once per new frame per camera). Frames are
+downscaled once per saved file; the decoded-frame cache holds both the
+tiles' newest frames and the set's frames, and the zone / highlight caches
+evict oldest-first (they used to clear themselves at the limit, which with
+two consumers meant recomputing every zone every cycle).
+
+Headless / for a timelapse:
+
+```
+~/vRMS/bin/python -m podcontrol.skymap                     # -> /tmp/podcontrol/skymap.png
+~/vRMS/bin/python -m podcontrol.skymap --size 1000 --loop 5 --out sky.png
+~/vRMS/bin/python -m podcontrol.skymap --proj pano --size 1440   # az/alt panorama (CLI only)
+```
+
 
 ## Settings
 
 Toolbar values (refresh, slew, clip threshold, point-source tolerance,
-overlay, sun / moon / flare radii, sun-cam-votes), the Shared AE on/off state
-and the window geometries are saved to `~/.config/podcontrol/settings.json`
+overlay, sun / moon / flare radii, sun-cam-votes), the Shared AE on/off state,
+the view (tiles or sky) and the window geometries are saved to `~/.config/podcontrol/settings.json`
 (`$PODCONTROL_SETTINGS` overrides) on every change and on close, and restored
 at start. If Shared AE was on at the last exit the pod is taken over again
 after the first poll, so an armed pod survives a restart; the History window
@@ -457,5 +512,6 @@ podcontrol/
   stations.py   pod definition (IPs, data dirs) from config/CLI/RMS Stations
   podctl.py     PodController: platform-aware :9600 client + unified telemetry
   frames.py     RMS-safe frame source + luma/clip metering
+  skymap.py     all-sky composite of the pod from the platepars (the Sky view)
   app.py        Tkinter UI (preview tiles + telemetry + controls)
 ```

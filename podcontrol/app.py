@@ -36,6 +36,7 @@ from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, fee
 from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
 from podcontrol.colour import cct_from_gains
+from podcontrol import skymap
 
 COLS = 3
 BG, PANEL = "#0f0d08", "#14110c"
@@ -48,6 +49,19 @@ TINT_CLIP, TINT_HOT = (255, 0, 255), (0, 255, 255)        # what drives the AE
 OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
 MONO = "JetBrains Mono"
+SKY_SIZE = 900        # internal size of the sky composite (px); scaled to the canvas
+
+
+def _fit_to(rgb, wh):
+    """rgb scaled to fit a (w, h) box, keeping its aspect; the array itself
+    when it already fits exactly."""
+    cw, ch = max(32, wh[0]), max(32, wh[1])
+    h, w = rgb.shape[:2]
+    sc = min(cw / w, ch / h)
+    if abs(sc - 1.0) < 0.005:
+        return rgb
+    dw, dh = max(1, int(w * sc)), max(1, int(h * sc))
+    return cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
 
 
 def _tint(small, mask_full, tint, alpha, size):
@@ -329,9 +343,29 @@ class App(tk.Tk):
             t = Tile(grid, s, on_select=self._on_select)
             t.grid(row=i // COLS, column=i % COLS, padx=4, pady=4, sticky="nsew")
             self.tiles[s.id] = t
+        self.grid_frame = grid
+
+        # ---- alternate view: the whole pod on one sky map (skymap) ----
+        # Rendered in the updater thread from the same frames, only while it
+        # is shown (the hidden tiles are then not drawn at all); the Tk thread
+        # only scales the finished image to the canvas.
+        self.sky_canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
+        self.sky_canvas.bind("<Configure>", self._on_sky_resize)
+        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE))
+        self._sky_rgb = None
+        self._sky_msg = None
+        self._sky_img_id = None
+        self._sky_photo = None
+        self._sky_job = None
+        self._sky_wh = None                 # canvas size, for pre-scaling in the worker
+        self._last_cycle = None
+        self._last_poll = {}
+        v = saved.get("view")
+        self.view = v if v in ("tiles", "sky") else "tiles"
 
         # ---- toolbar: grouped controls on two rows, status on its own row ----
         tb = tk.Frame(self, bg=BG); tb.pack(fill="x", padx=8, pady=(0, 6))
+        self.toolbar = tb
         row1 = tk.Frame(tb, bg=BG); row1.pack(fill="x")
         row2 = tk.Frame(tb, bg=BG); row2.pack(fill="x", pady=(4, 0))
 
@@ -389,6 +423,8 @@ class App(tk.Tk):
         self.hist_win = None
         self.hist_canvas = None
         self.history = HistoryLog()
+        if self.view == "sky":
+            self._apply_view(initial=True)
 
         threading.Thread(target=self._updater, daemon=True).start()
         self.after(200, self._drain)
@@ -464,7 +500,14 @@ class App(tk.Tk):
                                                 sun, self.ae_on, self.ae._max_li(), self.ae_slot))
             except Exception:
                 pass
-            self.q.put((frames, poll, lumas, layers, time.time() - t0))
+            self._last_poll = poll
+            sky = None
+            if self.view == "sky":
+                try:
+                    sky = self._render_sky(poll, frames, layers)
+                except Exception as e:
+                    sky = ("sky: %s" % e,)
+            self.q.put((frames, poll, lumas, layers, time.time() - t0, sky))
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
                     return
@@ -472,28 +515,36 @@ class App(tk.Tk):
 
     def _drain(self):
         try:
+            self._drain_once()
+        except Exception as e:                  # never let a display error stop the loop
+            try:
+                self.status.config(text="display error: %s" % e, fg="#b3402a")
+            except Exception:
+                pass
+        self.after(200, self._drain)
+
+    def _drain_once(self):
+        try:
             while True:
-                frames, poll, lumas, layers, dt = self.q.get_nowait()
+                item = self.q.get_nowait()
+                if isinstance(item[0], str):            # ("sky", rgb): on-demand render
+                    self._show_sky(item[1])
+                    continue
+                frames, poll, lumas, layers, dt, sky = item
+                self._last_cycle = (frames, poll, lumas, layers)
                 self._hist_dirty = True
+                if self.view == "tiles":
+                    self._render_tiles(frames, poll, lumas, layers)
+                else:
+                    self._show_sky(sky)
                 brights = []
-                info = self.ae_info if self.ae_on else None
-                driver = (info or {}).get("driver")
-                needs = (info or {}).get("needs") or {}
-                ov = (self.overlay.get(), float(self.sun_radius.get()), float(self.flare_w.get()),
-                      float(self.moon_radius.get()))
-                for sid, t in self.tiles.items():
-                    img, src, path = frames.get(sid, (None, "none", None))
-                    drive = None
-                    if info:
-                        n = needs.get(sid)
-                        drive = (sid == driver, (n[1] if n else None), (n[0] if n else None))
-                    t.render(img, src, poll.get(sid), lumas.get(sid),
-                             layers.get(sid), ov[0], drive, sig=(path, ov, drive))
+                for sid in self.tiles:
                     b = (poll.get(sid) or {}).get("avelum")
                     if b is None and lumas.get(sid):
                         b = lumas[sid]["mean"]
                     if b is not None:
                         brights.append(b)
+                info = self.ae_info if self.ae_on else None
                 daemons = sum(1 for v in poll.values() if v.get("online"))
                 if not self._wb_seeded:
                     for v in poll.values():
@@ -519,7 +570,138 @@ class App(tk.Tk):
         if getattr(self, "_hist_dirty", False):
             self._hist_dirty = False
             self._draw_history()
-        self.after(200, self._drain)
+
+    def _render_tiles(self, frames, poll, lumas, layers):
+        info = self.ae_info if self.ae_on else None
+        driver = (info or {}).get("driver")
+        needs = (info or {}).get("needs") or {}
+        ov = (self.overlay.get(), float(self.sun_radius.get()), float(self.flare_w.get()),
+              float(self.moon_radius.get()))
+        for sid, t in self.tiles.items():
+            img, src, path = frames.get(sid, (None, "none", None))
+            drive = None
+            if info:
+                n = needs.get(sid)
+                drive = (sid == driver, (n[1] if n else None), (n[0] if n else None))
+            t.render(img, src, poll.get(sid), lumas.get(sid),
+                     layers.get(sid), ov[0], drive, sig=(path, ov, drive))
+
+    # ---- sky view ------------------------------------------------------------
+    def _render_sky(self, poll, cyc_frames=None, cyc_layers=None):
+        """The sky composite (RGB, pre-scaled to the canvas) of the newest
+        complete frame set, with the overlay's exclusion zones and clipped
+        pixels when the overlay is on. Runs in a worker thread. Everything
+        static is cached in the renderer; a cycle with the same frames costs
+        a few ms, a new set ~60 ms. cyc_frames / cyc_layers are this cycle's
+        tile frames and overlay layers: when a camera's set frame is the very
+        file its tile shows (the usual case), its layers are reused as they
+        are, so the overlay adds no per-cycle work."""
+        r = self.sky_r
+        if not r.ready and not r.ensure():
+            return ("no platepar found: the sky view needs the stations' RMS platepars",)
+        overlay_on = self.overlay.get()
+        imgs, paths, t, coherent = skymap.pod_frames(self.stations, decode=False)
+        if not paths:
+            return None
+        layers = None
+        if overlay_on:
+            layers = {}
+            for st in self.stations:
+                p = paths.get(st.id)
+                if not p:
+                    continue
+                cf = (cyc_frames or {}).get(st.id)
+                cl = (cyc_layers or {}).get(st.id)
+                if cl is not None and cf is not None and cf[2] == p:
+                    layers[st.id] = cl                 # the tile's own file: reuse its layers
+                    continue
+                img = imgs.get(st.id)
+                if img is None:
+                    img = imgs[st.id] = F.imread_cached(p)
+                if img is None:
+                    continue
+                keep, lay = mask_for(st, img, t, layers=True)
+                lay = dict(lay or {})
+                st_ = stats_for_path(st, p, t)         # cached per file
+                if st_ is not None:
+                    lay["clip"], _ = highlight_maps_cached(p, img, keep, st_["peak"])
+                layers[st.id] = lay
+        info = self.ae_info if self.ae_on else None
+        drive = None
+        if info:
+            driver = info.get("driver")
+            drive = {sid: (sid == driver, (n[1] if n else None), (n[0] if n else None))
+                     for sid, n in (info.get("needs") or {}).items()}
+        bgr, _ = r.render(imgs, paths, t, coherent, telem=poll, drive=drive, layers=layers)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        wh = self._sky_wh                              # scale here, not in the Tk thread
+        return _fit_to(rgb, wh) if wh else rgb
+
+    def _sky_now(self):
+        """On-demand render (the view was just switched): via the queue."""
+        try:
+            fr, po, lu, la = self._last_cycle or (None, None, None, None)
+            sky = self._render_sky(po or self._last_poll, fr, la)
+        except Exception as e:
+            sky = ("sky: %s" % e,)
+        self.q.put(("sky", sky))
+
+    def _show_sky(self, sky):
+        """sky: an RGB array, None (nothing to show yet) or (message,)."""
+        if isinstance(sky, tuple):
+            self._sky_rgb, self._sky_msg = None, sky[0]
+        elif sky is None:
+            self._sky_rgb = None
+            self._sky_msg = ("no complete frame set yet" if self.sky_r.ready
+                             else "building the sky map (first time: ~10 s)…")
+        else:
+            self._sky_rgb, self._sky_msg = sky, None
+        self._fit_sky()
+
+    def _fit_sky(self):
+        c = self.sky_canvas
+        cw, ch = max(32, c.winfo_width()), max(32, c.winfo_height())
+        if self._sky_rgb is None:
+            c.delete("all"); self._sky_img_id = None
+            c.create_text(cw // 2, ch // 2, text=self._sky_msg or "…", fill="#726650", font=(MONO, 14))
+            return
+        disp = _fit_to(self._sky_rgb, (cw, ch))       # a no-op when pre-scaled to this size
+        dh, dw = disp.shape[:2]
+        self._sky_photo = ImageTk.PhotoImage(Image.fromarray(disp))
+        x, y = (cw - dw) // 2, (ch - dh) // 2
+        if self._sky_img_id:
+            c.itemconfig(self._sky_img_id, image=self._sky_photo)
+            c.coords(self._sky_img_id, x, y)
+        else:
+            c.delete("all")
+            self._sky_img_id = c.create_image(x, y, anchor="nw", image=self._sky_photo)
+
+    def _on_sky_resize(self, _e=None):
+        c = self.sky_canvas
+        self._sky_wh = (c.winfo_width(), c.winfo_height())
+        if self._sky_job:
+            self.after_cancel(self._sky_job)
+        self._sky_job = self.after(80, self._fit_sky)
+
+    def toggle_view(self):
+        self.view = "sky" if self.view == "tiles" else "tiles"
+        self._schedule_save()
+        self._apply_view()
+
+    def _apply_view(self, initial=False):
+        self.view_btn.config(text="View: %s" % self.view)
+        if self.view == "sky":
+            self.grid_frame.pack_forget()
+            self.sky_canvas.pack(fill="both", expand=True, padx=8, pady=8, before=self.toolbar)
+            if self._sky_rgb is None:
+                self._show_sky(None)                   # placeholder until the render lands
+            if not initial:                            # at start the first cycle renders it anyway
+                self._pool.submit(self._sky_now)       # do not wait for the next cycle
+        else:
+            self.sky_canvas.pack_forget()
+            self.grid_frame.pack(fill="both", expand=True, padx=8, pady=8, before=self.toolbar)
+            if self._last_cycle:
+                self._render_tiles(*self._last_cycle)  # the tiles were not drawn while hidden
 
     def _update_kelvin(self):
         try:
@@ -552,7 +734,7 @@ class App(tk.Tk):
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
              "wb_r": float(self.wb_r.get()), "wb_g": float(self.wb_g.get()), "wb_b": float(self.wb_b.get()),
              "history_open": bool(self.hist_win and self.hist_win.winfo_exists()),
-             "geometry": self.geometry()}
+             "geometry": self.geometry(), "view": self.view}
         if self.hist_win and self.hist_win.winfo_exists():
             d["history_geometry"] = self.hist_win.geometry()
         return d
