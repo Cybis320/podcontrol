@@ -1286,39 +1286,63 @@ class App(tk.Tk):
 
     def calibrate_night(self):
         """Night analog-gain calibration (podcontrol.nightcal): measure, show the
-        table and the proposal, apply only on the operator's click."""
+        table and the proposal, apply only on the operator's click. Everything the
+        operator must see goes to the button text or a popup -- the status line is
+        overwritten by the refresh loop within a second."""
+        from tkinter import messagebox
         if self.calibrating:
+            messagebox.showinfo("Night gain calibration", "A calibration is already running.", parent=self)
             return
+        resume_ae = False
         if self.ae_on:
-            self.status.config(text="switch Shared AE off first -- it would fight the gain sweep")
-            return
+            if not messagebox.askyesno(
+                    "Night gain calibration",
+                    "Shared AE is running and would fight the gain sweep.\n\n"
+                    "Pause it for the calibration? It resumes when you close the result window.",
+                    parent=self):
+                return
+            self.toggle_ae()                      # off: releases the pod to RMS's line
+            resume_ae = True
         self.calibrating = True
-        self.ncal_btn.config(text="Calibrating night…", state="disabled")
+        self.ncal_btn.config(text="Night cal: starting…", state="disabled")
+        ui = lambda f: self.after(0, f)
 
         def worker():
             from podcontrol import nightcal
-            res = None
+            res, err = None, None
             try:
                 def on_row(st, r):
-                    self.status.config(text="night cal: %s at %.2fx analog -- noise-equivalent flux %.3f" % (
-                        st.id, r["again_set"] / 1024.0, r["nef"]))
+                    t = "Night cal: %s %.1fx…" % (st.id, r["again_set"] / 1024.0)
+                    ui(lambda: self.ncal_btn.config(text=t))
                 res = nightcal.calibrate_pod(self.pod, on_row=on_row)
-                self.status.config(text="night cal: done -- review and Apply or Cancel")
             except Exception as e:
-                self.status.config(text="night cal failed: %s" % e)
+                err = str(e)
             finally:
                 self.calibrating = False
-                self.ncal_btn.config(text="Calibrate night gain", state="normal")
+                ui(lambda: self.ncal_btn.config(text="Calibrate night gain", state="normal"))
             if res is not None:
-                self.after(0, lambda: self._night_cal_dialog(res))
+                ui(lambda: self._night_cal_dialog(res, resume_ae))
+            else:
+                def fail():
+                    messagebox.showerror("Night gain calibration", "Calibration failed:\n\n%s" % err, parent=self)
+                    if resume_ae and not self.ae_on:
+                        self.toggle_ae()
+                ui(fail)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _night_cal_dialog(self, res):
+    def _night_cal_dialog(self, res, resume_ae=False):
+        from tkinter import messagebox
         from podcontrol import nightcal
         n_ok = sum(1 for c in res["cameras"].values() if c.get("ok"))
         n_all = len(res["cameras"])
-        w = tk.Toplevel(self); w.title("Pod Control \u2014 night gain calibration"); w.configure(bg=BG)
+        w = tk.Toplevel(self); w.title("Pod Control — night gain calibration"); w.configure(bg=BG)
+
+        def close():
+            if resume_ae and not self.ae_on:
+                self.toggle_ae()                  # resume Shared AE as it was
+            w.destroy()
+        w.protocol("WM_DELETE_WINDOW", close)
         head = ("Measured on %d of %d cameras." % (n_ok, n_all) +
                 ("  The proposal can only reflect the measured cameras' skies." if n_ok < n_all else ""))
         tk.Label(w, text=head, bg=BG, fg="#f0a830" if n_ok < n_all else "#c8bfa8",
@@ -1333,18 +1357,20 @@ class App(tk.Tk):
             def work():
                 try:
                     notes = nightcal.apply(self.pod, res)
-                    self.status.config(text="night gain applied: %.2fx analog, ISP 1.0625x -- %s" % (
-                        res["pod_again"] / 1024.0, "; ".join(notes[-2:])))
+                    # Shared AE latches onto RMS's night line at dusk: reload it from
+                    # the file just rewritten, or its next latch re-pins the old gains
+                    configure_from_pod(self.ae, self.pod)
+                    msg = "Applied %.2fx analog, ISP 1.0625x.\n\n%s" % (res["pod_again"] / 1024.0, "\n".join(notes))
+                    self.after(0, lambda: (messagebox.showinfo("Night gain calibration", msg, parent=w), close()))
                 except Exception as e:
-                    self.status.config(text="night gain apply failed: %s" % e)
-                self.after(0, w.destroy)
+                    self.after(0, lambda: (messagebox.showerror("Night gain calibration", "Apply failed:\n\n%s" % e, parent=w), close()))
             threading.Thread(target=work, daemon=True).start()
 
         ab = tk.Button(row, text=("Apply %.2fx to all %d cameras + settings JSON" % (res["pod_again"] / 1024.0, n_all))
                        if res["pod_again"] else "Nothing to apply", command=do_apply,
                        state="normal" if res["pod_again"] else "disabled")
         ab.pack(side="left")
-        cb = tk.Button(row, text="Cancel", command=w.destroy); cb.pack(side="left", padx=6)
+        cb = tk.Button(row, text="Cancel", command=close); cb.pack(side="left", padx=6)
 
     def _close(self):
         self.running = False
