@@ -541,6 +541,12 @@ class App(tk.Tk):
             "Drag a box over a grey cloud on one tile, then click. Iterates the white-balance\n"
             "gains until that region is neutral and pushes the result to every camera.\n"
             "Takes minutes on a capturing pod: each step waits for a fresh RMS frame.", padx=(0, 6))
+        self.ncal_btn = btn(g, "Calibrate night gain", self.calibrate_night,
+            "Night only. Sweeps each camera's analog gain down from the top (exposure and\n"
+            "ISP gain fixed), measuring sky and noise ON the camera (no extra stream), and\n"
+            "proposes the lowest gain that loses no sensitivity -- the darkest sky's need.\n"
+            "Shows the table; nothing is saved until you click Apply, which sets the cameras\n"
+            "and RMS's night line in the settings JSON. Switch Shared AE off first.", padx=(0, 6))
         btn(g, "History", self.toggle_history,
             "Open the 12-hour chart: exposure and total gain per camera, pod luma against the\n"
             "clipping ceiling, and the clipped fraction, with night and latched shading.")
@@ -1277,6 +1283,68 @@ class App(tk.Tk):
                 self.cal_btn.config(text="Calibrate WB (cloud)", state="normal")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def calibrate_night(self):
+        """Night analog-gain calibration (podcontrol.nightcal): measure, show the
+        table and the proposal, apply only on the operator's click."""
+        if self.calibrating:
+            return
+        if self.ae_on:
+            self.status.config(text="switch Shared AE off first -- it would fight the gain sweep")
+            return
+        self.calibrating = True
+        self.ncal_btn.config(text="Calibrating night…", state="disabled")
+
+        def worker():
+            from podcontrol import nightcal
+            res = None
+            try:
+                def on_row(st, r):
+                    self.status.config(text="night cal: %s at %.2fx analog -- noise-equivalent flux %.3f" % (
+                        st.id, r["again_set"] / 1024.0, r["nef"]))
+                res = nightcal.calibrate_pod(self.pod, on_row=on_row)
+                self.status.config(text="night cal: done -- review and Apply or Cancel")
+            except Exception as e:
+                self.status.config(text="night cal failed: %s" % e)
+            finally:
+                self.calibrating = False
+                self.ncal_btn.config(text="Calibrate night gain", state="normal")
+            if res is not None:
+                self.after(0, lambda: self._night_cal_dialog(res))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _night_cal_dialog(self, res):
+        from podcontrol import nightcal
+        n_ok = sum(1 for c in res["cameras"].values() if c.get("ok"))
+        n_all = len(res["cameras"])
+        w = tk.Toplevel(self); w.title("Pod Control \u2014 night gain calibration"); w.configure(bg=BG)
+        head = ("Measured on %d of %d cameras." % (n_ok, n_all) +
+                ("  The proposal can only reflect the measured cameras' skies." if n_ok < n_all else ""))
+        tk.Label(w, text=head, bg=BG, fg="#f0a830" if n_ok < n_all else "#c8bfa8",
+                 anchor="w", justify="left").pack(fill="x", padx=8, pady=(8, 2))
+        txt = tk.Text(w, width=118, height=min(40, 4 + 8 * n_all), font=("Courier", 9))
+        txt.insert("1.0", nightcal.format_table(res)); txt.config(state="disabled")
+        txt.pack(fill="both", expand=True, padx=8, pady=4)
+        row = tk.Frame(w, bg=BG); row.pack(fill="x", padx=8, pady=(2, 8))
+
+        def do_apply():
+            ab.config(state="disabled"); cb.config(state="disabled")
+            def work():
+                try:
+                    notes = nightcal.apply(self.pod, res)
+                    self.status.config(text="night gain applied: %.2fx analog, ISP 1.0625x -- %s" % (
+                        res["pod_again"] / 1024.0, "; ".join(notes[-2:])))
+                except Exception as e:
+                    self.status.config(text="night gain apply failed: %s" % e)
+                self.after(0, w.destroy)
+            threading.Thread(target=work, daemon=True).start()
+
+        ab = tk.Button(row, text=("Apply %.2fx to all %d cameras + settings JSON" % (res["pod_again"] / 1024.0, n_all))
+                       if res["pod_again"] else "Nothing to apply", command=do_apply,
+                       state="normal" if res["pod_again"] else "disabled")
+        ab.pack(side="left")
+        cb = tk.Button(row, text="Cancel", command=w.destroy); cb.pack(side="left", padx=6)
 
     def _close(self):
         self.running = False
