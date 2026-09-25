@@ -1293,16 +1293,17 @@ class App(tk.Tk):
         if self.calibrating:
             messagebox.showinfo("Night gain calibration", "A calibration is already running.", parent=self)
             return
-        resume_ae = False
-        if self.ae_on:
-            if not messagebox.askyesno(
-                    "Night gain calibration",
-                    "Shared AE is running and would fight the gain sweep.\n\n"
-                    "Pause it for the calibration? It resumes when you close the result window.",
-                    parent=self):
-                return
-            self.toggle_ae()                      # off: releases the pod to RMS's line
-            resume_ae = True
+        # Shared AE stays as it is. At night it is LATCHED at RMS's night line and
+        # silent (it unlatches only at dawn, sun rising above -12 deg), and the
+        # calibration itself refuses to run unless the sun is at or below -12 deg,
+        # so the two never drive the pod at the same time. Only an AE that is on
+        # and still driving (not latched) would fight the sweep.
+        if self.ae_on and not getattr(self.ae, "latched", False):
+            messagebox.showinfo(
+                "Night gain calibration",
+                "Shared AE is still driving the pod (not yet latched at the night line).\n\n"
+                "Calibrate at night, once it has latched.", parent=self)
+            return
         self.calibrating = True
         self.ncal_btn.config(text="Night cal: starting…", state="disabled")
         ui = lambda f: self.after(0, f)
@@ -1321,17 +1322,15 @@ class App(tk.Tk):
                 self.calibrating = False
                 ui(lambda: self.ncal_btn.config(text="Calibrate night gain", state="normal"))
             if res is not None:
-                ui(lambda: self._night_cal_dialog(res, resume_ae))
+                ui(lambda: self._night_cal_dialog(res))
             else:
                 def fail():
                     messagebox.showerror("Night gain calibration", "Calibration failed:\n\n%s" % err, parent=self)
-                    if resume_ae and not self.ae_on:
-                        self.toggle_ae()
                 ui(fail)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _night_cal_dialog(self, res, resume_ae=False):
+    def _night_cal_dialog(self, res):
         from tkinter import messagebox
         from podcontrol import nightcal
         n_ok = sum(1 for c in res["cameras"].values() if c.get("ok"))
@@ -1339,8 +1338,6 @@ class App(tk.Tk):
         w = tk.Toplevel(self); w.title("Pod Control — night gain calibration"); w.configure(bg=BG)
 
         def close():
-            if resume_ae and not self.ae_on:
-                self.toggle_ae()                  # resume Shared AE as it was
             w.destroy()
         w.protocol("WM_DELETE_WINDOW", close)
         head = ("Measured on %d of %d cameras." % (n_ok, n_all) +
@@ -1359,7 +1356,12 @@ class App(tk.Tk):
                     notes = nightcal.apply(self.pod, res)
                     # Shared AE latches onto RMS's night line at dusk: reload it from
                     # the file just rewritten, or its next latch re-pins the old gains
+                    # Shared AE latches onto RMS's night line: reload it from the file
+                    # just rewritten, and if latched move its position to the new top,
+                    # or its dawn unlatch would compare against the old night gains
                     configure_from_pod(self.ae, self.pod)
+                    if getattr(self.ae, "latched", False):
+                        self.ae.li = self.ae.target = self.ae._max_li()
                     msg = "Applied %.2fx analog, ISP 1.0625x.\n\n%s" % (res["pod_again"] / 1024.0, "\n".join(notes))
                     self.after(0, lambda: (messagebox.showinfo("Night gain calibration", msg, parent=w), close()))
                 except Exception as e:
