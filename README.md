@@ -365,6 +365,10 @@ with its id, exposure and total gain (and the `<< DRIVING` badge), and the
 sun/moon markers. With the **overlay** on, the same exclusion zones as on
 the tiles are tinted on the map (red RMS mask, orange sun zone, violet
 flare, blue moon, magenta clipped pixels), warped through the same lookup.
+The overlay checkbox governs the **FOV overlay** too: with it off the sky view
+is the bare composite, with no footprints, camera labels, telemetry or
+sun/moon markers. The alt/az grid and the caption stay either way, so the
+frame time is always readable. Headless, `--no-outline` does the same.
 The composite always uses the **newest complete frame set** (the six
 coherent frames the shared AE meters); the caption shows its capture time
 and age. The chosen view is remembered across restarts.

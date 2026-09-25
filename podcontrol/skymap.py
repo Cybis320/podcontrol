@@ -589,12 +589,15 @@ class SkyRenderer:
         return min(max(x - 22, 4), self.grid.w - 120), y + 4
 
     def decorate(self, out, t=None, used=None, telem=None, drive=None, coherent=True, covered=None,
-                 bodies=True, title=True):
+                 bodies=True, title=True, labels=True):
         """Dynamic decorations, drawn in place (on top of the tints, so they
         stay legible): each camera's id, exposure / total gain and driving
-        badge at its field centre, sun/moon markers, the caption."""
+        badge at its field centre, sun/moon markers, the caption.
+
+        `labels` is the text half of the FOV overlay and goes with `outlines`;
+        the caption stays either way, so the frame time is always readable."""
         used = used if used is not None else self._used
-        for i, st in enumerate(self.pod):
+        for i, st in enumerate(self.pod if labels else []):
             lut = self.luts.get(st.id)
             if lut is None:
                 continue
@@ -630,7 +633,9 @@ class SkyRenderer:
     def render(self, imgs=None, paths=None, t=None, coherent=True, telem=None, drive=None, layers=None,
                show_grid=True, outlines=True, **kw):
         """Full render: (bgr, info). imgs/paths default to the newest complete
-        set; layers (see tinted) are optional."""
+        set; layers (see tinted) are optional. `outlines` draws the camera
+        footprints and pairs with `labels` (passed through to decorate): both
+        are the FOV overlay and are normally switched together."""
         with self._lock:
             if imgs is None:
                 imgs, paths, t, coherent = pod_frames(self.pod, decode=False)
@@ -659,7 +664,8 @@ if __name__ == "__main__":
     ap.add_argument("--feather", type=float, default=2.5, help="blend feather at frame edges (deg)")
     ap.add_argument("--mask-weight", type=float, default=0.02, help="blend weight of RMS-masked pixels (0 = never shown)")
     ap.add_argument("--no-grid", action="store_true")
-    ap.add_argument("--no-outline", action="store_true")
+    ap.add_argument("--no-outline", action="store_true",
+                    help="no FOV overlay: neither footprint outlines nor camera labels")
     ap.add_argument("--no-cache", action="store_true", help="rebuild the lookup tables")
     ap.add_argument("--out", default=os.path.join(frames.SCRATCH, "skymap.png"))
     ap.add_argument("--loop", type=float, default=0, help="re-render every N seconds (0 = once)")
@@ -678,7 +684,8 @@ if __name__ == "__main__":
     last_t = None
     while True:
         t0 = time.time()
-        img, info = renderer.render(show_grid=not args.no_grid, outlines=not args.no_outline)
+        img, info = renderer.render(show_grid=not args.no_grid, outlines=not args.no_outline,
+                                    labels=not args.no_outline)
         dt = time.time() - t0
         if info["t"] != last_t or not args.loop:
             cv2.imwrite(args.out, img)

@@ -577,7 +577,10 @@ class App(tk.Tk):
         check(g, "overlay", self.overlay, tip=
               "Tint the excluded zones and what drives the exposure, on the tiles and the sky view:\n"
               "red = RMS mask, orange = sun zone, violet = lens flare, blue = moon zone,\n"
-              "magenta = clipped pixels, cyan = the peak pixels on the driving camera.", padx=(0, 8))
+              "magenta = clipped pixels, cyan = the peak pixels on the driving camera.\n"
+              "On the sky view it also governs the FOV overlay: with it off you get the bare\n"
+              "composite, no camera footprints, labels, telemetry or sun/moon markers. The\n"
+              "alt/az grid and the caption stay, so the frame time is always readable.", padx=(0, 8))
         pair(g, "sun r", self.sun_radius, 0, 45, 1, 4, tip=
              "Radius of the exclusion disc around the sun, from the platepar and an ephemeris.\n"
              "Applied whenever the disc can touch the sky, so the glow around a just-set sun is\n"
@@ -896,7 +899,11 @@ class App(tk.Tk):
             driver = info.get("driver")
             drive = {sid: (sid == driver, (n[1] if n else None), (n[0] if n else None))
                      for sid, n in (info.get("needs") or {}).items()}
-        bgr, _ = r.render(imgs, paths, t, coherent, telem=poll, drive=drive, layers=layers)
+        # the overlay checkbox governs the FOV overlay too: with it off the sky
+        # view is the bare composite (plus the alt/az grid and the caption), no
+        # footprints, camera labels, telemetry or sun/moon markers
+        bgr, _ = r.render(imgs, paths, t, coherent, telem=poll, drive=drive, layers=layers,
+                          outlines=overlay_on, labels=overlay_on, bodies=overlay_on)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread
         return _fit_to(rgb, wh) if wh else rgb
