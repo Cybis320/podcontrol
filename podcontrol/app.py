@@ -864,7 +864,10 @@ class App(tk.Tk):
         file its tile shows (the usual case), its layers are reused as they
         are, so the overlay adds no per-cycle work."""
         r = self.sky_r
-        if not r.ready and not r.ensure():
+        # ensure() every cycle, not just until ready: it is how an edited mask or
+        # platepar reaches the sky view. Steady state it stats two files per
+        # station and returns, so the cost is noise against the ~5 ms cycle.
+        if not r.ensure():
             return ("no platepar found: the sky view needs the stations' RMS platepars",)
         overlay_on = self.overlay.get()
         imgs, paths, t, coherent = skymap.pod_frames(self.stations, decode=False)

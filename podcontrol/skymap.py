@@ -249,6 +249,34 @@ def build_lut(station, grid, feather_deg=2.5, mask_weight=0.02):
 
 _LUTS = {}
 _BUILD_LOCK = threading.Lock()
+CACHE_KEEP = 3          # LUT files kept per station on disk
+
+
+def _prune_cache(station_id, keep=CACHE_KEEP):
+    """Keep only the newest `keep` LUT files for a station.
+
+    A LUT is ~600-900 kB and every mask edit, platepar update or map size makes
+    a new one, so without this the cache grows without bound (26 MB by
+    2026-09-25). Keeping a few rather than only the current one means the app's
+    map size and the CLI's do not evict each other. Each delete is guarded on
+    its own: a single odd directory entry used to abort the whole sweep."""
+    try:
+        names = [n for n in os.listdir(CACHE_DIR)
+                 if n.startswith(station_id + "_") and n.endswith(".npz")]
+    except OSError:
+        return
+    dated = []
+    for n in names:
+        f = os.path.join(CACHE_DIR, n)
+        try:
+            dated.append((os.path.getmtime(f), f))
+        except OSError:
+            continue
+    for _, f in sorted(dated, reverse=True)[keep:]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 
 def lut_for(station, grid, feather_deg=2.5, mask_weight=0.02, cache=True):
@@ -279,6 +307,7 @@ def lut_for(station, grid, feather_deg=2.5, mask_weight=0.02, cache=True):
                 if cache:
                     os.makedirs(CACHE_DIR, exist_ok=True)
                     lut.save(path)
+                    _prune_cache(station.id)
                 print("skymap: %s LUT built in %.1fs (%.1f%% of the map)" % (
                     station.id, time.time() - t0, 100.0 * lut.covered.mean()))
             except Exception as e:
@@ -410,6 +439,7 @@ class SkyRenderer:
         self.by_id = {st.id: st for st in self.pod}
         self.feather_deg, self.mask_weight = float(feather_deg), float(mask_weight)
         self.luts = {}
+        self._lut_keys = {}            # sid -> the key its LUT was built from (mask/platepar stamps)
         self._wcache = {}              # frozenset(ids) -> (wnorm per id, covered, covered fraction)
         self._base_key, self._base, self._used = None, None, []
         self._static_small = {}        # sid -> small bool of the station's RMS mask (static)
@@ -424,11 +454,37 @@ class SkyRenderer:
 
     def ensure(self):
         """Load or build every station's LUT (seconds per station the first
-        time, then from the disk cache). Call from a background thread."""
+        time, then from the disk cache). Call from a background thread.
+
+        Also notices an edited mask or platepar. The LUT bakes the mask into
+        its blend weights and the overlay keeps a downscaled copy, both keyed
+        by station id, so without this an edit showed up on the tiles at once
+        (frames.load_mask reloads on mtime) and never on the sky view until a
+        restart. The key carries the mask and platepar stamps, so comparing it
+        each call costs two stats per station and catches the edit."""
         for st in self.pod:
-            if st.id not in self.luts:
-                self.luts[st.id] = lut_for(st, self.grid, self.feather_deg, self.mask_weight)
+            key = _lut_key(st, self.grid, self.feather_deg, self.mask_weight)
+            if st.id in self.luts and self._lut_keys.get(st.id) == key:
+                continue
+            rebuilt = st.id in self.luts        # a change, not the first load
+            self.luts[st.id] = lut_for(st, self.grid, self.feather_deg, self.mask_weight)
+            self._lut_keys[st.id] = key
+            self._drop_cached(st.id)
+            if rebuilt:
+                print("skymap: %s rebuilt (mask or platepar changed)" % st.id)
         return self.ready
+
+    def _drop_cached(self, sid=None):
+        """Forget everything derived from a station's LUT or mask."""
+        self._wcache.clear()
+        self._base_key, self._base = None, None
+        self._ov_key, self._ov = None, None
+        if sid is None:
+            self._static_small.clear()
+            self._ov_small.clear()
+        else:
+            self._static_small.pop(sid, None)
+            self._ov_small.pop(sid, None)
 
     def _weights(self, ids):
         """Normalised blend weight per camera for this set of cameras (static;
