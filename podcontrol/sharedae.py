@@ -43,6 +43,8 @@ if __name__ == "__main__" and not __package__:
 
 import math, re, time
 
+from podcontrol import skybright
+
 
 class AEConfig:
     line_us = 29.63             # sensor LINE time (25 fps, VMAX~1350) -- exposure is
@@ -87,6 +89,15 @@ class AEConfig:
                                 # law settles the last fraction of a stop
     startup_max_s = 600.0       # the startup phase ends when the pod first reaches a
                                 # post-takeover target, or after this long
+    # Sky prior (skybright). Metering is up to ~50 s stale, so on a moving sky
+    # the pod lags by rate x latency however fast the slew is: measured 0.28
+    # stop at sun -4.4 deg on 2026-09-24, growing. The prior says how much the
+    # sky moved between a frame's capture and now (so a stale frame is read
+    # correctly) and how far it will move this cycle (so the pod travels with
+    # it). The ABSOLUTE level still comes only from the frames; the prior only
+    # ever supplies a DIFFERENCE, capped, and never acts while latched.
+    sky_feedforward = True
+    ff_max_step = 0.25          # stops the prior may move the pod in one cycle
     night_switch_deg = -9.0     # RMS CaptureModeSwitcher SWITCH_HORIZON_DEG (colour/mono, _d/_n);
                                 # RMS writes its night line here -- we re-pin and keep driving.
                                 # Overwritten from RMS at import (see below).
@@ -177,6 +188,9 @@ class SharedAE:
         self.startup = False                 # fast phase after a takeover (see step)
         self.fast = False                    # last step ran at slew_fast
         self.driver_li_f = None              # light index the driver's frame was captured at
+        self._sun_t = 0.0                    # epoch of the last sun update
+        self.sun_rate = 0.0                  # deg/s, smoothed, for dead-reckoning the sun
+        self._ff_alt = None                  # sun altitude at the previous feed-forward
 
     # --- ladder geometry (all in stops above (exp_min, gain 1x)) -----------
     def _exp_stops(self):
@@ -251,12 +265,33 @@ class SharedAE:
         if not lis:
             return None
         self.li = self.target = max(0.0, min(min(lis), self._max_li()))
+        self._ff_alt = None                  # no feed-forward across a takeover
         self.last = {}
         self.startup = True                  # converge fast from wherever we start
         self.t_seed = time.time()
         self.hist = [(self.t_seed, self.li)]
         self._applied_li = None
         return self.li
+
+    def sun_alt_at(self, t):
+        """Sun altitude at epoch t, dead-reckoned from the last update. Over a
+        frame-latency window (under a minute) a straight line is well inside
+        the accuracy the prior needs."""
+        if self.sun_alt is None or not self._sun_t or t is None:
+            return None
+        return self.sun_alt + self.sun_rate * (t - self._sun_t)
+
+    def sky_drift(self, t_from, t_to=None):
+        """Stops the sky has moved between two epochs, per the prior. 0 when
+        the prior is off, the sun is unknown, or we are latched (RMS owns the
+        night and nothing here may move the pod)."""
+        if not self.cfg.sky_feedforward or self.latched:
+            return 0.0
+        a0 = self.sun_alt_at(t_from)
+        a1 = self.sun_alt if t_to is None else self.sun_alt_at(t_to)
+        if a0 is None or a1 is None:
+            return 0.0
+        return skybright.li_delta(a0, a1)
 
     def li_at(self, t):
         """Light index in effect when a frame was captured at epoch t (our last
@@ -322,7 +357,14 @@ class SharedAE:
         return li
 
     def update_sun(self, alt_deg, rising):
-        """Feed the sun altitude (deg) and whether it is rising; sets state."""
+        """Feed the sun altitude (deg) and whether it is rising; sets state.
+        Also keeps a smoothed altitude rate so the sun can be dead-reckoned
+        back to a frame's capture time without another ephemeris call."""
+        now = time.time()
+        if self._sun_t and now > self._sun_t and self.sun_alt is not None:
+            r = (alt_deg - self.sun_alt) / (now - self._sun_t)
+            self.sun_rate = r if not self.sun_rate else 0.8 * self.sun_rate + 0.2 * r
+        self._sun_t = now
         self.sun_alt, self.sun_rising = alt_deg, bool(rising)
         c = self.cfg
         if self.latched:
@@ -444,7 +486,9 @@ class SharedAE:
             d, why = min(c.max_step, c.kp * (c.peak_ceiling - peak) / c.peak_ceiling), "headroom"
         else:
             d, why = 0.0, "at target"
-        t_new = li_f + d
+        # The frame is up to ~50 s old: correct its target for how much the sky
+        # has moved since it was captured, so the pod aims at the sky NOW.
+        t_new = li_f + d + self.sky_drift(t)
         if t_new < 0.0 and c.wb_lever and self.wb_base:
             # about to enter the WB rung from above the floor: the same guard
             # as on the rung. Until 2026-09-16 only frames captured AT the
@@ -525,6 +569,16 @@ class SharedAE:
                          "needs": {}, "changed": self._applied_li is None, "state": self.state}
             return self.last
         self.evaluate(metering)
+        # FEED-FORWARD: travel with the sky so the slew only has to correct the
+        # residual. Capped, and skipped entirely while latched or sunless.
+        ff = 0.0
+        if c.sky_feedforward and self.sun_alt is not None:
+            if self._ff_alt is not None:
+                ff = skybright.li_delta(self._ff_alt, self.sun_alt)
+                ff = max(-c.ff_max_step, min(c.ff_max_step, ff))
+                if ff:
+                    self.li = max(self._min_li(), min(self.li + ff, self._max_li()))
+            self._ff_alt = self.sun_alt
         target = self.target
         ramp = self._dusk_ramp_target()
         if ramp is not None and ramp > target:
@@ -599,7 +653,7 @@ class SharedAE:
                      "needs": {k: (v[0] - self.li, v[1]) for k, v in
                                list(self.needs.items()) + list(self.followers.items())},
                      "state": self.state, "ramp": ramp, "wb_scale": self.wb_scale_for(self.li),
-                     "fast": fast, "startup": self.startup,
+                     "fast": fast, "startup": self.startup, "ff": ff,
                      "wb_unconfirmed": list(self.wb_unconfirmed),
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last

@@ -506,6 +506,54 @@ its 1.99x ceiling, but gets there by mixing channels. Both reach true mono at
 `satu 0`, which means leaving `matrix identity` installed does not interfere
 with RMS's mono night.
 
+## Tracking the sky at dawn and dusk
+
+Metering is up to ~50 s stale: the shared AE uses the newest COMPLETE frame set
+and judges each frame at the light index that was in force when it was
+captured. That is exactly right for a steady sky and increasingly wrong for a
+moving one, because the pod ends up aiming at the sky as it *was*. The lag is
+rate times latency however fast the slew is. Measured at dusk on 2026-09-24:
+
+| Sun altitude | Sky demanded | Reported error |
+|---|---|---|
+| −1° | 0.10 stop/min | 0.006 stop |
+| −3° | 0.13 stop/min | 0.012 stop |
+| −4.4° | 0.20 stop/min | 0.11 stop |
+
+and the true lag is that plus rate × latency, so about 0.28 stop at −4.4° and
+still growing: the rate roughly doubles again by −8°.
+
+So `skybright.py` carries an analytic **prior** for how fast the sky changes
+with sun altitude — the standard twilight curve, 0.6–0.8 magnitudes per degree
+of solar depression through civil and nautical twilight, steepest near −8°,
+flattening past −18°. It brackets what this pod actually showed (measured 0.31
+stop/deg at −1.5°, 0.45 at −2.5°, 0.87 at −3.75°, against 0.36 / 0.50 / 0.75
+from the table). It is used two ways:
+
+- **Latency correction.** Each frame's target is corrected for how much the sky
+  moved between its capture and now, so a stale frame is read for the sky it
+  actually describes.
+- **Feed-forward.** The pod travels with the predicted change each cycle, so
+  the slew only has to correct the residual rather than chase the whole ramp.
+
+The prior never sets the level. It only ever supplies a *difference*, it is
+capped at `ff_max_step` (0.25 stop per cycle), and it is inert while latched,
+when the sun is unknown, or with `sky_feedforward = False`. A wrong prior costs
+the closed loop a little extra work; it cannot run the exposure on its own.
+There is no learning: the absolute anchor is always the current measurement.
+
+Simulated over a dusk ramp with 50 s latency:
+
+| Sky versus the prior | Mean lag off | Mean lag on | Below −4°, off → on |
+|---|---|---|---|
+| exactly right | 0.52 stop | 0.19 | 0.77 → 0.20 |
+| 1.5× faster | 1.05 | 0.18 | 1.62 → 0.19 |
+| 0.6× slower | 0.20 | 0.30 | 0.23 → 0.36 |
+
+So it helps most where the sky moves fastest, and when the prior overestimates
+the cost is bounded to a few tenths of a stop of overshoot that the loop pulls
+back.
+
 ## Settings
 
 Toolbar values (refresh, slew, clip threshold, point-source tolerance,
