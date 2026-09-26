@@ -753,6 +753,10 @@ class App(tk.Tk):
                                         wb_scale_fn=self.ae.wb_scale_at)
                 ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
                 self.ae_slot = slot
+                # RMS's dawn `auto` ends our control silently: give up the latch
+                # before stepping, or we hold the night ceiling while the
+                # cameras fan out on their own AE.
+                self.ae.note_cameras(poll)
                 info = self.ae.step(ctl)       # target from the set, one small slew step
                 if info.get("changed") or self.ae.repin_needed(poll):
                     try:
@@ -876,7 +880,7 @@ class App(tk.Tk):
         if not r.ensure():
             return ("no platepar found: the sky view needs the stations' RMS platepars",)
         overlay_on = self.overlay.get()
-        imgs, paths, t, coherent = skymap.pod_frames(self.stations, decode=False)
+        imgs, paths, t, spread = skymap.pod_frames(self.stations, decode=False)
         if not paths:
             return None
         layers = None
@@ -911,7 +915,7 @@ class App(tk.Tk):
         # the overlay checkbox governs the FOV overlay too: with it off the sky
         # view is the bare composite (plus the alt/az grid and the caption), no
         # footprints, camera labels, telemetry or sun/moon markers
-        bgr, _ = r.render(imgs, paths, t, coherent, telem=poll, drive=drive, layers=layers,
+        bgr, _ = r.render(imgs, paths, t, spread, telem=poll, drive=drive, layers=layers,
                           outlines=overlay_on, labels=overlay_on, bodies=overlay_on)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread

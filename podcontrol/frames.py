@@ -397,6 +397,16 @@ def mask_for(station, img, t=None, layers=False):
 # a different moment).
 SET_SLOT_S = 5.0
 SET_MAX_AGE_S = 180.0
+# RMS lands every frame within ~20 ms of its 5 s boundary, so the slot grid is
+# exact. What it does NOT do is save every slot: measured 2026-09-26 over 233
+# minutes, each camera was present in only ~21% of slots, and all six coincided
+# in a slot 0% of the time. Requiring a complete set therefore starved the AE of
+# metering for hours at a stretch. A set is now built with a tolerance: each
+# camera contributes its frame nearest the slot within SET_TOL_S, and a quorum
+# is enough. At dawn the sky moves ~0.25 deg of solar altitude per minute, so a
+# 10 s spread is under 0.05 stops of sky brightness -- far below the deadband.
+SET_TOL_S = 10.0           # how far from the slot a camera's frame may sit
+SET_MIN_CAMS = 3           # cameras needed before a slot counts as a set
 _STATS_CACHE = {}          # path -> luma stats (frames are immutable once written)
 
 
@@ -406,22 +416,41 @@ def recent_rms_frames(station, max_age=SET_MAX_AGE_S):
     return [(t, p) for t, p in scan_station(station) if now - t <= max_age]
 
 
-def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
-    """(slot_epoch, {station_id: path}) for the newest slot where EVERY active
-    station (one with any frame within max_age) has a frame; (None, {}) if
-    no such slot. Stations without saved frames are not part of sets."""
+def newest_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S,
+               tol_s=SET_TOL_S, min_cams=SET_MIN_CAMS):
+    """(slot_epoch, {station_id: path}, spread_s) for the newest slot that at
+    least min_cams cameras can serve, each with its frame nearest the slot and
+    no further than tol_s from it. spread_s is the widest gap between the
+    chosen frames' capture times, so a caller can say how coherent the set is.
+    (None, {}, 0.0) when nothing qualifies.
+
+    tol_s = 0 with min_cams = len(stations) reproduces the old strict
+    "every camera in one slot" behaviour."""
     per = {}
     for st in stations:
         fr = recent_rms_frames(st, max_age)
         if fr:
-            per[st.id] = {round(t / slot_s) * slot_s: p for t, p in fr}
+            per[st.id] = {round(t / slot_s) * slot_s: (t, p) for t, p in fr}
     if not per:
-        return None, {}
-    common = set.intersection(*(set(d.keys()) for d in per.values()))
-    if not common:
-        return None, {}
-    slot = max(common)
-    return slot, {sid: per[sid][slot] for sid in per}
+        return None, {}, 0.0
+    if min_cams > len(per):
+        min_cams = len(per)
+    for slot in sorted({k for d in per.values() for k in d}, reverse=True):
+        chosen = {}
+        for sid, d in per.items():
+            near = [(abs(k - slot), k) for k in d if abs(k - slot) <= tol_s]
+            if near:
+                chosen[sid] = d[min(near)[1]]
+        if len(chosen) >= min_cams:
+            ts = [t for t, _ in chosen.values()]
+            return slot, {sid: p for sid, (_, p) in chosen.items()}, max(ts) - min(ts)
+    return None, {}, 0.0
+
+
+def newest_complete_set(stations, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S):
+    """Back-compat: (slot_epoch, {station_id: path}) from newest_set."""
+    slot, paths, _ = newest_set(stations, slot_s, max_age)
+    return slot, paths
 
 
 def stats_for_path(station, path, t, wb_scale=1.0):
@@ -449,33 +478,53 @@ def F_SUN_RADIUS():
     return SUN_RADIUS_DEG[0]
 
 
-def meter_set(stations, allow_grab=False, wb_scale_fn=None):
-    """Pod metering on the newest complete frame set: ({station_id: stats+t},
-    slot_epoch). Stations that save no frames (RMS idle) are metered from a
-    one-shot grab (t = now) only if allow_grab; otherwise skipped.
-    wb_scale_fn(slot_epoch) -> the WB attenuation in effect when the set was
-    captured (shared AE's WB rung), for channel-aware clipping."""
-    slot, paths = newest_complete_set(stations)
-    ws = 1.0
-    if slot and wb_scale_fn:
+def meter_set(stations, allow_grab=False, wb_scale_fn=None, max_age=SET_MAX_AGE_S):
+    """Pod metering: ({station_id: stats + t + path}, newest_capture_epoch).
+
+    Every camera is metered on ITS OWN newest saved frame, each carrying that
+    frame's capture time. It used to need one slot every camera had saved, which
+    starved the controller completely whenever that coincidence failed -- and it
+    fails nearly always: measured over 233 minutes on 2026-09-26, all six
+    cameras shared a slot in 0% of them, so the AE ran blind for four hours and
+    sat latched at the night ceiling straight through dawn.
+
+    Frames of different ages are safe here because the controller does not
+    assume simultaneity: SharedAE._need judges each frame at the light index
+    that was in effect when it was captured (li_at) and step() adds the analytic
+    sky drift between then and now. A per-camera capture time is in fact more
+    correct than a shared slot, since the sun mask is then placed at the instant
+    that camera exposed.
+
+    Stations that save no frames (RMS idle) are metered from a one-shot grab
+    (t = now) only if allow_grab; otherwise skipped. wb_scale_fn(t) -> the WB
+    attenuation in effect at t (shared AE's WB rung), for channel-aware
+    clipping, asked per frame rather than once for the set."""
+    def ws_at(t):
+        if not wb_scale_fn:
+            return 1.0
         try:
-            ws = float(wb_scale_fn(slot))
+            return float(wb_scale_fn(t))
         except Exception:
-            ws = 1.0
-    out = {}
+            return 1.0
+    out, newest = {}, None
     for st in stations:
-        if st.id in paths:
-            s = stats_for_path(st, paths[st.id], slot, ws)
+        fr = recent_rms_frames(st, max_age)
+        if fr:
+            t, path = fr[0]                       # newest first
+            s = stats_for_path(st, path, t, ws_at(t))
             if s is not None:
-                out[st.id] = dict(s, t=slot, path=paths[st.id])
+                out[st.id] = dict(s, t=t, path=path)
+                newest = t if newest is None else max(newest, t)
         elif allow_grab and not rms_active(st):
             img = grab_rtsp(st.ip)
             keep, lay = mask_for(st, img, layers=True)
             s = luma_stats(img, keep)
             if s is not None:
                 si = (lay or {}).get("sun_info") or {}
-                out[st.id] = dict(s, t=time.time(), sun_in_fov=bool(si.get("in_fov")))
-    return out, slot
+                now = time.time()
+                out[st.id] = dict(s, t=now, sun_in_fov=bool(si.get("in_fov")))
+                newest = now if newest is None else max(newest, now)
+    return out, newest
 
 
 _HL_CACHE = {}

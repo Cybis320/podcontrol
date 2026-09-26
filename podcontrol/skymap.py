@@ -10,7 +10,7 @@ projection, so every candidate is verified by a round trip through
 xyToRaDecPP (genuine pixels agree to ~0.001 deg, folded ones by >100 deg).
 
 The composite is one cv2.remap per camera on the newest COMPLETE frame set
-(frames.newest_complete_set: one capture time for all cameras), blended
+(each camera's newest saved frame, with the spread reported), blended
 where fields overlap with feathered weights (0 at a frame edge, 1 a few
 degrees in) so seams fade; pixels under the station's RMS mask get a tiny
 weight so an unmasked neighbour wins there but the area is still filled when
@@ -347,23 +347,31 @@ def small_frame(img, path, size):
 
 def pod_frames(pod, decode=True):
     """({station_id: bgr_or_None}, {station_id: path}, capture_epoch_or_None,
-    coherent): the newest complete set when there is one, else each
-    station's newest saved frame (coherent=False: mixed capture times).
+    spread_s): every camera contributes its OWN newest saved frame, so the
+    composite keeps full sky coverage even when RMS has not saved the same
+    instant everywhere -- which is the normal case, not the exception: over 233
+    minutes on 2026-09-26 all six shared a 5 s slot in 0% of them, so insisting
+    on one instant meant permanently falling back to this anyway.
+
+    The fourth value is the SPREAD in seconds between the oldest and newest
+    chosen frame. It replaces the old coherent flag, which was a bool that read
+    as "MIXED TIMES" on the map and left the operator guessing whether it meant
+    the cameras disagreed about their settings. A number of seconds says what it
+    is: how far apart in time the frames making up this picture were taken.
+
     decode=False leaves the images None (compose() decodes a file only when
     its downscaled version is not cached yet)."""
-    slot, paths = frames.newest_complete_set(pod)
-    if slot:
-        imgs = {sid: (frames.imread_cached(p) if decode else None) for sid, p in paths.items()}
-        return imgs, paths, slot, True
-    imgs, paths, ts = {}, {}, []
+    paths, ts = {}, {}
     for st in pod:
-        img, src, t, p = frames.frame_for(st, allow_grab=False, with_path=True)
-        if img is not None:
-            imgs[st.id] = img
-            paths[st.id] = p
-            if t:
-                ts.append(t)
-    return imgs, paths, (max(ts) if ts else None), False
+        fr = frames.recent_rms_frames(st)
+        if fr:
+            t, p = fr[0]                     # newest first
+            paths[st.id], ts[st.id] = p, t
+    if not paths:
+        return {}, {}, None, 0.0
+    imgs = {sid: (frames.imread_cached(p) if decode else None) for sid, p in paths.items()}
+    newest = max(ts.values())
+    return imgs, paths, newest, newest - min(ts.values())
 
 
 def _text(img, s, xy, scale=0.45, colour=TEXT_COLOUR, thick=1):
@@ -644,7 +652,7 @@ class SkyRenderer:
         x, y = lut.centre_xy
         return min(max(x - 22, 4), self.grid.w - 120), y + 4
 
-    def decorate(self, out, t=None, used=None, telem=None, drive=None, coherent=True, covered=None,
+    def decorate(self, out, t=None, used=None, telem=None, drive=None, spread=0.0, covered=None,
                  bodies=True, title=True, labels=True):
         """Dynamic decorations, drawn in place (on top of the tints, so they
         stay legible): each camera's id, exposure / total gain and driving
@@ -682,11 +690,12 @@ class SkyRenderer:
             else:
                 when = "no frame time"
             _text(out, "%s%s  %d/%d cameras%s" % (
-                when, "" if coherent else " MIXED TIMES", len(used), len(self.pod),
+                when, ("  frames span %ds" % int(round(spread))) if (spread or 0) > frames.SET_SLOT_S * 1.5 else "",
+                len(used), len(self.pod),
                 ("  sky covered %.0f%%" % (100 * covered)) if covered is not None else ""),
                   (6, self.grid.h - 8), 0.45)
 
-    def render(self, imgs=None, paths=None, t=None, coherent=True, telem=None, drive=None, layers=None,
+    def render(self, imgs=None, paths=None, t=None, spread=0.0, telem=None, drive=None, layers=None,
                show_grid=True, outlines=True, **kw):
         """Full render: (bgr, info). imgs/paths default to the newest complete
         set; layers (see tinted) are optional. `outlines` draws the camera
@@ -694,13 +703,13 @@ class SkyRenderer:
         are the FOV overlay and are normally switched together."""
         with self._lock:
             if imgs is None:
-                imgs, paths, t, coherent = pod_frames(self.pod, decode=False)
+                imgs, paths, t, spread = pod_frames(self.pod, decode=False)
             self.ensure()
             base, used = self.compose(imgs, paths, show_grid, outlines)
             out = (self.tinted(base, layers) if layers else base).copy()
             covered = self._weights(frozenset(used))[2] if used else 0.0
-            self.decorate(out, t, used, telem, drive, coherent, covered, **kw)
-            return out, {"t": t, "used": used, "coherent": coherent, "covered": covered}
+            self.decorate(out, t, used, telem, drive, spread, covered, **kw)
+            return out, {"t": t, "used": used, "spread": spread, "covered": covered}
 
 
 def render(pod, grid=None, imgs=None, t=None, feather_deg=2.5, mask_weight=0.02, **kw):
@@ -749,7 +758,8 @@ if __name__ == "__main__":
             print("wrote %s  (%dx%d, %d/%d cameras, frames %s%s, sky covered %.0f%%, render %.0f ms)" % (
                 args.out, img.shape[1], img.shape[0], len(info["used"]), len(pod),
                 time.strftime("%H:%M:%S UTC", time.gmtime(info["t"])) if info["t"] else "?",
-                "" if info["coherent"] else " MIXED TIMES", 100 * info["covered"], 1000 * dt))
+                ("  spread %ds" % int(round(info["spread"]))) if info["spread"] else "",
+                100 * info["covered"], 1000 * dt))
         if not args.loop:
             break
         time.sleep(max(1.0, args.loop))

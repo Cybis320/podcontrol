@@ -658,20 +658,57 @@ class SharedAE:
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
 
+    def note_cameras(self, poll):
+        """Call with each fresh poll, before step(). Notices RMS taking the pod
+        back and gives up the latch so we start driving again.
+
+        At the dawn switch (sun crossing -9 rising) RMS writes its day line,
+        which is `auto`: control passes to each camera's own AE and the pod
+        fans out, bounded by the camera's own route (44.8x here) rather than by
+        the night-calibrated ceiling. We were still latched, and while latched
+        repin_needed returned early, so nothing reclaimed the cameras -- the pod
+        free-ran from 12:38 to 12:55 on 2026-09-26 with gains from 3.8x to 32x.
+
+        Deep night is left alone deliberately. A camera in AUTO there is an
+        anomaly (a reboot, say) and the right answer is to re-pin it to the
+        night line, which is what staying latched makes apply() do. Only a
+        handover at dawn should drop the latch."""
+        if not self.latched:
+            return False
+        if not any(d.get("online") and (d.get("optype") or "").upper() == "AUTO"
+                   for d in poll.values()):
+            return False
+        c = self.cfg
+        if self.sun_alt is not None and not self.sun_rising and self.sun_alt < c.latch_deg:
+            return False
+        self.latched = False
+        self.state = "dawn"
+        self._ramp_from = None
+        return True
+
     def repin_needed(self, poll, tol=0.06):
-        """True if a camera no longer holds what we last applied while we are
-        driving (not latched): RMS's -9 deg night write (MANUAL, night line),
-        its dawn `auto`, a reboot... The caller re-applies so at most one frame
-        deviates. Compares op type AND live exposure/gain values."""
-        if self.latched or self._applied_li is None:
+        """True if a camera no longer holds what we last applied: RMS's -9 deg
+        night write (MANUAL, night line), its dawn `auto`, a reboot... The
+        caller re-applies so at most one frame deviates. Compares op type AND
+        live exposure/gain values."""
+        if self._applied_li is None:
+            return False
+        # A camera in AUTO is not under our control whatever the latch state.
+        # This test used to sit behind an early `if self.latched: return False`,
+        # so the dawn `auto` this docstring names was the one case it could
+        # never catch: at dawn we are latched by definition until metering
+        # releases us. note_cameras() drops the latch first, and this keeps the
+        # night case working, where re-pinning the night line is the right fix.
+        for d in poll.values():
+            if d.get("online") and (d.get("optype") or "").upper() == "AUTO":
+                return True
+        if self.latched:
             return False
         exp, analog, boost = self._li_to_exp_gain(self._applied_li)
         ws = self._applied_wb_scale
         for d in poll.values():
             if not d.get("online"):
                 continue
-            if (d.get("optype") or "").upper() == "AUTO":
-                return True
             # While the rung is engaged, WB is ours and must be EXACT on every
             # camera: the old test allowed 5% on red, about thirteen 1/256 steps,
             # so a camera one or two steps behind never looked wrong and never got
@@ -799,6 +836,7 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
             poll = pod.poll_all(timeout=4)
             feed_sun(ae, pod)
             m = {sid: v for sid, v in meter_fn().items() if poll.get(sid, {}).get("online")}
+            ae.note_cameras(poll)            # RMS's dawn `auto` ends our control
             info = ae.step(m)
             if info["changed"] or ae.repin_needed(poll):
                 ae.apply(platform=_pod_platform(poll))
