@@ -21,4 +21,6 @@ cc_pip_install "$PY" "$DEST" "PIL:Pillow"
 # fix for a dawn handover fault sat in the checkout while the running app still
 # had the bug. The updater only runs this hook when HEAD actually moved, so this
 # is one restart per new commit, not one per hour.
-"$DEST/scripts/restart-app.sh" || cc_warn "restart failed; the old code is still running"
+# A failed restart may have stopped the app without bringing it back, so fail
+# the hook: the updater then retries next hour instead of marking this applied.
+"$DEST/scripts/restart-app.sh" || { cc_warn "restart failed -- Pod Control may not be running"; exit 1; }

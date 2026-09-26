@@ -46,9 +46,14 @@ CC_TOOL=podcontrol
 
 [ "${CC_NO_RESTART:-0}" = "1" ] && { cc_info "CC_NO_RESTART=1 -- not restarting"; exit 0; }
 
-# A GUI relaunched from cron needs the session's display and bus. The user's
-# crontab carries DISPLAY/XAUTHORITY; this fills in DBUS.
-cc_session_env
+# A GUI relaunched from cron needs the session's display and bus, and cron
+# has neither: the crontab sets no DISPLAY/XAUTHORITY. On 2026-09-26 the first
+# post-update restart stopped the app and relaunched it without a display; Tk
+# died on the spot and the pod was left with no controller at all. So the
+# replacement inherits these from the process it replaces (session_env_from),
+# and cc_session_env fills in DBUS if that did not.
+SESSION_VARS="DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS"
+LAUNCH_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/podcontrol-restart.log"
 
 # Every way podcontrol is started: the console script, or `python -m podcontrol`
 # (what the autostart entry and the desktop launcher use).
@@ -91,6 +96,20 @@ find_pids() {
     done
 }
 
+# Export the running app's session variables, so its replacement opens on
+# the same display. Fails when the app has a display but we still cannot reach
+# one -- the caller must then leave the app running rather than stop it.
+session_env_from() {
+    local pid="$1" line v
+    while IFS= read -r -d '' line; do
+        for v in $SESSION_VARS; do
+            case "$line" in "$v="*) export "$line" ;; esac
+        done
+    done < "/proc/$pid/environ"
+    cc_session_env
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
+}
+
 restart_one() {
     local pid="$1" i cwd exe now_pid
     local -a argv
@@ -110,8 +129,12 @@ restart_one() {
     command -v "$exe" >/dev/null 2>&1 || [ -x "$exe" ] || {
         cc_warn "pid $pid: cannot re-exec ${exe} -- leaving it running"; return 1; }
 
+    if ! session_env_from "$pid"; then
+        cc_warn "pid $pid: no display to relaunch on -- leaving it running"; return 1
+    fi
+
     if [ "$DRY" = "1" ]; then
-        cc_info "would restart pid $pid in $cwd: ${argv[*]}"
+        cc_info "would restart pid $pid in $cwd on ${DISPLAY:-$WAYLAND_DISPLAY}: ${argv[*]}"
         return 0
     fi
 
@@ -128,7 +151,11 @@ restart_one() {
     fi
 
     # setsid so the new app outlives this script and its cron parent.
-    ( cd "$cwd" && setsid nohup "${argv[@]}" >/dev/null 2>&1 & ) || {
+    # Its output goes to a log, not /dev/null: a relaunch that dies at startup
+    # otherwise leaves nothing to say why.
+    mkdir -p "$(dirname "$LAUNCH_LOG")"
+    echo "$(date -u +%FT%TZ) relaunch: ${argv[*]} (DISPLAY=${DISPLAY:-})" >> "$LAUNCH_LOG"
+    ( cd "$cwd" && setsid nohup "${argv[@]}" >>"$LAUNCH_LOG" 2>&1 < /dev/null & ) || {
         cc_warn "relaunch failed: ${argv[*]}"; return 1; }
     for ((i = 0; i < START_WAIT; i++)); do
         sleep 1
@@ -141,7 +168,7 @@ restart_one() {
             fi
         done
     done
-    cc_warn "Pod Control did not come back within ${START_WAIT}s: ${argv[*]}"
+    cc_warn "Pod Control did not come back within ${START_WAIT}s: ${argv[*]} (see $LAUNCH_LOG)"
     return 1
 }
 
