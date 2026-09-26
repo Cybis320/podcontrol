@@ -35,6 +35,7 @@ from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, hig
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
 from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
+from podcontrol import version as VERSION
 from podcontrol.colour import cct_from_gains, gains_from_cct
 from podcontrol import skymap
 
@@ -363,7 +364,7 @@ class Tile(tk.Frame):
 class App(tk.Tk):
     def __init__(self, allow_grab=True):
         super().__init__()
-        self.title("Pod Control — pod as one camera")
+        self.title("Pod Control %s — pod as one camera" % VERSION.short())
         self.configure(bg=BG)
         self.geometry("1400x820")
         self.minsize(720, 460)
@@ -380,7 +381,7 @@ class App(tk.Tk):
         # a live pod); the loop still meters and shows what it WOULD do
         self.dry = bool(os.environ.get("PODCONTROL_DRY"))
         if self.dry:
-            self.title("Pod Control — DRY RUN (no camera writes)")
+            self.title("Pod Control %s — DRY RUN (no camera writes)" % VERSION.short())
             self.pod.manual_all = lambda *a, **k: {}
             self.pod.release = lambda *a, **k: {}
             self.pod.auto_all = lambda *a, **k: {}
@@ -446,6 +447,17 @@ class App(tk.Tk):
         self._pool = ThreadPoolExecutor(max_workers=12)
 
         # tiles scale with the window: equal-weight grid cells, tiles sticky
+        # ---- top strip: what code is running, in the top right corner ------
+        # Packed first, so both views (which pack before the toolbar) sit under
+        # it. Shows the revision THIS process loaded, so after the hourly
+        # updater pulls it keeps reading the old commit until the app restarts.
+        # That is the whole point: it answers "did the update get picked up?".
+        top = tk.Frame(self, bg=BG); top.pack(fill="x", padx=8, pady=(4, 0))
+        self.ver_lbl = tk.Label(top, text=VERSION.short(), fg="#6d6350", bg=BG,
+                                font=(MONO, 8), anchor="e")
+        self.ver_lbl.pack(side="right")
+        Tip(self.ver_lbl, VERSION.detail())
+
         grid = tk.Frame(self, bg=BG); grid.pack(fill="both", expand=True, padx=8, pady=8)
         rows = (len(self.stations) + COLS - 1) // COLS
         for c in range(COLS):
