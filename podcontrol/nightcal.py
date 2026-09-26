@@ -10,9 +10,22 @@ and ISP gain, and at every step asks the camera for `noise_stats` -- venc
 measures the sky background and its frame-to-frame noise itself, on the
 uncompressed picture, so no second RTSP stream is opened while RMS captures.
 The figure of merit is the noise-equivalent flux (noise divided by total gain):
-how faint a signal each gain can still separate from the sky. The chosen gain
-is the lowest one whose noise-equivalent flux is within `tol` of the top
-gain's. One value goes to the whole pod: the HIGHEST of the per-camera choices,
+how faint a signal each gain can still separate from the sky. The reported gain
+is the right divisor: on .102 (CV300, 2026-09-26) the response measured as the
+40 ms - 20 ms background difference tracked the reported gain within 2% from
+5.6x to 22x. The background itself does NOT scale with gain at the low end,
+because the black subtraction takes ~6 linear codes too many (a 0.1 ms frame
+reads 0 with no noise); that is an offset, not lost sensitivity, so the
+background/noise ratio (snr) is not a fair score across gains.
+
+Two things do corrupt a step's noise figure, and such steps are not eligible:
+  - quantization: sky noise under ~1 code of the 8-bit output is under-read
+    (lin = code^2, so one code is 2*code*4095/65025 linear units);
+  - the black clip: a sky within 3 sigma of zero has its lower tail clipped.
+The noise-equivalent flux does NOT fall monotonically toward the top gain (it
+rose ~15% from 11x to 22x on every 10x camera), so steps are compared with the
+BEST eligible step, not the top one. The chosen gain is the lowest eligible
+step within `tol` of that best. One value goes to the whole pod: the HIGHEST of the per-camera choices,
 i.e. the darkest sky's need, so no camera loses sensitivity.
 
 ISP digital gain is not swept. It comes after the ADC, so it adds no signal; it
@@ -78,7 +91,24 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s):
     r["total_gain"] = g
     r["nef"] = r["std_lin"] / g                # noise-equivalent flux: lower = more sensitive
     r["sky"] = r["mean_lin"] / g               # sky brightness in gain-free units
+    r["std_code"] = r["std_lin"] / code_step(r["mean_lin"])
+    r["eligible"], r["why"] = eligible(r)
     return r
+
+
+def code_step(mean_lin):
+    """Linear units per 8-bit output code at this level (lin = code^2 * 4095/65025)."""
+    code = math.sqrt(max(mean_lin, 0.0) * 65025.0 / 4095.0)
+    return max(2.0 * code, 1.0) * 4095.0 / 65025.0
+
+
+def eligible(r, min_std_code=1.0, min_sigma=3.0):
+    """Is this step's noise figure trustworthy? (ok, reason)"""
+    if r["std_code"] < min_std_code:
+        return False, "quantized (noise %.2f code)" % r["std_code"]
+    if r["mean_lin"] < min_sigma * r["std_lin"]:
+        return False, "black clip (sky %.1f sigma)" % (r["mean_lin"] / max(r["std_lin"], 1e-9))
+    return True, ""
 
 
 def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
@@ -108,10 +138,18 @@ def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
     return out
 
 
+def best(rows):
+    """The eligible step with the lowest noise-equivalent flux, or None."""
+    ok = [r for r in rows if r.get("eligible", True)]
+    return min(ok, key=lambda r: r["nef"]) if ok else None
+
+
 def choose(rows, tol):
-    """Lowest analog gain whose noise-equivalent flux is within tol of the top gain's."""
-    top = max(rows, key=lambda r: r["again_set"])
-    ok = [r for r in rows if r["nef"] <= top["nef"] * (1.0 + tol)]
+    """Lowest eligible analog gain whose noise-equivalent flux is within tol of the best's."""
+    b = best(rows)
+    if b is None:
+        return None
+    ok = [r for r in rows if r.get("eligible", True) and r["nef"] <= b["nef"] * (1.0 + tol)]
     return min(ok, key=lambda r: r["again_set"])["again_set"]
 
 
@@ -149,6 +187,9 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
                                    if c["drift"] is not None else "stability re-measure failed")
                 else:
                     c["chosen"] = choose(c["rows"], tol)
+                    if c["chosen"] is None:
+                        c["ok"] = False
+                        c["reason"] = "no step with a trustworthy noise figure"
             res["cameras"][sid] = c
     good = [c["chosen"] for c in res["cameras"].values() if c.get("ok")]
     res["pod_again"] = max(good) if good else None     # the darkest sky's need
@@ -164,13 +205,15 @@ def format_table(res):
             L.append("  %-8s  -- %s" % (sid, c.get("reason", "no data")))
             continue
         top = max(c["rows"], key=lambda r: r["again_set"])
+        ref = best(c["rows"]) or top
         L.append("  %-8s  %s  sky %.2f  drift %s" % (
             sid, ("-> %.2fx" % (c["chosen"] / 1024.0)) if c.get("ok") else "INVALID: " + c.get("reason", ""),
             top["sky"], ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?"))
         for r in sorted(c["rows"], key=lambda r: -r["again_set"]):
-            L.append("      again %6.2fx  bg %8.1f  noise %7.2f  snr %5.2f  nef %+5.1f%%  headroom %6.1fx  clip %.3f%%" % (
-                r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r["snr"],
-                100 * (r["nef"] / top["nef"] - 1), 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0)))
+            L.append("      again %6.2fx  bg %8.1f  noise %7.2f (%4.2f code)  nef %+5.1f%%  headroom %6.1fx  clip %.3f%%%s" % (
+                r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r.get("std_code", float("nan")),
+                100 * (r["nef"] / ref["nef"] - 1), 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0),
+                ("  " + r["why"]) if r.get("why") else ("  <- best" if r is ref else "")))
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
     return "\n".join(L)
