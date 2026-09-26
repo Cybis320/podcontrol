@@ -17,7 +17,7 @@ an optional mask_path: the station's RMS mask.bmp (0 = excluded). Metering
 ignores masked pixels so a bright light in a masked zone (a street lamp, a
 roof edge) cannot drive the pod's shared AE or the WB calibration.
 """
-import os, re, glob, json
+import os, re, glob, json, importlib.util
 
 DEFAULT_IPS = ["192.168.42.%d" % n for n in range(101, 107)]
 
@@ -30,10 +30,13 @@ def rms_root():
     if d and os.path.isdir(os.path.expanduser(d)):
         return os.path.expanduser(d)
     try:
-        import RMS
-        d = os.path.dirname(os.path.dirname(os.path.abspath(RMS.__file__)))
-        if os.path.isdir(d):
-            return d
+        # find_spec locates the package without importing it: we want the path
+        # RMS sits at, not anything RMS does. (RMS/__init__.py is empty anyway.)
+        spec = importlib.util.find_spec("RMS")
+        if spec is not None and spec.origin:
+            d = os.path.dirname(os.path.dirname(os.path.abspath(spec.origin)))
+            if os.path.isdir(d):
+                return d
     except Exception:
         pass
     return os.path.expanduser("~/source/RMS")

@@ -707,3 +707,22 @@ podcontrol/
   skymap.py     all-sky composite of the pod from the platepars (the Sky view)
   app.py        Tkinter UI (preview tiles + telemetry + controls)
 ```
+
+## Licence
+
+Copyright (c) 2026 Luc Busquin. All rights reserved. **Source-available, not
+open source.**
+
+The source is published so ContrailCast camera owners can read it, audit what it
+sends to their hardware, and adapt it for their own pod. The licence permits you
+to run and modify it to operate ContrailCast cameras you bought, and does not
+permit redistributing it, using it with other cameras, or building a competing
+product from it. Full terms in [LICENSE](LICENSE); for any other use, open an
+issue.
+
+`podcontrol` interoperates with [RMS](https://github.com/CroatianMeteorNetwork/RMS),
+which you install separately. The three RMS modules it imports at run time
+(`Formats.Platepar`, `Astrometry.ApplyAstrometry`, `Astrometry.Conversions`) are
+MIT-licensed by their author; the rest of RMS is GPL-3.0-or-later and is not
+imported or incorporated here. Camera control goes over a TCP socket to the
+firmware daemon, which is a separate program.

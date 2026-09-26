@@ -22,7 +22,7 @@ if __name__ == "__main__" and not __package__:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-import os, math, time, glob, datetime
+import os, re, math, time, glob, datetime
 import numpy as np
 import cv2
 
@@ -133,13 +133,25 @@ DEFAULT_MOON_RADIUS_DEG = 10.0   # not yet measured (no moon-in-field frames sav
 
 
 # RMS switches day/night capture modes when the sun crosses this altitude.
-# Read from RMS itself so the two can never disagree; -9 if RMS is absent.
+# Read out of RMS's source as text, not imported: the value is a fact we want to
+# agree with RMS on, and reading it costs us nothing while importing the module
+# it lives in would pull a GPL-licensed file into this program. -9 if RMS is
+# absent, which is the value RMS itself ships.
+DEFAULT_SWITCH_HORIZON_DEG = -9.0
+
+
 def _rms_switch_horizon():
     try:
-        from RMS.CaptureModeSwitcher import SWITCH_HORIZON_DEG as v
-        return float(str(v).split(":")[0])          # ephem-style "-9" or "-5:26"
+        from podcontrol.stations import rms_root
+        src = os.path.join(rms_root(), "RMS", "CaptureModeSwitcher.py")
+        with open(src) as f:
+            m = re.search(r'^SWITCH_HORIZON_DEG\s*=\s*["\']?(-?[\d:.]+)',
+                          f.read(), re.MULTILINE)
+        if m:
+            return float(m.group(1).split(":")[0])  # ephem-style "-9" or "-5:26"
     except Exception:
-        return -9.0
+        pass
+    return DEFAULT_SWITCH_HORIZON_DEG
 
 
 SWITCH_HORIZON_DEG = _rms_switch_horizon()

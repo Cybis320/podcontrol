@@ -1,21 +1,168 @@
-MIT License
+ContrailCast podcontrol -- Software License Agreement
+Copyright (c) 2026 Luc Busquin. All rights reserved.
 
-Copyright (c) 2026 Luc Busquin
+Version 1.0, 2026-09-26
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+PLAIN-LANGUAGE SUMMARY (not part of the legal terms)
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+  The source is published so owners of ContrailCast cameras can read it, audit
+  it, and adapt it for their own pod. It is not open source. You may run and
+  modify it to operate ContrailCast cameras you bought. You may not use it with
+  other cameras, redistribute it, or build a competing product from it.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+--------------------------------------------------------------------------------
+
+1. DEFINITIONS
+
+   "Licensor" means Luc Busquin.
+
+   "Software" means the podcontrol program in this repository, in source or
+   compiled form, including its documentation and any update Licensor supplies.
+
+   "Licensed Hardware" means a ContrailCast camera unit manufactured or sold by
+   Licensor or by a reseller Licensor has authorised in writing, which you
+   acquired through a lawful sale and which has not been materially altered to
+   defeat this Agreement.
+
+   "You" means the individual or legal entity exercising the rights in
+   section 2.
+
+2. LICENCE GRANT
+
+   Subject to your compliance with this Agreement, Licensor grants you a
+   licence that is limited, personal, non-exclusive, non-transferable,
+   non-sublicensable and revocable, to:
+
+   (a) download, install, and run the Software, solely to operate and maintain
+       Licensed Hardware that you own or administer;
+
+   (b) modify the Software and run your modified version, solely for the
+       purpose in (a) and solely by you or your employees and contractors
+       acting on your behalf; and
+
+   (c) make a reasonable number of copies for backup and internal deployment,
+       each carrying this Agreement and all copyright notices intact.
+
+   No fee is charged for this licence. It accompanies your purchase of Licensed
+   Hardware and lasts as long as you comply with this Agreement.
+
+3. RESTRICTIONS
+
+   Except as section 2 expressly permits, or as applicable law permits
+   notwithstanding this Agreement, you shall not:
+
+   (a) use the Software, in whole or in part, to operate, configure, calibrate
+       or control any camera or imaging device that is not Licensed Hardware;
+
+   (b) distribute, publish, sell, rent, lease, lend, sublicense, host as a
+       service, or otherwise make the Software or any derivative of it
+       available to any third party;
+
+   (c) use the Software or any knowledge derived from it to design, develop,
+       manufacture, market or support a product or service that competes with
+       Licensed Hardware or with the Software;
+
+   (d) remove, obscure or alter any copyright, licence or attribution notice;
+
+   (e) circumvent, disable or interfere with any authentication, licence check
+       or access control in the Software or in Licensed Hardware firmware, or
+       assist another person in doing so; or
+
+   (f) use the Software in violation of any applicable law, or in any safety-
+       critical application.
+
+   Publishing this repository publicly grants no licence beyond section 2.
+   Viewing and forking the repository on a code-hosting platform, to the extent
+   that platform's terms of service permit it, does not grant you any right to
+   use the Software.
+
+4. RESERVATION OF RIGHTS
+
+   The Software is licensed, not sold. Licensor and its licensors retain all
+   right, title and interest in the Software, including all intellectual
+   property rights. Any right not expressly granted in section 2 is reserved.
+
+5. CONTRIBUTIONS
+
+   If you submit a contribution to Licensor, you grant Licensor a perpetual,
+   irrevocable, worldwide, royalty-free, sublicensable licence to use,
+   reproduce, modify, distribute and commercially exploit it in any form,
+   and you confirm you have the right to grant that licence. You are not
+   obliged to submit contributions.
+
+6. THIRD-PARTY COMPONENTS
+
+   The Software interoperates with, and at run time may import from, the RMS
+   meteor station software (https://github.com/CroatianMeteorNetwork/RMS),
+   which you install separately. The RMS modules the Software imports
+   (RMS.Formats.Platepar, RMS.Astrometry.ApplyAstrometry and
+   RMS.Astrometry.Conversions) are distributed by their authors under the MIT
+   Licence, Copyright (c) 2016 Denis Vida. Other RMS components are licensed
+   under the GNU General Public License version 3 or later; the Software does
+   not import or incorporate them. The Software also uses NumPy (BSD-3-Clause),
+   OpenCV (Apache-2.0), Pillow (HPND) and PyEphem (MIT). Each third-party
+   component remains governed by its own licence, and nothing in this
+   Agreement limits any right you have under those licences.
+
+7. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS, IMPLIED OR STATUTORY, INCLUDING WITHOUT LIMITATION THE
+   IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+   TITLE AND NON-INFRINGEMENT. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE
+   WILL BE UNINTERRUPTED, ERROR-FREE, OR THAT IT WILL PROTECT ANY CAMERA,
+   SENSOR OR DATA FROM DAMAGE OR LOSS. THE SOFTWARE COMMANDS IMAGING HARDWARE
+   DIRECTLY AND YOU USE IT AT YOUR OWN RISK.
+
+8. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR SHALL NOT BE LIABLE FOR
+   ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY OR PUNITIVE
+   DAMAGES, NOR FOR ANY LOST PROFITS, LOST DATA, LOST OBSERVATIONS, BUSINESS
+   INTERRUPTION, OR DAMAGE TO HARDWARE, ARISING OUT OF OR RELATING TO THE
+   SOFTWARE OR THIS AGREEMENT, ON ANY THEORY OF LIABILITY, EVEN IF ADVISED OF
+   THE POSSIBILITY OF SUCH DAMAGES. LICENSOR'S TOTAL AGGREGATE LIABILITY SHALL
+   NOT EXCEED THE GREATER OF (A) THE AMOUNT YOU PAID LICENSOR FOR THE LICENSED
+   HARDWARE ON WHICH THE CLAIM IS BASED IN THE TWELVE MONTHS PRECEDING THE
+   CLAIM, OR (B) FIFTY UNITED STATES DOLLARS (USD 50). Some jurisdictions do
+   not allow certain exclusions, so parts of sections 7 and 8 may not apply to
+   you, in which case they apply to the fullest extent permitted.
+
+9. TERM AND TERMINATION
+
+   This Agreement takes effect when you first download, install or run the
+   Software and continues until terminated. It terminates automatically and
+   immediately if you breach any term. Licensor may also terminate it on
+   30 days' written notice. On termination you shall stop using the Software
+   and destroy all copies in your possession, except that you may keep one
+   archival copy solely to evidence past compliance. Sections 3(c), 4, 5, 6,
+   7, 8, 10 and 11 survive termination.
+
+10. GOVERNING LAW AND VENUE
+
+   This Agreement is governed by the laws of [STATE], United States, excluding
+   its conflict-of-laws rules and excluding the United Nations Convention on
+   Contracts for the International Sale of Goods. The state and federal courts
+   located in [COUNTY, STATE] shall have exclusive jurisdiction, and each party
+   consents to that venue.
+
+11. GENERAL
+
+   This Agreement is the entire agreement between you and Licensor about the
+   Software and supersedes any prior understanding. If a provision is held
+   unenforceable, it shall be limited to the minimum extent necessary and the
+   remainder shall stay in force. Licensor's failure to enforce a provision is
+   not a waiver of it. You may not assign this Agreement without Licensor's
+   prior written consent; Licensor may assign it in connection with a merger,
+   acquisition or sale of assets. Licensor may release future versions of the
+   Software under different terms; those terms will not retroactively change
+   your licence to a version you already received.
+
+   Licensing enquiries, including permission to use the Software with hardware
+   that is not Licensed Hardware: open an issue on the repository.
+
+--------------------------------------------------------------------------------
+Earlier versions of this Software, up to and including commit 05bae0d, were
+published to a private repository under the MIT Licence. This Agreement governs
+this and later versions. It does not purport to withdraw any right lawfully
+granted to a recipient of an earlier version under those earlier terms.
