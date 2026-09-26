@@ -1,0 +1,21 @@
+{
+ "ae_on": true,
+ "ccm_mode": "identity",
+ "clip_limit_pct": 0.005,
+ "clip_min_blob_px": 100,
+ "colour_hold": false,
+ "flare_radius_deg": 7.0,
+ "history_open": false,
+ "moon_radius_deg": 10.0,
+ "overlay": true,
+ "refresh_s": 5.0,
+ "satu": 255,
+ "slew": 0.02,
+ "slew_fast": 1.0,
+ "sun_cam_votes": true,
+ "sun_radius_deg": 15.0,
+ "view": "sky",
+ "wb_b": 1.92,
+ "wb_g": 1.0,
+ "wb_r": 1.8
+}

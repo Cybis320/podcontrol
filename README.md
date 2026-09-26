@@ -38,6 +38,29 @@ a **Pod Control** icon on the Desktop and in the app menu. Re-run it any time.
 Updates install themselves through the shared hourly
 [cc-utils](cc-utils/README.md) updater.
 
+**Starts with the session.** The installer also writes
+`~/.config/autostart/podcontrol.desktop`, the same mechanism RMS uses for its
+`US05*_StartCap.desktop` entries, so the pod is under control after a reboot with
+nobody logged in at the keyboard. It waits 60 s so RMS opens its RTSP sessions
+first, and runs with `--no-grab`: at login RMS has not saved a frame yet, and
+without that flag frame auto-detect would judge every camera idle and start an
+`ffmpeg` grab on all six exactly while RMS is opening its own streams.
+
+```bash
+CC_NO_AUTOSTART=1 ./install.sh              # launcher only, no autostart
+PODCONTROL_AUTOSTART_DELAY=90 ./install.sh  # wait longer for RMS
+rm ~/.config/autostart/podcontrol.desktop   # turn autostart off again
+```
+
+**A first install comes up configured.** `podcontrol/defaults.json` carries the
+pod's working settings (sky view, shared AE armed, identity matrix, saturation
+255, the calibrated WB gains), so a new machine starts the way the pod is
+actually run instead of on generic values. Your own
+`~/.config/podcontrol/settings.json` wins key by key and is never overwritten by
+an install or an update, so upgrading changes nothing you have set. Window size
+and position are deliberately not shipped: the app places its own window on a
+first run rather than restoring a geometry from another machine's display.
+
 System packages (not pip-installable; the installer lists any that are missing):
 
 ```bash

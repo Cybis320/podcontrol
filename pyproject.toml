@@ -20,3 +20,8 @@ podcontrol = "podcontrol.app:main"
 
 [tool.setuptools.packages.find]
 include = ["podcontrol*"]
+
+# defaults.json is the pod's working configuration, shipped so a fresh install
+# starts set up rather than on generic values (podcontrol/settings.py).
+[tool.setuptools.package-data]
+podcontrol = ["defaults.json"]

@@ -8,7 +8,12 @@
 #
 # Idempotent. Installs the package editable into the RMS virtualenv (~/vRMS)
 # with --no-deps, checks the apt-only modules it needs, adds a Pod Control
-# launcher, and schedules the shared hourly cc-utils updater.
+# launcher plus a session autostart entry (as RMS does for its own capture
+# scripts), and schedules the shared hourly cc-utils updater.
+#
+# A first install starts from podcontrol/defaults.json -- the pod's working
+# configuration -- so the app comes up set up rather than on generic values.
+# An existing ~/.config/podcontrol/settings.json always wins.
 #
 set -euo pipefail
 
@@ -46,8 +51,8 @@ fi
 if command -v xdg-user-dir >/dev/null 2>&1 || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     "$DEST/scripts/install-desktop.sh"
 else
-    cc_warn "No graphical session detected -- skipped the desktop icon."
-    cc_warn "Install it later from the desktop session:  $DEST/scripts/install-desktop.sh"
+    cc_warn "No graphical session detected -- skipped the launcher and autostart."
+    cc_warn "Install them later from the desktop session:  $DEST/scripts/install-desktop.sh"
 fi
 
 cc_install_updater "$DEST/cc-utils"
@@ -56,4 +61,5 @@ cc_mark_applied "$DEST"
 echo
 cc_info "Done. Click the 'Pod Control' icon, or run:"
 cc_info "    cd $DEST && $PY -m podcontrol"
+cc_info "Pod Control now starts with the session, a minute after login."
 cc_info "Updates arrive hourly (cc-utils updater)."
