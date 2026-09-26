@@ -52,6 +52,21 @@ PODCONTROL_AUTOSTART_DELAY=90 ./install.sh  # wait longer for RMS
 rm ~/.config/autostart/podcontrol.desktop   # turn autostart off again
 ```
 
+**Updates restart the app.** A pull cannot change a running process, so the
+hourly [cc-utils](cc-utils/README.md) updater's post-update hook restarts Pod
+Control whenever `HEAD` actually moves: one restart per new commit, not one per
+hour. Shutdown is graceful, since podcontrol treats `SIGTERM` like a window
+close, saving settings, restoring the cameras' colour settings and handing the
+pod back before it exits; `SIGKILL` follows only if it will not go. The shared
+AE re-seeds from wherever the cameras are, so control resumes within a few
+seconds. Run it by hand, or check what it would do, with:
+
+```bash
+./scripts/restart-app.sh --dry-run
+./scripts/restart-app.sh                    # restart whatever is running
+CC_NO_RESTART=1 ./scripts/post-update.sh    # update without restarting
+```
+
 **A first install comes up configured.** `podcontrol/defaults.json` carries the
 pod's working settings (sky view, shared AE armed, identity matrix, saturation
 255, the calibrated WB gains), so a new machine starts the way the pod is

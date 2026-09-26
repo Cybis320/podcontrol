@@ -14,3 +14,11 @@ CC_TOOL=podcontrol
 export CC_VENV_SYSTEM_SITE=1
 PY="$(cc_python "$DEST")"
 cc_pip_install "$PY" "$DEST" "PIL:Pillow"
+
+# Restart a running Pod Control, or the pull changes nothing: the process holds
+# its Python in memory and keeps driving the pod with the old controller until
+# someone restarts it by hand. That gap is not theoretical -- on 2026-09-26 a
+# fix for a dawn handover fault sat in the checkout while the running app still
+# had the bug. The updater only runs this hook when HEAD actually moved, so this
+# is one restart per new commit, not one per hour.
+"$DEST/scripts/restart-app.sh" || cc_warn "restart failed; the old code is still running"
