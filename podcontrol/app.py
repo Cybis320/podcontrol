@@ -410,6 +410,7 @@ class App(tk.Tk):
         self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
         self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
         self.sun_votes = tk.BooleanVar(value=sv("sun_cam_votes", self.ae.cfg.sun_cam_votes))
+        self.magenta_ok = tk.BooleanVar(value=sv("wb_rung_magenta_ok", self.ae.cfg.wb_rung_magenta_ok))
         self.flare_w = tk.DoubleVar(value=sv("flare_radius_deg", F.FLARE_HALF_WIDTH_DEG[0]))
         self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
         self.moon_radius = tk.DoubleVar(value=sv("moon_radius_deg", F.MOON_RADIUS_DEG[0]))
@@ -450,7 +451,7 @@ class App(tk.Tk):
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
         for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
-                    self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
+                    self.magenta_ok, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
@@ -669,6 +670,12 @@ class App(tk.Tk):
               "Checked: a camera with the sun in its field votes on the pod exposure like any\n"
               "other, so the sun-zone radius is your only lever. Cleared: it follows the pod\n"
               "without voting. If every camera sees the sun they all vote regardless.")
+        check(g, "RMS fixes magenta", self.magenta_ok, tip=
+              "Checked: raw (sensor) saturation no longer stops or reverses the WB rung -- it keeps\n"
+              "recovering gain-induced R/B clipping down to its floor (largest WB gain 1.0x) and\n"
+              "holds once recovered. Only with RMS day_highlight_rebuild: true on the stations,\n"
+              "which rebuilds the magenta areas in the saved day frames. Cleared: the rung backs\n"
+              "off to s = 1 whenever a frame shows raw saturation (no magenta at all).")
 
         g = group(row2, "white balance (x gains, pod-wide)",
                   "Manual white balance for the whole pod. RMS owns colour at its day/night\n"
@@ -777,6 +784,7 @@ class App(tk.Tk):
                 self.ae.cfg.slew = max(0.005, float(self.slew.get()))
                 self.ae.cfg.slew_fast = max(0.05, float(self.slew_fast.get()))
                 self.ae.cfg.sun_cam_votes = bool(self.sun_votes.get())
+                self.ae.cfg.wb_rung_magenta_ok = bool(self.magenta_ok.get())
             except Exception:
                 pass
             # one daemon connection per camera per cycle; the encoder/WB
@@ -1283,7 +1291,8 @@ class App(tk.Tk):
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "colour_hold": bool(self.colour_hold.get()),
-             "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
+             "sun_cam_votes": bool(self.sun_votes.get()), "wb_rung_magenta_ok": bool(self.magenta_ok.get()),
+             "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
              "wb_r": float(self.wb_r.get()), "wb_g": float(self.wb_g.get()), "wb_b": float(self.wb_b.get()),

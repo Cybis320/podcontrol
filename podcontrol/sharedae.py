@@ -121,6 +121,11 @@ class AEConfig:
     wb_min_scale = 0.25         # safety floor; the real bottom is 1/max(R,G,B) gains:
                                 # once every channel is below 1.0x nothing gain-induced
                                 # is left to recover, only uniform darkening of raw data
+    wb_rung_magenta_ok = False  # True when RMS rebuilds raw-saturated day highlights
+                                # (RMS day_highlight_rebuild): raw saturation then no
+                                # longer stops or reverses the WB rung -- it keeps
+                                # recovering gain-induced R/B clipping down to its floor
+                                # (largest WB gain 1.0x) and holds once recovered
     wb_rung_raw_sat_max = 0.0002  # the rung is used only while raw (green) saturation is
                                 # below this fraction: attenuated WB turns raw-saturated
                                 # zones magenta (R 1.8s, G s, B 1.9s no longer clip to
@@ -447,6 +452,13 @@ class SharedAE:
             # raw saturation counts wherever it is in the frame (masked zones
             # included): the magenta it would take is visible there all the same
             rb, rs = m.get("rb_only", clip), max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
+            if c.wb_rung_magenta_ok:
+                # raw saturation is RMS's to repair; only gain-induced R/B clipping moves the rung
+                if rb > c.clip_limit:
+                    return min(li_f, 0.0) - min(c.max_step, max(0.05, rb * c.kp_clip)), "R/B gain clipping (WB rung)"
+                if li_f < -1e-6 or rs > c.clip_limit:
+                    # recovered (or only raw saturation left, which the rung cannot fix): hold
+                    return min(li_f, 0.0), "at target (WB rung)" if li_f < -1e-6 else "raw-saturated at the floor"
             if rs > c.wb_rung_raw_sat_max:
                 # raw-saturated zones would go magenta under attenuation: stay
                 # (or go back) to s = 1 where they clip to white
@@ -495,7 +507,7 @@ class SharedAE:
             # floor were checked, so heavily clipped frames from just above it
             # drove the target straight to the rung's bottom past the guard.
             rs = max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
-            if rs > c.wb_rung_raw_sat_max:
+            if rs > c.wb_rung_raw_sat_max and not c.wb_rung_magenta_ok:
                 return 0.0, "raw-saturated: staying at the floor"
         return t_new, why
 
@@ -524,7 +536,7 @@ class SharedAE:
         # pod at the rung bottom, driven by A1/B1/D1/E1). If any frame of the
         # set shows raw saturation, nobody may ask for less than the floor.
         c = self.cfg
-        if c.wb_lever and self.wb_base:
+        if c.wb_lever and self.wb_base and not c.wb_rung_magenta_ok:
             sat = {cam: max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
                    for cam, m in metering.items() if m}
             worst = max(sat, key=sat.get) if sat else None
