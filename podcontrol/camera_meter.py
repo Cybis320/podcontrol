@@ -34,10 +34,17 @@ WHITE = 64000                    # wb_stats white level: 98% of linear full scal
 LEVEL_CAL = 0.9614               # frame-meter mean / camera mean: 290 daylight pairs on US05E1,
                                  # 2026-09-28, p10-p90 0.958-0.964, flat from mean 60 to 200
                                  # (zone gamma of the mean vs mean of gamma, green vs luma)
-RB_MARGIN = 0.80                 # a zone whose post-WB red or blue MEAN is above this fraction of
+RB_MARGIN = 0.72                 # a zone whose post-WB red or blue MEAN is above this fraction of
                                  # full scale is counted as at risk of gain clipping (zone means
-                                 # hide the brightest pixels; the AE stats have no per-channel
-                                 # histogram on the GK7205V200)
+                                 # hide the brightest pixels; no per-channel histogram on the
+                                 # GK7205V200). 20x pod 2026-09-28: the two cameras with R/B
+                                 # clipping in the frame had brightest zones at 0.76-0.78, the
+                                 # four without at <= 0.65
+PEAK_ZONE_FACTOR = 1.06          # frame-meter peak (max channel, p99.9) / brightest clean zone mean:
+                                 # 0.99-1.11 over the six 20x cameras, median 1.044 (2026-09-28);
+                                 # set a little high so the controller errs towards not brightening
+MIN_CLIP_PX = 25                 # never count fewer saturated pixels than this in a zone: a glint
+                                 # or a few hot pixels (US05C1: 4 and 8 px the frame meter never saw)
 ZONE_PX = 60 * 34                # pixels in one WB statistics zone (32x32 over 1920x1080)
 MASK_TTL_S = 30.0                # clean-zone grids are recomputed this often (the sun mask moves
                                  # ~0.1 deg in 30 s; computing it costs ~1.4 s per camera)
@@ -169,7 +176,7 @@ def controller_stats(st, t=None):
     # sensor saturation: fraction of pixels above the white level; zones with fewer clipped
     # pixels than one blob (the frame meter's point-source tolerance) do not count
     sat = 1.0 - cnt / FULL
-    min_frac = frames.CLIP_MIN_BLOB_PX[0] / float(ZONE_PX)
+    min_frac = max(frames.CLIP_MIN_BLOB_PX[0], MIN_CLIP_PX) / float(ZONE_PX)
     sat_c = sat[wb_ok]
     clip_sensor = float(np.where(sat_c >= min_frac, sat_c, 0.0).mean())
     raw_sat = float(sat_c.mean())
@@ -177,16 +184,12 @@ def controller_stats(st, t=None):
     # red/blue gain clipping risk: clean zones whose post-WB R or B mean is above the margin
     rb_zone = (np.maximum(zr, zb) >= RB_MARGIN * FULL) & ae_ok
     rb_only = float(rb_zone.sum()) / float(ae_ok.sum())
-    # peak (0-255): the AE histogram's 99.9th percentile (green, post-WB, full scale = bin 963
-    # after the black-level subtraction; 208 vs the frame meter's 210 on US05E1) or the
-    # brightest clean zone mean in any channel, whichever is higher; 255 when a zone clips
+    # peak (0-255, max channel): the brightest CLEAN zone mean in any channel x PEAK_ZONE_FACTOR.
+    # Not the AE histogram: it covers the whole frame, masked areas included (US05C1 read 255
+    # from something under its mask while its sky peaked at 188). 255 when a zone clips.
     hdr = dict(x.split("=", 1) for x in ae_hdr.split()[1:] if "=" in x)
     zmax = np.maximum(np.maximum(zr, zg), zb)[ae_ok]
-    peak = 255.0 * math.sqrt(min(1.0, float(zmax.max()) / FULL))
-    try:
-        peak = max(peak, 255.0 * math.sqrt(min(1.0, int(hdr["p999"]) / 963.0)))
-    except (KeyError, ValueError):
-        pass
+    peak = min(255.0, PEAK_ZONE_FACTOR * 255.0 * math.sqrt(min(1.0, float(zmax.max()) / FULL)))
     if clip_sensor > 0:
         peak = 255.0
     return {"mean": mean, "clip": max(clip_sensor, rb_only), "clip_raw": max(raw_sat, rb_only),
