@@ -38,10 +38,10 @@ import os, math, time, json, hashlib, threading
 import numpy as np
 import cv2
 
-from podcontrol import frames, sunmask
+from podcontrol import frames, vignette, sunmask
 
 CACHE_DIR = os.path.expanduser("~/.cache/podcontrol/skymap")
-LUT_VERSION = 2
+LUT_VERSION = 3          # 3: carries r_px for the vignetting correction
 BACKGROUND = (45, 45, 45)          # sky with no camera covering it (BGR)
 GRID_COLOUR = (90, 90, 90)
 TEXT_COLOUR = (235, 235, 235)
@@ -140,8 +140,12 @@ class CamLUT:
     in map pixels) so the per-camera remap + accumulate touch only the ~1/7
     of the map the camera sees."""
 
-    def __init__(self, map_x, map_y, weight, bbox, shape, factor, small, centre_xy, fov_xy):
+    def __init__(self, map_x, map_y, weight, bbox, shape, factor, small, centre_xy, fov_xy, r_px=None):
         self.map_x, self.map_y, self.weight = (np.ascontiguousarray(a) for a in (map_x, map_y, weight))
+        # distance of each map pixel from the optical axis, in FULL-frame pixels
+        # (not the downscaled ones the maps address). Geometry, so it lives here;
+        # the vignetting coefficient stays a runtime knob applied over it.
+        self.r_px = None if r_px is None else np.ascontiguousarray(r_px, np.float32)
         self.bbox, self.shape = tuple(int(v) for v in bbox), tuple(int(v) for v in shape)
         self.factor, self.small = int(factor), tuple(int(v) for v in small)
         self.centre_xy, self.fov_xy = tuple(float(v) for v in centre_xy), tuple(float(v) for v in fov_xy)
@@ -160,24 +164,29 @@ class CamLUT:
         return self._contours
 
     @classmethod
-    def from_full(cls, map_x, map_y, weight, factor, small, centre_xy, fov_xy):
+    def from_full(cls, map_x, map_y, weight, factor, small, centre_xy, fov_xy, r_px=None):
         ys, xs = np.nonzero(weight > 0)
         bbox = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1) if ys.size else (0, 0, 0, 0)
         y0, y1, x0, x1 = bbox
         return cls(map_x[y0:y1, x0:x1], map_y[y0:y1, x0:x1], weight[y0:y1, x0:x1], bbox, weight.shape,
-                   factor, small, centre_xy, fov_xy)
+                   factor, small, centre_xy, fov_xy,
+                   None if r_px is None else r_px[y0:y1, x0:x1])
 
     def save(self, path):
         np.savez_compressed(path, map_x=self.map_x, map_y=self.map_y, weight=self.weight,
                             bbox=np.array(self.bbox), shape=np.array(self.shape), factor=self.factor,
                             small=np.array(self.small), centre_xy=np.array(self.centre_xy),
-                            fov_xy=np.array(self.fov_xy))
+                            fov_xy=np.array(self.fov_xy),
+                            r_px=self.r_px if self.r_px is not None else np.zeros(0, np.float32))
 
     @classmethod
     def load(cls, path):
         z = np.load(path)
+        r = z["r_px"] if "r_px" in z.files else None
+        if r is not None and r.size == 0:
+            r = None
         return cls(z["map_x"], z["map_y"], z["weight"], z["bbox"], z["shape"], int(z["factor"]),
-                   z["small"], z["centre_xy"], z["fov_xy"])
+                   z["small"], z["centre_xy"], z["fov_xy"], r)
 
 
 def _lut_key(station, grid, feather_deg, mask_weight):
@@ -219,6 +228,7 @@ def build_lut(station, grid, feather_deg=2.5, mask_weight=0.02):
     map_x = np.full(alt.shape, -1.0, np.float32)
     map_y = np.full(alt.shape, -1.0, np.float32)
     weight = np.zeros(alt.shape, np.float32)
+    r_px = np.zeros(alt.shape, np.float32)
     factor = max(1, int(math.floor(float(pp.F_scale) / grid.px_per_deg)))
     small = (int(math.ceil(W / factor)), int(math.ceil(H / factor)))
     cx_map, cy_map = grid.xy(alt_c, az_c)
@@ -244,7 +254,9 @@ def build_lut(station, grid, feather_deg=2.5, mask_weight=0.02):
             map_x.ravel()[sel] = ((xs + 0.5) / factor - 0.5).astype(np.float32)
             map_y.ravel()[sel] = ((ys + 0.5) / factor - 0.5).astype(np.float32)
             weight.ravel()[sel] = wgt.astype(np.float32)
-    return CamLUT.from_full(map_x, map_y, weight, factor, small, (float(cx_map), float(cy_map)), (alt_c, az_c))
+            r_px.ravel()[sel] = np.hypot(xs - W / 2.0, ys - H / 2.0).astype(np.float32)
+    return CamLUT.from_full(map_x, map_y, weight, factor, small, (float(cx_map), float(cy_map)),
+                            (alt_c, az_c), r_px)
 
 
 _LUTS = {}
@@ -442,8 +454,11 @@ class SkyRenderer:
 
     Thread-safe: one render at a time."""
 
-    def __init__(self, pod, grid, feather_deg=2.5, mask_weight=0.02):
+    def __init__(self, pod, grid, feather_deg=2.5, mask_weight=0.02, vig_coeff=0.0):
         self.pod, self.grid = list(pod), grid
+        # lens vignetting: 0 = raw (the default). Folded into the blend weights,
+        # which are static, so a flattened composite costs nothing per frame.
+        self.vig_coeff = vignette.clamp(vig_coeff)
         self.by_id = {st.id: st for st in self.pod}
         self.feather_deg, self.mask_weight = float(feather_deg), float(mask_weight)
         self.luts = {}
@@ -482,6 +497,16 @@ class SkyRenderer:
                 print("skymap: %s rebuilt (mask or platepar changed)" % st.id)
         return self.ready
 
+    def set_vig_coeff(self, coeff):
+        """Change the flat-field coefficient (0 = raw). Returns True if it
+        moved, having dropped the composites derived from the old one."""
+        c = vignette.clamp(coeff)
+        if c == self.vig_coeff:
+            return False
+        self.vig_coeff = c
+        self._drop_cached()
+        return True
+
     def _drop_cached(self, sid=None):
         """Forget everything derived from a station's LUT or mask."""
         self._wcache.clear()
@@ -497,7 +522,8 @@ class SkyRenderer:
     def _weights(self, ids):
         """Normalised blend weight per camera for this set of cameras (static;
         cached), the covered mask and the covered fraction of the sky."""
-        hit = self._wcache.get(ids)
+        key = (ids, self.vig_coeff)
+        hit = self._wcache.get(key)
         if hit is not None:
             return hit
         h, w = self.grid.h, self.grid.w
@@ -513,13 +539,20 @@ class SkyRenderer:
         for sid in ids:
             lut = self.luts[sid]
             y0, y1, x0, x1 = lut.bbox
-            wn[sid] = (lut.weight * inv[y0:y1, x0:x1])[:, :, None]
+            a = lut.weight * inv[y0:y1, x0:x1]
+            # Pre-multiply the flat-field gain into the normalised weight. The
+            # blend is sum(value_i * w_i) with sum(w_i) = 1, so folding 1/V(r)
+            # in here makes each term the CORRECTED value and leaves the blend a
+            # weighted mean. Static, so compose() is untouched and pays nothing.
+            if self.vig_coeff and lut.r_px is not None:
+                a = a * vignette.gain(lut.r_px, self.vig_coeff)
+            wn[sid] = a[:, :, None]
         inside = self.grid.inside
         frac = float(cov[inside].mean()) if inside.any() else 0.0
         if len(self._wcache) > 8:
             self._wcache.clear()
-        self._wcache[ids] = (wn, cov, frac)
-        return self._wcache[ids]
+        self._wcache[key] = (wn, cov, frac)
+        return self._wcache[key]
 
     def compose(self, imgs, paths=None, show_grid=True, outlines=True):
         """(bgr, used_ids): the blended map for these frames ({id: bgr or

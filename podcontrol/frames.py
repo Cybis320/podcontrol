@@ -478,6 +478,26 @@ def F_SUN_RADIUS():
     return SUN_RADIUS_DEG[0]
 
 
+def recent_sets(stations, want=12, slot_s=SET_SLOT_S, max_age=SET_MAX_AGE_S, tol_s=0.0):
+    """[{station_id: path}] for the newest `want` slots that EVERY station can
+    serve, newest first. Unlike newest_set this returns many sets rather than
+    one, and defaults to no tolerance: the vignetting fit compares cameras
+    against each other, so the frames in a set want to be as near one instant as
+    the source allows. Returns fewer than `want`, or none, when the frames are
+    not there."""
+    per = {}
+    for st in stations:
+        fr = recent_rms_frames(st, max_age)
+        if not fr:
+            return []
+        per[st.id] = {round(t / slot_s) * slot_s: p for t, p in fr}
+    common = set.intersection(*(set(d) for d in per.values()))
+    out = []
+    for slot in sorted(common, reverse=True)[:want]:
+        out.append({sid: per[sid][slot] for sid in per})
+    return out
+
+
 def meter_set(stations, allow_grab=False, wb_scale_fn=None, max_age=SET_MAX_AGE_S):
     """Pod metering: ({station_id: stats + t + path}, newest_capture_epoch).
 

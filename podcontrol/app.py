@@ -36,6 +36,7 @@ from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, fee
 from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
 from podcontrol import version as VERSION
+from podcontrol import vignette as VIGNETTE
 from podcontrol.colour import cct_from_gains, gains_from_cct
 from podcontrol import skymap
 
@@ -416,6 +417,14 @@ class App(tk.Tk):
         # colour: matrix mode + CCM-domain saturation, pushed pod-wide by Apply;
         # `hold` re-asserts them after RMS's dawn replay (its day line says
         # `ccm off` / `satu 128` unless camera_settings is updated)
+        # sky-view flat field: raw by default, so a camera that drifts out of the
+        # pod's shared settings still shows as a step at its seams. The lens
+        # falloff is not that, and is the larger signal (up to 11% across a seam
+        # against the pod's real 5%), so correcting it is what lets the eye judge
+        # the rest. Off by default all the same: it changes displayed pixels.
+        self.vig_on = tk.BooleanVar(value=bool(sv("vignette_on", False)))
+        self.vig_coeff = tk.DoubleVar(value=float(sv("vignette_coeff", VIGNETTE.DEFAULT_COEFF)))
+        self._vig_busy = False
         self.satu = tk.IntVar(value=int(sv("satu", 128)))
         cm = saved.get("ccm_mode")
         self.ccm_mode = tk.StringVar(value=cm if cm in ("identity", "auto", "off") else "identity")
@@ -477,7 +486,9 @@ class App(tk.Tk):
         # only scales the finished image to the canvas.
         self.sky_canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
         self.sky_canvas.bind("<Configure>", self._on_sky_resize)
-        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE))
+        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE),
+                                        vig_coeff=(VIGNETTE.clamp(self.vig_coeff.get())
+                                                   if self.vig_on.get() else 0.0))
         self._sky_rgb = None
         self._sky_msg = None
         self._sky_img_id = None
@@ -611,6 +622,47 @@ class App(tk.Tk):
              "Radius of the lens-flare ghost discs, which sit on the line from the sun through\n"
              "the lens's principal point at fixed fractions of its distance. 0 disables the\n"
              "whole flare model.", unit="°")
+
+        g = group(row2, "sky flat field",
+                  "Lens vignetting correction for the sky view only. Nothing is sent to a camera\n"
+                  "and no other measurement changes: this is purely how the composite is drawn.")
+        check(g, "flatten", self.vig_on, tip=
+              "Off (the default) draws the raw composite, so a camera that has drifted out of\n"
+              "the pod's shared exposure shows as a step at its seams.\n\n"
+              "The trouble is the lens puts a step there too. Overlaps sit at the EDGE of both\n"
+              "fields, but rarely at the same edge distance in each, so one camera images a\n"
+              "shared patch nearer its axis and reads brighter. Measured 2026-09-28 that alone\n"
+              "made pairs disagree by up to 11%, against a real pod mismatch of about 5%.\n"
+              "Flattening removes it, so what is left at a seam is a genuine mismatch.\n\n"
+              "Costs nothing per frame: the correction is folded into the blend weights, which\n"
+              "are static.", padx=(0, 6))
+        spin(g, self.vig_coeff, 0.0, VIGNETTE.MAX_COEFF, 0.00001, 9, "%.6f", tip=
+             "The coefficient k in RMS's own model, V(r) = cos(k*r)^4, in radians per pixel,\n"
+             "r measured from the optical axis. Auto sets it from your own overlaps; type a\n"
+             "value to override.\n\n"
+             "Podcontrol keeps its own rather than using the platepar's, for two reasons. RMS\n"
+             "fits that one against STAR PHOTOMETRY, which also absorbs focus softening and\n"
+             "extinction, and on this pod five of six platepars were never fitted at all and\n"
+             "hold RMS's default -- which over-corrects by 92%, asking 3.29x at the corner\n"
+             "where 1.35x is needed. Writing this value back would shift RMS's meteor\n"
+             "magnitudes, so it is deliberately kept separate.")
+        self.vig_note = lab(g, "", padx=(6, 0))
+        btn(g, "auto", self._vig_autotune, tip=
+            "Fit the coefficient from the pod's own overlapping fields, over the last few\n"
+            "minutes of saved frames. Takes a few seconds and touches no camera.\n\n"
+            "Where two cameras see one sky direction the sky itself cancels exactly in their\n"
+            "ratio, so no sky model is needed -- and time-averaging could not do this, because\n"
+            "the cameras do not move and horizon glow sits in the same place in every frame.\n"
+            "One shared coefficient is fitted for all six, since they are the same lens: fitted\n"
+            "per camera it is degenerate, because overlaps never reach inside r~0.35 and each\n"
+            "camera's curve then trades against its own gain.\n\n"
+            "It also reports each camera's gain, which IS the pod's exposure mismatch with the\n"
+            "lens taken out.", padx=(6, 0))
+        # registered HERE, not beside the other traces: these handlers touch
+        # sky_r and vig_note, both of which are built after the variables are.
+        for var in (self.vig_on, self.vig_coeff):
+            var.trace_add("write", lambda *_: (self._vig_apply(), self._schedule_save()))
+        self._vig_label()
 
         g = group(row2, "policy")
         check(g, "sun cam votes", self.sun_votes, tip=
@@ -984,6 +1036,64 @@ class App(tk.Tk):
         self._schedule_save()
         self._apply_view()
 
+    # ---- sky flat field ------------------------------------------------------
+    def _vig_apply(self, *_):
+        """Push the toggle/coefficient into the renderer and redraw if needed."""
+        want = VIGNETTE.clamp(self.vig_coeff.get()) if self.vig_on.get() else 0.0
+        if self.sky_r.set_vig_coeff(want) and self.view == "sky":
+            self._pool.submit(self._sky_now)          # do not wait for the next cycle
+        self._vig_label()
+
+    def _vig_label(self):
+        c = VIGNETTE.clamp(self.vig_coeff.get())
+        if not self.vig_on.get():
+            self.vig_note.config(text="raw", fg="#6d6350")
+        elif not c:
+            self.vig_note.config(text="off (0)", fg="#6d6350")
+        else:
+            self.vig_note.config(text="%.2fx corner" % VIGNETTE.corner_gain(c), fg="#c8bfa8")
+
+    def _vig_autotune(self):
+        """Fit the coefficient from the pod's own overlaps, in a worker thread."""
+        if self._vig_busy:
+            return
+        self._vig_busy = True
+        self.vig_note.config(text="fitting…", fg="#f0a830")
+
+        def work():
+            try:
+                sets = F.recent_sets(self.stations, want=12)
+                if len(sets) < 3:
+                    raise RuntimeError("only %d usable frame sets; needs a few minutes of"
+                                       " frames from every camera" % len(sets))
+                res = VIGNETTE.fit(self.sky_r, sets)
+            except Exception as e:
+                res = {"error": str(e)}
+            self.after(0, lambda: self._vig_autotune_done(res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _vig_autotune_done(self, res):
+        from tkinter import messagebox
+        self._vig_busy = False
+        if res.get("error") or not res.get("coeff"):
+            self._vig_label()
+            messagebox.showwarning("Sky flat field", "Could not fit:\n\n%s" % res.get("error", "no result"))
+            return
+        self.vig_coeff.set(round(res["coeff"], 6))
+        self.vig_on.set(True)
+        self._vig_apply()
+        gains = res.get("gains") or {}
+        spread = (100 * (max(gains.values()) / min(gains.values()) - 1)) if gains else 0.0
+        lines = ["k = %.6f rad/px  (%.2fx at the corner)" % (res["coeff"], res["corner"]),
+                 "residual %.1f%% over %d overlap samples from %d frame sets"
+                 % (100 * res["residual"], res["samples"], res["sets"]), "",
+                 "Per-camera gain, which is the pod's exposure mismatch with the",
+                 "lens taken out:"]
+        for sid in sorted(gains):
+            lines.append("    %-8s %.3fx" % (sid, gains[sid]))
+        lines += ["", "spread %.1f%%" % spread]
+        messagebox.showinfo("Sky flat field", "\n".join(lines))
+
     def _apply_view(self, initial=False):
         self.view_btn.config(text="View: %s" % self.view)
         if self.view == "sky":
@@ -1171,6 +1281,7 @@ class App(tk.Tk):
              "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
              "slew_fast": float(self.slew_fast.get()),
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
+             "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
