@@ -1,7 +1,7 @@
 """Camera-side metering: the ISP's own statistics instead of RMS's saved frames.
 
-EXPERIMENTAL -- not wired into the controller. It exists to be compared, live, against the
-frame meter (podcontrol.frames.luma_stats) before anything switches over.
+Used by the controller when "camera meter" is on (meter_set_hybrid): every camera that has
+the commands is metered here, the others by the frame meter. Off by default.
 
 Two read-only commands on the camera's control server (:9600), a few ms each, measured
 on the frame just captured, in linear light:
@@ -31,6 +31,16 @@ import numpy as np
 from podcontrol.podctl import send
 
 WHITE = 64000                    # wb_stats white level: 98% of linear full scale
+LEVEL_CAL = 0.9614               # frame-meter mean / camera mean: 290 daylight pairs on US05E1,
+                                 # 2026-09-28, p10-p90 0.958-0.964, flat from mean 60 to 200
+                                 # (zone gamma of the mean vs mean of gamma, green vs luma)
+RB_MARGIN = 0.80                 # a zone whose post-WB red or blue MEAN is above this fraction of
+                                 # full scale is counted as at risk of gain clipping (zone means
+                                 # hide the brightest pixels; the AE stats have no per-channel
+                                 # histogram on the GK7205V200)
+ZONE_PX = 60 * 34                # pixels in one WB statistics zone (32x32 over 1920x1080)
+MASK_TTL_S = 30.0                # clean-zone grids are recomputed this often (the sun mask moves
+                                 # ~0.1 deg in 30 s; computing it costs ~1.4 s per camera)
 FULL = 65535.0
 H, W = 1080, 1920
 
@@ -108,10 +118,105 @@ class CameraMeter(object):
             return None
         y_z = 255.0 * np.sqrt(np.clip(ae[ae_ok], 0, FULL) / FULL)     # per-zone luma equivalent
         clip_z = 1.0 - cnt[wb_ok] / FULL
-        hdr = dict(x.split("=", 1) for x in (ae_t.splitlines()[0].split()[1:]) if "=" in x)
+        hdr = dict(x.split("=", 1) for x in next(l for l in ae_t.splitlines() if l.startswith("ae_stats ")).split()[1:] if "=" in x)
         return {"mean": float(y_z.mean()), "clip": float(clip_z.mean()), "clip_zone_max": float(clip_z.max()),
                 "n_ae": int(ae_ok.sum()), "n_wb": int(wb_ok.sum()), "white_ok": white_ok, "t": t,
                 "exp_us": int(hdr.get("exp_us", 0)), "again": int(hdr.get("again", 0)), "src": "camera"}
+
+
+_CLEAN = {}          # station id -> (t, key, ae_ok, wb_ok, sun_in_fov)
+
+
+def _clean_grids(st, t, wb_text, n_rows, n_cols):
+    """(ae_ok, wb_ok, sun_in_fov) for station st at t, cached for MASK_TTL_S."""
+    from podcontrol import frames
+    key = (round(frames.SUN_RADIUS_DEG[0], 2), round(frames.MOON_RADIUS_DEG[0], 2),
+           round(frames.FLARE_HALF_WIDTH_DEG[0], 2), n_rows, n_cols)
+    hit = _CLEAN.get(st.id)
+    if hit and hit[1] == key and abs(t - hit[0]) < MASK_TTL_S:
+        return hit[2], hit[3], hit[4]
+    keep, lay = frames.mask_for(st, np.zeros((H, W, 3), np.uint8), t, layers=True)
+    ae_ok = clean_zones(keep, AE_XE, AE_YE)
+    xe, ye = _edges(wb_text, n_rows, n_cols)
+    wb_ok = clean_zones(keep, xe, ye)
+    sun = bool(((lay or {}).get("sun_info") or {}).get("in_fov"))
+    _CLEAN[st.id] = (t, key, ae_ok, wb_ok, sun)
+    return ae_ok, wb_ok, sun
+
+
+def controller_stats(st, t=None):
+    """The frame meter's fields for the controller (mean, clip, rb_only, peak, raw_sat,
+    raw_sat_all, sun_in_fov, t), measured by the camera; None when the camera lacks the
+    commands or a reading fails -- the caller falls back to the frame meter."""
+    from podcontrol import frames
+    t = time.time() if t is None else t
+    ae_t = send(st.ip, "ae_stats full", timeout=5) or ""
+    wb_t = send(st.ip, "wb_stats", timeout=5) or ""
+    ae_hdr = next((l for l in ae_t.splitlines() if l.startswith("ae_stats ")), None)
+    wb_hdr = next((l for l in wb_t.splitlines() if l.startswith("wb_cfg ")), None)
+    if ae_hdr is None or wb_hdr is None:
+        return None
+    zg, zr, zb, cnt = _grid(ae_t, "zone_g"), _grid(ae_t, "zone_r"), _grid(ae_t, "zone_b"), _grid(wb_t, "zone_count")
+    if zg is None or zr is None or zb is None or cnt is None:
+        return None
+    if "white=%d " % WHITE not in wb_hdr + " ":
+        send(st.ip, "wb_stats set white %d" % WHITE, timeout=5)   # persisted; statistics only
+    ae_ok, wb_ok, sun = _clean_grids(st, t, wb_t, cnt.shape[0], cnt.shape[1])
+    if not ae_ok.any() or not wb_ok.any():
+        return None
+    # level: per-zone luma equivalent of the post-WB green mean, calibrated to the frame meter
+    mean = LEVEL_CAL * float((255.0 * np.sqrt(np.clip(zg[ae_ok], 0, FULL) / FULL)).mean())
+    # sensor saturation: fraction of pixels above the white level; zones with fewer clipped
+    # pixels than one blob (the frame meter's point-source tolerance) do not count
+    sat = 1.0 - cnt / FULL
+    min_frac = frames.CLIP_MIN_BLOB_PX[0] / float(ZONE_PX)
+    sat_c = sat[wb_ok]
+    clip_sensor = float(np.where(sat_c >= min_frac, sat_c, 0.0).mean())
+    raw_sat = float(sat_c.mean())
+    raw_sat_all = float(sat.mean())
+    # red/blue gain clipping risk: clean zones whose post-WB R or B mean is above the margin
+    rb_zone = (np.maximum(zr, zb) >= RB_MARGIN * FULL) & ae_ok
+    rb_only = float(rb_zone.sum()) / float(ae_ok.sum())
+    # peak (0-255): the AE histogram's 99.9th percentile (green, post-WB, full scale = bin 963
+    # after the black-level subtraction; 208 vs the frame meter's 210 on US05E1) or the
+    # brightest clean zone mean in any channel, whichever is higher; 255 when a zone clips
+    hdr = dict(x.split("=", 1) for x in ae_hdr.split()[1:] if "=" in x)
+    zmax = np.maximum(np.maximum(zr, zg), zb)[ae_ok]
+    peak = 255.0 * math.sqrt(min(1.0, float(zmax.max()) / FULL))
+    try:
+        peak = max(peak, 255.0 * math.sqrt(min(1.0, int(hdr["p999"]) / 963.0)))
+    except (KeyError, ValueError):
+        pass
+    if clip_sensor > 0:
+        peak = 255.0
+    return {"mean": mean, "clip": max(clip_sensor, rb_only), "clip_raw": max(raw_sat, rb_only),
+            "rb_only": rb_only, "raw_sat": raw_sat, "raw_sat_all": raw_sat_all, "peak": float(peak),
+            "peak_luma": float(peak), "sun_in_fov": sun, "t": t, "src": "camera",
+            "n_zones": int(ae_ok.sum()), "exp_us": int(hdr.get("exp_us", 0))}
+
+
+def meter_set_hybrid(stations, allow_grab=False, wb_scale_fn=None):
+    """Like frames.meter_set, but each camera that supports it is metered by the camera
+    (current frame, t = now); the rest by the frame meter. Returns (met, newest_t)."""
+    from podcontrol import frames
+    met, newest, rest = {}, None, []
+    for st in stations:
+        try:
+            m = controller_stats(st)
+        except Exception:
+            m = None
+        if m is None:
+            rest.append(st)
+        else:
+            met[st.id] = m
+            newest = m["t"] if newest is None else max(newest, m["t"])
+    if rest:
+        fm, fslot = frames.meter_set(rest, allow_grab=allow_grab, wb_scale_fn=wb_scale_fn)
+        for sid, m in fm.items():
+            met[sid] = dict(m, src="frames")
+        if fslot is not None:
+            newest = fslot if newest is None else max(newest, fslot)
+    return met, newest
 
 
 def _compare(sid, period=5.0):

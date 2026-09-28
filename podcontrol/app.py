@@ -411,6 +411,7 @@ class App(tk.Tk):
         self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
         self.sun_votes = tk.BooleanVar(value=sv("sun_cam_votes", self.ae.cfg.sun_cam_votes))
         self.magenta_ok = tk.BooleanVar(value=sv("wb_rung_magenta_ok", self.ae.cfg.wb_rung_magenta_ok))
+        self.camera_meter = tk.BooleanVar(value=sv("camera_meter", False))
         self.flare_w = tk.DoubleVar(value=sv("flare_radius_deg", F.FLARE_HALF_WIDTH_DEG[0]))
         self.min_blob = tk.IntVar(value=int(sv("clip_min_blob_px", F.CLIP_MIN_BLOB_PX[0])))
         self.moon_radius = tk.DoubleVar(value=sv("moon_radius_deg", F.MOON_RADIUS_DEG[0]))
@@ -451,7 +452,7 @@ class App(tk.Tk):
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
         for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
-                    self.magenta_ok, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
+                    self.magenta_ok, self.camera_meter, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
@@ -676,6 +677,11 @@ class App(tk.Tk):
               "holds once recovered. Only with RMS day_highlight_rebuild: true on the stations,\n"
               "which rebuilds the magenta areas in the saved day frames. Cleared: the rung backs\n"
               "off to s = 1 whenever a frame shows raw saturation (no magenta at all).")
+        check(g, "camera meter", self.camera_meter, tip=
+              "Checked: meter each camera from its own ISP statistics (ae_stats + wb_stats: the\n"
+              "current frame, linear, zones touching no mask only) instead of RMS's saved frames,\n"
+              "which can be ~50 s old. Cameras without those commands (older isp_ctl) keep using\n"
+              "the frame meter. Cleared: frame meter for every camera.")
 
         g = group(row2, "white balance (x gains, pod-wide)",
                   "Manual white balance for the whole pod. RMS owns colour at its day/night\n"
@@ -821,8 +827,13 @@ class App(tk.Tk):
             if self.ae_on and self.ae.t_seed:
                 # meter the pod on the newest COMPLETE frame set (one capture
                 # instant for all cameras), not six frames of different ages
-                met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab,
-                                        wb_scale_fn=self.ae.wb_scale_at)
+                if self.camera_meter.get():
+                    from podcontrol.camera_meter import meter_set_hybrid
+                    met, slot = meter_set_hybrid(self.stations, allow_grab=self.allow_grab,
+                                                 wb_scale_fn=self.ae.wb_scale_at)
+                else:
+                    met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab,
+                                            wb_scale_fn=self.ae.wb_scale_at)
                 ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
                 self.ae_slot = slot
                 # RMS's dawn `auto` ends our control silently: give up the latch
@@ -1292,6 +1303,7 @@ class App(tk.Tk):
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "wb_rung_magenta_ok": bool(self.magenta_ok.get()),
+             "camera_meter": bool(self.camera_meter.get()),
              "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
