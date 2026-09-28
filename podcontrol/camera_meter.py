@@ -45,6 +45,9 @@ PEAK_ZONE_FACTOR = 1.06          # frame-meter peak (max channel, p99.9) / brigh
                                  # set a little high so the controller errs towards not brightening
 MIN_CLIP_PX = 25                 # never count fewer saturated pixels than this in a zone: a glint
                                  # or a few hot pixels (US05C1: 4 and 8 px the frame meter never saw)
+RB_ZONE_TO_PX = 0.01             # an at-risk zone counts as ~1% clipped pixels, so rb_only is on the
+                                 # frame meter's pixel-fraction scale (the controller's clip step is
+                                 # proportional to it: a raw zone fraction stepped up to 10x harder)
 ZONE_PX = 60 * 34                # pixels in one WB statistics zone (32x32 over 1920x1080)
 MASK_TTL_S = 30.0                # clean-zone grids are recomputed this often (the sun mask moves
                                  # ~0.1 deg in 30 s; computing it costs ~1.4 s per camera)
@@ -183,7 +186,7 @@ def controller_stats(st, t=None):
     raw_sat_all = float(sat.mean())
     # red/blue gain clipping risk: clean zones whose post-WB R or B mean is above the margin
     rb_zone = (np.maximum(zr, zb) >= RB_MARGIN * FULL) & ae_ok
-    rb_only = float(rb_zone.sum()) / float(ae_ok.sum())
+    rb_only = RB_ZONE_TO_PX * float(rb_zone.sum()) / float(ae_ok.sum())
     # peak (0-255, max channel): the brightest CLEAN zone mean in any channel x PEAK_ZONE_FACTOR.
     # Not the AE histogram: it covers the whole frame, masked areas included (US05C1 read 255
     # from something under its mask while its sky peaked at 188). 255 when a zone clips.
