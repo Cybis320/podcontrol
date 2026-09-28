@@ -406,6 +406,7 @@ class App(tk.Tk):
             return v if isinstance(v, (int, float, bool)) else default
         self.interval = tk.DoubleVar(value=sv("refresh_s", 5.0))
         self.overlay = tk.BooleanVar(value=sv("overlay", True))
+        self.const_exp = tk.BooleanVar(value=sv("sky_constant_exposure", False))
         self.sun_radius = tk.DoubleVar(value=sv("sun_radius_deg", F.SUN_RADIUS_DEG[0]))
         self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
         self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
@@ -451,7 +452,7 @@ class App(tk.Tk):
         self._save_job = None
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
-        for var in (self.interval, self.overlay, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
+        for var in (self.interval, self.overlay, self.const_exp, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
                     self.magenta_ok, self.camera_meter, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
@@ -612,6 +613,12 @@ class App(tk.Tk):
               "On the sky view it also governs the FOV overlay: with it off you get the bare\n"
               "composite, no camera footprints, labels, telemetry or sun/moon markers. The\n"
               "alt/az grid and the caption stay, so the frame time is always readable.", padx=(0, 8))
+        check(g, "const exp", self.const_exp, tip=
+              "DEMO: draw the sky view with every camera at ONE common exposure. Each tile is\n"
+              "scaled in linear light by (median exposure / that camera's exposure when the frame\n"
+              "was taken), from the history's 5 s polls. Meant for trying free per-camera exposure\n"
+              "(switch AE off): the raw mosaic is patchy, this one should be continuous. Seams that\n"
+              "remain are uncalibrated per-camera sensitivity/vignetting. View only.", padx=(0, 8))
         pair(g, "sun r", self.sun_radius, 0, 45, 1, 4, tip=
              "Radius of the exclusion disc around the sun, from the platepar and an ephemeris.\n"
              "Applied whenever the disc can touch the sky, so the glow around a just-set sun is\n"
@@ -998,8 +1005,19 @@ class App(tk.Tk):
         # the overlay checkbox governs the FOV overlay too: with it off the sky
         # view is the bare composite (plus the alt/az grid and the caption), no
         # footprints, camera labels, telemetry or sun/moon markers
+        if self.const_exp.get():
+            # DEMO: every tile brought to one common exposure (podcontrol.radiance)
+            from podcontrol import radiance
+            imgs, paths, cinfo = radiance.constant_exposure(paths, list(self.history.records))
+            self._const_info = cinfo
         bgr, _ = r.render(imgs, paths, t, spread, telem=poll, drive=drive, layers=layers,
                           outlines=overlay_on, labels=overlay_on, bodies=overlay_on)
+        if self.const_exp.get() and getattr(self, "_const_info", None) and self._const_info.get("e_ref"):
+            ks = self._const_info["k"]
+            txt = "constant exposure %.0f us-x   k: %s" % (self._const_info["e_ref"],
+                   " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
+            cv2.putText(bgr, txt, (10, bgr.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+            cv2.putText(bgr, txt, (10, bgr.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread
         return _fit_to(rgb, wh) if wh else rgb
@@ -1297,6 +1315,7 @@ class App(tk.Tk):
 
     def _settings_dict(self):
         d = {"refresh_s": float(self.interval.get()), "overlay": bool(self.overlay.get()),
+             "sky_constant_exposure": bool(self.const_exp.get()),
              "sun_radius_deg": float(self.sun_radius.get()), "slew": float(self.slew.get()),
              "slew_fast": float(self.slew_fast.get()),
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
