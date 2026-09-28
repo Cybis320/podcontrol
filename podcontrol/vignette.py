@@ -108,6 +108,7 @@ def fit(renderer, sets, progress=None):
     n = len(ids)
     pos = {sid: k for k, sid in enumerate(ids)}
     grid = renderer.grid
+    from podcontrol import frames as _frames
     rad, cov, rmax = {}, {}, {}
     for sid in ids:
         lut = renderer.luts[sid]
@@ -115,7 +116,19 @@ def fit(renderer, sets, progress=None):
         C = np.zeros((grid.h, grid.w), bool)
         y0, y1, x0, x1 = lut.bbox
         R[y0:y1, x0:x1] = lut.r_px
-        C[y0:y1, x0:x1] = lut.weight > 0
+        # A masked pixel is a building or a tree, not sky, and the LUT keeps it
+        # at a small weight rather than dropping it. If a direction is blocked in
+        # one camera and clear in the other their ratio is meaningless, and those
+        # pixels sit near the horizon, which is the frame edge, exactly where the
+        # radial signal lives. So the fit uses clear sky only.
+        ok = np.ones(lut.weight.shape, bool)
+        keep = _frames.load_mask(renderer.by_id[sid])
+        if keep is not None:
+            sm = cv2.resize(keep.astype(np.uint8), lut.small, interpolation=cv2.INTER_NEAREST)
+            xi = np.clip(np.rint(lut.map_x).astype(int), 0, lut.small[0] - 1)
+            yi = np.clip(np.rint(lut.map_y).astype(int), 0, lut.small[1] - 1)
+            ok = sm[yi, xi] > 0
+        C[y0:y1, x0:x1] = (lut.weight > 0) & ok
         rad[sid], cov[sid] = R, C
         rmax[sid] = float(lut.r_px.max()) or 1.0
     scale = max(rmax.values())          # normalise so the solve is well scaled
