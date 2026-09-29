@@ -452,6 +452,7 @@ class App(tk.Tk):
         self._save_job = None
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
+        self.individual_ae.trace_add("write", lambda *_: self._switch_ae_mode())
         for var in (self.interval, self.overlay, self.const_exp, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
                     self.magenta_ok, self.camera_meter, self.individual_ae, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
@@ -689,8 +690,9 @@ class App(tk.Tk):
               "metering, highlight priority, slow slews, its own WB rung, the night latch), so the\n"
               "sun camera no longer darkens the others. Saved frames carry their exposure\n"
               "(RMS save_frame_metadata); the sky view's 'const exp' reunifies the pod view.\n"
-              "At night all cameras latch to the same RMS night line. Takes effect the next time\n"
-              "AE is switched on. Cleared: one shared exposure for the pod.")
+              "At night all cameras latch to the same RMS night line. Takes effect at once (with\n"
+              "AE on: the cameras are handed back and taken over again). Cleared: one shared\n"
+              "exposure for the pod.")
         check(g, "camera meter", self.camera_meter, tip=
               "Checked: meter each camera from its own ISP statistics (ae_stats + wb_stats: the\n"
               "current frame, linear, zones touching no mask only) instead of RMS's saved frames,\n"
@@ -1402,6 +1404,29 @@ class App(tk.Tk):
             ae = SharedAE(self.pod, cfg=cfg) if cfg is not None else SharedAE(self.pod)
         configure_from_pod(ae, self.pod)
         return ae
+
+    def _switch_ae_mode(self):
+        """The individual-AE box, ticked or cleared: with AE running, hand the cameras back,
+        build the other kind of controller and take over again at once."""
+        want = bool(self.individual_ae.get())
+        if want == bool(getattr(self.ae, "individual", False)):
+            return
+        if not self.ae_on:
+            self.ae = self._make_ae(want)
+            self.ae_btn.config(text="%s: OFF" % self._ae_label(), fg="#000")
+            return
+        old = self.ae
+        def _swap():
+            try:
+                old.release()
+            except Exception:
+                pass
+            new = self._make_ae(want)
+            feed_sun(new, self.pod)
+            new.takeover(self.pod.poll_all(timeout=4))
+            self.ae, self.ae_info = new, None
+            self.after(0, lambda: self.ae_btn.config(text="%s: ON" % self._ae_label(), fg="#7fc776"))
+        threading.Thread(target=_swap, daemon=True).start()
 
     def _ae_label(self):
         return "%s AE" % ("Individual" if getattr(self.ae, "individual", False) else "Shared")
