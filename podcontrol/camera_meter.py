@@ -182,7 +182,7 @@ def controller_stats(st, t=None):
     min_frac = max(frames.CLIP_MIN_BLOB_PX[0], MIN_CLIP_PX) / float(ZONE_PX)
     sat_c = sat[wb_ok]
     clip_sensor = float(np.where(sat_c >= min_frac, sat_c, 0.0).mean())
-    raw_sat = float(sat_c.mean())
+    raw_sat = clip_sensor                     # same blob floor: a few glinting pixels never count
     raw_sat_all = float(sat.mean())
     # red/blue gain clipping risk: clean zones whose post-WB R or B mean is above the margin
     rb_zone = (np.maximum(zr, zb) >= RB_MARGIN * FULL) & ae_ok

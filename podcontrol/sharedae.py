@@ -453,7 +453,10 @@ class SharedAE:
             # included): the magenta it would take is visible there all the same
             rb, rs = m.get("rb_only", clip), max(m.get("raw_sat", 0.0), m.get("raw_sat_all", 0.0))
             if c.wb_rung_magenta_ok:
-                # raw saturation is RMS's to repair; only gain-induced R/B clipping moves the rung
+                # raw saturation is RMS's to repair; only gain-induced R/B clipping moves the rung.
+                # Only the CLEAN sky decides whether we may brighten: saturation under a mask (the
+                # sun zone) is excluded like every other masked pixel.
+                rs = m.get("raw_sat", 0.0)
                 if rb > c.clip_limit:
                     return min(li_f, 0.0) - min(c.max_step, max(0.05, rb * c.kp_clip)), "R/B gain clipping (WB rung)"
                 if li_f < -1e-6 or rs > c.clip_limit:

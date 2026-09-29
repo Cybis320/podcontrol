@@ -392,8 +392,7 @@ class App(tk.Tk):
             self.pod.ccm_all = lambda *a, **k: {}
             self.pod.one_live = lambda *a, **k: {}
         self.allow_grab = allow_grab
-        self.ae = SharedAE(self.pod)
-        configure_from_pod(self.ae, self.pod)      # top rung = RMS night line
+        self.ae = self._make_ae(bool(self._saved_setting("individual_ae", False)))
         self.ae_on = False
         self.ae_info = None
         self.ae_slot = None
@@ -411,6 +410,7 @@ class App(tk.Tk):
         self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
         self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
         self.sun_votes = tk.BooleanVar(value=sv("sun_cam_votes", self.ae.cfg.sun_cam_votes))
+        self.individual_ae = tk.BooleanVar(value=sv("individual_ae", False))
         self.magenta_ok = tk.BooleanVar(value=sv("wb_rung_magenta_ok", self.ae.cfg.wb_rung_magenta_ok))
         self.camera_meter = tk.BooleanVar(value=sv("camera_meter", False))
         self.flare_w = tk.DoubleVar(value=sv("flare_radius_deg", F.FLARE_HALF_WIDTH_DEG[0]))
@@ -453,7 +453,7 @@ class App(tk.Tk):
         for var in (self.wb_r, self.wb_g, self.wb_b):
             var.trace_add("write", lambda *_: (self._update_kelvin(), self._schedule_save()))
         for var in (self.interval, self.overlay, self.const_exp, self.sun_radius, self.slew, self.slew_fast, self.sun_votes,
-                    self.magenta_ok, self.camera_meter, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
+                    self.magenta_ok, self.camera_meter, self.individual_ae, self.flare_w, self.min_blob, self.moon_radius, self.clip_pct):
             var.trace_add("write", lambda *_: self._schedule_save())
         self.running = True
         self._pool = ThreadPoolExecutor(max_workers=12)
@@ -559,7 +559,7 @@ class App(tk.Tk):
             "Hand every camera back to RMS's own day exposure line and switch Shared AE off.\n"
             "Never sends a bare `auto`: on the Goke that would reset the AE ranges and break\n"
             "the science config's fixed sensor digital gain.")
-        self.ae_btn = btn(g, "Shared AE: OFF", self.toggle_ae,
+        self.ae_btn = btn(g, "%s: OFF" % self._ae_label(), self.toggle_ae,
             "Drive ONE exposure and gain onto the whole pod, metered from the newest complete\n"
             "frame set. The darkest need wins, so if any camera clips, everyone backs off.\n"
             "Off leaves each camera on whatever it currently holds.", padx=6)
@@ -684,6 +684,13 @@ class App(tk.Tk):
               "holds once recovered. Only with RMS day_highlight_rebuild: true on the stations,\n"
               "which rebuilds the magenta areas in the saved day frames. Cleared: the rung backs\n"
               "off to s = 1 whenever a frame shows raw saturation (no magenta at all).")
+        check(g, "individual AE", self.individual_ae, tip=
+              "Checked: every camera is driven by its OWN controller (same logic: clean-zone\n"
+              "metering, highlight priority, slow slews, its own WB rung, the night latch), so the\n"
+              "sun camera no longer darkens the others. Saved frames carry their exposure\n"
+              "(RMS save_frame_metadata); the sky view's 'const exp' reunifies the pod view.\n"
+              "At night all cameras latch to the same RMS night line. Takes effect the next time\n"
+              "AE is switched on. Cleared: one shared exposure for the pod.")
         check(g, "camera meter", self.camera_meter, tip=
               "Checked: meter each camera from its own ISP statistics (ae_stats + wb_stats: the\n"
               "current frame, linear, zones touching no mask only) instead of RMS's saved frames,\n"
@@ -1322,7 +1329,7 @@ class App(tk.Tk):
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "wb_rung_magenta_ok": bool(self.magenta_ok.get()),
-             "camera_meter": bool(self.camera_meter.get()),
+             "camera_meter": bool(self.camera_meter.get()), "individual_ae": bool(self.individual_ae.get()),
              "flare_radius_deg": float(self.flare_w.get()),
              "clip_min_blob_px": int(self.min_blob.get()), "moon_radius_deg": float(self.moon_radius.get()),
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
@@ -1378,10 +1385,33 @@ class App(tk.Tk):
                 self.hist_canvas.delete("all")
                 self.hist_canvas.create_text(20, 20, text="history: %s" % e, fill="#b3402a", anchor="nw")
 
+    def _saved_setting(self, key, default):
+        try:
+            return SETTINGS.load().get(key, default)
+        except Exception:
+            return default
+
+    def _make_ae(self, individual):
+        """A shared (one exposure for the pod) or individual (one controller per camera) AE,
+        with the RMS night line as its top rung. The config object is carried over."""
+        cfg = getattr(getattr(self, "ae", None), "cfg", None)
+        if individual:
+            from podcontrol.individualae import IndividualAE
+            ae = IndividualAE(self.pod, cfg=cfg)
+        else:
+            ae = SharedAE(self.pod, cfg=cfg) if cfg is not None else SharedAE(self.pod)
+        configure_from_pod(ae, self.pod)
+        return ae
+
+    def _ae_label(self):
+        return "%s AE" % ("Individual" if getattr(self.ae, "individual", False) else "Shared")
+
     def toggle_ae(self):
         self.ae_on = not self.ae_on
         self._schedule_save()
-        self.ae_btn.config(text="Shared AE: %s" % ("ON" if self.ae_on else "OFF"),
+        if self.ae_on and bool(self.individual_ae.get()) != bool(getattr(self.ae, "individual", False)):
+            self.ae = self._make_ae(bool(self.individual_ae.get()))    # the mode switch takes effect here
+        self.ae_btn.config(text="%s: %s" % (self._ae_label(), "ON" if self.ae_on else "OFF"),
                            fg=("#7fc776" if self.ae_on else "#000"))
         if self.ae_on:
             # start from the cameras' current (darkest) exposure, not a fixed
@@ -1397,7 +1427,7 @@ class App(tk.Tk):
     def auto_all(self):
         self.ae_on = False
         self._schedule_save()
-        self.ae_btn.config(text="Shared AE: OFF", fg="#000")
+        self.ae_btn.config(text="%s: OFF" % self._ae_label(), fg="#000")
         threading.Thread(target=lambda: self.pod.auto_all(), daemon=True).start()
 
     def _on_select(self, station_id):

@@ -8,8 +8,9 @@ pure gamma 0.5 (full range), so a pixel converts exactly to light on a fixed sca
 
 and back to a display value at a reference exposure E_ref: v' = 255 * sqrt(min(1, light * E_ref)).
 Each tile is therefore scaled in linear light by k = E_ref / E_camera. E_camera is looked up
-in podcontrol's history (one poll per ~5 s) at the frame's capture time; E_ref is the median
-of the cameras' exposures unless given.
+from the metadata RMS embeds in each saved frame (exact, includes the WB-rung scale), else in
+podcontrol's history (one poll per ~5 s) at the frame's capture time; E_ref is the median of
+the cameras' exposures unless given.
 
 Limits (a demo, not the product): the 5 s poll can miss an exposure change between poll and
 frame; per-camera sensitivity (~5% in red between units) and vignetting are not calibrated
@@ -52,13 +53,33 @@ def scale(img, k):
     return (255.0 * np.sqrt(np.clip(lin * k, 0.0, 1.0)) + 0.5).astype(np.uint8)
 
 
+def frame_exposure(path):
+    """The frame's own total exposure from the metadata RMS embeds (save_frame_metadata):
+    exposure x analog x sensor-digital x ISP-digital gain x the WB scale (the green gain, 1.0 at
+    the day base; the rung scales every gain by it). Exact per frame; None without metadata."""
+    try:
+        from RMS.FrameMetadata import readImageMeta
+    except Exception:
+        return None
+    try:
+        m = readImageMeta(path) or {}
+        e = float(m["exp_us"]) * float(m["again"]) * float(m.get("dgain") or 1.0) * float(m.get("ispdgain") or 1.0)
+        return e * float(m.get("wb_g") or 1.0)
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
 def constant_exposure(paths, records, e_ref=None):
     """({sid: scaled image}, {sid: cache path tagged with k}, info) for the sky compositor.
     Cameras whose exposure cannot be found are left out of the scaling (drawn as they are)."""
-    es = {}
+    es, src = {}, {}
     for sid, p in paths.items():
-        t = frames.frame_capture_time(p)
-        e = exposure_at(records, sid, t) if t is not None else None
+        e = frame_exposure(p)                  # exact, from the frame itself
+        src[sid] = "frame"
+        if not e:
+            t = frames.frame_capture_time(p)   # fallback: the history poll nearest the capture
+            e = exposure_at(records, sid, t) if t is not None else None
+            src[sid] = "poll"
         if e:
             es[sid] = e
     if not es:
@@ -73,4 +94,4 @@ def constant_exposure(paths, records, e_ref=None):
         imgs[sid] = scale(img, k) if abs(k - 1.0) > 1e-3 else img
         tagged[sid] = "%s#k=%.4f" % (p, k)
         ks[sid] = k
-    return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es}
+    return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src}
