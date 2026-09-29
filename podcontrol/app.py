@@ -587,11 +587,21 @@ class App(tk.Tk):
             return w
 
         def pair(parent, txt, var, lo, hi, inc, width, fmt=None, tip=None, unit=None, unit_pad=0):
-            """label + spinbox (+ unit) sharing one tip, so hovering any of them helps."""
-            lab(parent, txt, tip=tip)
-            spin(parent, var, lo, hi, inc, width, fmt, tip=tip)
+            """label + spinbox (+ unit) sharing one tip, so hovering any of them helps. Built in
+            one sub-frame: the side column flows each group's children as embedded windows, and
+            Tk may break a line between any two of them, which split labels from their boxes."""
+            f = unit_box(parent)
+            lab(f, txt, tip=tip)
+            spin(f, var, lo, hi, inc, width, fmt, tip=tip)
             if unit is not None:
-                lab(parent, unit, tip=tip, padx=(0, unit_pad))
+                lab(f, unit, tip=tip, padx=(0, unit_pad))
+            return f
+
+        def unit_box(parent, **kw):
+            """a frame whose contents flow (and wrap) as one piece in the side column."""
+            f = tk.Frame(parent, bg=BG)
+            f.pack(side="left", **kw)
+            return f
 
         g = group(row1, "control", "Pod-wide actions. Everything here acts on all six cameras at once.")
         btn(g, "Auto All", self.auto_all,
@@ -750,9 +760,7 @@ class App(tk.Tk):
                   "before green. The shared AE's WB rung attenuates all three together below\n"
                   "the exposure floor.")
         for txt, var in (("R", self.wb_r), ("G", self.wb_g), ("B", self.wb_b)):
-            lab(g, txt, tip=wb_tip)
-            spin(g, var, 0.25, 4.0, 0.01, 5, "%.2f", tip=wb_tip)
-            lab(g, "", tip=wb_tip, padx=(0, 4))
+            pair(g, txt, var, 0.25, 4.0, 0.01, 5, "%.2f", tip=wb_tip, unit="", unit_pad=4)
         btn(g, "Apply", self.apply_wb,
             "Push these three gains to every camera as a manual white balance.", padx=(4, 4))
         btn(g, "Auto", self.wb_auto,
@@ -762,9 +770,10 @@ class App(tk.Tk):
                  "illuminant of that temperature, with G kept as it is.\n"
                  "One axis only: the green-magenta tint is fixed to the locus, so this cannot\n"
                  "reproduce every balance. The cloud calibrator stays the source of truth.")
-        lab(g, "≈", tip=k_tip, padx=(8, 0))
-        spin(g, self.wb_k, 3800, 20000, 100, 6, tip=k_tip)
-        lab(g, "K", tip=k_tip)
+        f = unit_box(g, padx=(8, 0))
+        lab(f, "≈", tip=k_tip)
+        spin(f, self.wb_k, 3800, 20000, 100, 6, tip=k_tip)
+        lab(f, "K", tip=k_tip)
         self._update_kelvin()
 
         g = group(row2, "colour (pod-wide)",
@@ -783,8 +792,9 @@ class App(tk.Tk):
                    "  off       the stage is bypassed, which makes satu INERT. Raw sensor colour.\n"
                    "Both identity and auto reach TRUE mono at satu 0 (measured chroma exactly\n"
                    "0.00), so RMS's night line gives mono science frames either way.")
-        lab(g, "ccm", tip=ccm_tip)
-        om = tk.OptionMenu(g, self.ccm_mode, "identity", "auto", "off")
+        f = unit_box(g)
+        lab(f, "ccm", tip=ccm_tip)
+        om = tk.OptionMenu(f, self.ccm_mode, "identity", "auto", "off")
         om.config(width=7, bg=BG, fg="#c8bfa8", activebackground=BG, highlightthickness=0)
         om.pack(side="left", padx=(0, 6))
         Tip(om, ccm_tip)
@@ -794,9 +804,10 @@ class App(tk.Tk):
                     "255 = 1.99x is the ceiling because the ISP register is 8-bit: 2.00x would\n"
                     "need 256, which does not fit, so 1.99x is as high as the hardware goes.\n"
                     "Does nothing while the matrix on the left is `off`.")
-        lab(g, "satu", tip=satu_tip)
-        spin(g, self.satu, 0, 255, 8, 4, tip=satu_tip)
-        self.satu_x = tk.Label(g, text="", fg="#f0a830", bg=BG, font=(MONO, 9, "bold"))
+        f = unit_box(g)
+        lab(f, "satu", tip=satu_tip)
+        spin(f, self.satu, 0, 255, 8, 4, tip=satu_tip)
+        self.satu_x = tk.Label(f, text="", fg="#f0a830", bg=BG, font=(MONO, 9, "bold"))
         self.satu_x.pack(side="left", padx=(4, 6))
         Tip(self.satu_x, satu_tip)
         btn(g, "Apply", self.apply_colour,
