@@ -14,7 +14,8 @@ the cameras' exposures unless given.
 
 Limits (a demo, not the product): the 5 s poll can miss an exposure change between poll and
 frame; per-camera sensitivity (~5% in red between units) and vignetting are not calibrated
-and will show as seams; clipped pixels stay clipped (only a lower bound on the light).
+and will show as seams; clipped pixels stay clipped (only a lower bound on the light). For
+display, highlights above ~60% of white roll off smoothly (rolloff), the same for every tile.
 """
 import numpy as np
 
@@ -47,10 +48,23 @@ def exposure_at(records, sid, t, max_gap=15.0):
     return e * float(best[1].get("wb_scale") or 1.0)
 
 
-def scale(img, k):
-    """img (uint8, gamma 0.5) scaled by k in linear light, back to uint8 gamma 0.5."""
-    lin = (img.astype(np.float32) / 255.0) ** 2
-    return (255.0 * np.sqrt(np.clip(lin * k, 0.0, 1.0)) + 0.5).astype(np.uint8)
+KNEE = 0.36    # linear level (= 60% of display white after gamma 0.5) above which highlights roll off
+
+
+def rolloff(lin, knee=KNEE):
+    """Soft highlight compression in linear light, identical for every tile: unchanged below the
+    knee, then an exponential shoulder that approaches 1 without ever clipping. A common exposure
+    spans more than the display can show (the sun camera, brought to the pod's median exposure,
+    lands up to ~4x above white); a hard clip blew those tiles out (US05B1: 9% clipped as
+    captured, 50% in the merged view), this keeps their detail and the mosaic seamless."""
+    over = np.maximum(lin - knee, 0.0)
+    return np.where(lin <= knee, lin, knee + (1.0 - knee) * (1.0 - np.exp(-over / (1.0 - knee))))
+
+
+def scale(img, k, knee=KNEE):
+    """img (uint8, gamma 0.5) scaled by k in linear light, highlights rolled off, back to uint8."""
+    lin = (img.astype(np.float32) / 255.0) ** 2 * k
+    return (255.0 * np.sqrt(np.clip(rolloff(lin, knee), 0.0, 1.0)) + 0.5).astype(np.uint8)
 
 
 def frame_exposure(path):
@@ -91,7 +105,7 @@ def constant_exposure(paths, records, e_ref=None):
         if img is None:
             continue
         k = ref / es[sid] if sid in es else 1.0
-        imgs[sid] = scale(img, k) if abs(k - 1.0) > 1e-3 else img
+        imgs[sid] = scale(img, k)                  # every tile through the same curve
         tagged[sid] = "%s#k=%.4f" % (p, k)
         ks[sid] = k
     return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src}
