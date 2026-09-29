@@ -153,9 +153,12 @@ restart_one() {
     # setsid so the new app outlives this script and its cron parent.
     # Its output goes to a log, not /dev/null: a relaunch that dies at startup
     # otherwise leaves nothing to say why.
+    # 9>&- because fd 9 is the cc-utils updater's run lock: inherited, the app
+    # held it for its whole life and every later hourly run bailed out as "already
+    # running". On 2026-09-29 a commit pushed at 18:00 was not pulled until 23:07.
     mkdir -p "$(dirname "$LAUNCH_LOG")"
     echo "$(date -u +%FT%TZ) relaunch: ${argv[*]} (DISPLAY=${DISPLAY:-})" >> "$LAUNCH_LOG"
-    ( cd "$cwd" && setsid nohup "${argv[@]}" >>"$LAUNCH_LOG" 2>&1 < /dev/null & ) || {
+    ( cd "$cwd" && setsid nohup "${argv[@]}" >>"$LAUNCH_LOG" 2>&1 < /dev/null & ) 9>&- || {
         cc_warn "relaunch failed: ${argv[*]}"; return 1; }
     for ((i = 0; i < START_WAIT; i++)); do
         sleep 1

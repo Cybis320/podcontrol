@@ -18,7 +18,7 @@
 # Afterwards the installed copy of this script is replaced by the newest kit
 # found in any checkout (higher CC_KIT_VERSION wins).
 #
-CC_KIT_VERSION=1
+CC_KIT_VERSION=2
 
 set -uo pipefail
 
@@ -39,6 +39,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 # One run at a time.
 exec 9>"$(dirname "$LOG")/cc-utils-update.lock"
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    log "another run holds the lock; skipped"
     exit 0
 fi
 
@@ -69,7 +70,9 @@ update_one() {
 
     applied="$(cat "$dir/.git/cc-utils-applied" 2>/dev/null || true)"
     if [ "$applied" != "$after" ]; then
-        if (cd "$dir" && timeout 600 ./scripts/post-update.sh); then
+        # 9>&-: a hook that starts a long-lived process (Pod Control's restart)
+        # must not hand it the lock, or every later run is skipped.
+        if (cd "$dir" && timeout 600 ./scripts/post-update.sh 9>&-); then
             echo "$after" >"$dir/.git/cc-utils-applied"
             log "$name: post-update applied at ${after:0:8}"
         else
