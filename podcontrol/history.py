@@ -96,6 +96,13 @@ def make_record(poll, info, metering, sun, ae_on, max_li=None, slot=None):
            "clip": max(clips) if clips else None, "slot": slot,
            "sun_alt": sun[0] if sun else None, "max_li": max_li}
     if info:
+        # individual AE: each camera's own controller state next to its exposure, so the
+        # history shows what every camera's AE and WB rung did (the pod fields are medians)
+        for sid, pc in (info.get("per_cam") or {}).items():
+            if sid in cams:
+                cams[sid].update({"ae_li": pc.get("li"), "ae_target": pc.get("target"),
+                                  "wb_scale": pc.get("wb_scale"), "reason": pc.get("reason")})
+        rec["mode"] = "individual" if info.get("individual") else "shared"
         rec.update({"li": info.get("li"), "target": info.get("target"), "exp_us": info.get("exp_us"),
                     "gain": info.get("total_gain_x"), "state": info.get("state"),
                     "reason": info.get("reason"), "driver": info.get("driver"),
