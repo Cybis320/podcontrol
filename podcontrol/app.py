@@ -557,13 +557,25 @@ class App(tk.Tk):
 
         g = group(row1, "control", "Pod-wide actions. Everything here acts on all six cameras at once.")
         btn(g, "Auto All", self.auto_all,
-            "Hand every camera back to RMS's own day exposure line and switch Shared AE off.\n"
+            "Hand every camera back to RMS's own day exposure line and switch AE off.\n"
             "Never sends a bare `auto`: on the Goke that would reset the AE ranges and break\n"
             "the science config's fixed sensor digital gain.")
-        self.ae_btn = btn(g, "%s: OFF" % self._ae_label(), self.toggle_ae,
-            "Drive ONE exposure and gain onto the whole pod, metered from the newest complete\n"
-            "frame set. The darkest need wins, so if any camera clips, everyone backs off.\n"
-            "Off leaves each camera on whatever it currently holds.", padx=6)
+        self.ae_btn = btn(g, "AE: OFF", self.toggle_ae,
+            "Switch podcontrol's exposure control on or off. How it drives the cameras is the\n"
+            "choice right next to it (shared / individual). Off leaves each camera on whatever\n"
+            "it currently holds.", padx=(6, 2))
+        mode_tip = ("shared: ONE exposure and gain for the whole pod; the darkest need wins, so if any\n"
+                    "camera clips, everyone backs off (the sun camera darkens all six).\n"
+                    "individual: every camera driven by its own controller with the same logic (clean-zone\n"
+                    "metering, highlight priority, slow slews, its own WB rung); saved frames carry their\n"
+                    "exposure and the sky view's 'const exp' reunifies the pod. At night all cameras latch\n"
+                    "to the same RMS night line either way. Changing it with AE on hands the cameras back\n"
+                    "and takes over again at once.")
+        for val, txt in ((False, "shared"), (True, "individual")):
+            w = tk.Radiobutton(g, text=txt, variable=self.individual_ae, value=val, fg="#c8bfa8", bg=BG,
+                               selectcolor=BG, activebackground=BG)
+            w.pack(side="left", padx=(0, 2 if not val else 6))
+            Tip(w, mode_tip)
         self.cal_btn = btn(g, "Calibrate WB (cloud)", self.calibrate_wb,
             "Drag a box over a grey cloud on one tile, then click. Iterates the white-balance\n"
             "gains until that region is neutral and pushes the result to every camera.\n"
@@ -573,7 +585,7 @@ class App(tk.Tk):
             "ISP gain fixed), measuring sky and noise ON the camera (no extra stream), and\n"
             "proposes the lowest gain that loses no sensitivity -- the darkest sky's need.\n"
             "Shows the table; nothing is saved until you click Apply, which sets the cameras\n"
-            "and RMS's night line in the settings JSON. Switch Shared AE off first.", padx=(0, 6))
+            "and RMS's night line in the settings JSON. Switch AE off first.", padx=(0, 6))
         btn(g, "History", self.toggle_history,
             "Open the 12-hour chart: exposure and total gain per camera, pod luma against the\n"
             "clipping ceiling, and the clipped fraction, with night and latched shading.")
@@ -685,14 +697,6 @@ class App(tk.Tk):
               "holds once recovered. Only with RMS day_highlight_rebuild: true on the stations,\n"
               "which rebuilds the magenta areas in the saved day frames. Cleared: the rung backs\n"
               "off to s = 1 whenever a frame shows raw saturation (no magenta at all).")
-        check(g, "individual AE", self.individual_ae, tip=
-              "Checked: every camera is driven by its OWN controller (same logic: clean-zone\n"
-              "metering, highlight priority, slow slews, its own WB rung, the night latch), so the\n"
-              "sun camera no longer darkens the others. Saved frames carry their exposure\n"
-              "(RMS save_frame_metadata); the sky view's 'const exp' reunifies the pod view.\n"
-              "At night all cameras latch to the same RMS night line. Takes effect at once (with\n"
-              "AE on: the cameras are handed back and taken over again). Cleared: one shared\n"
-              "exposure for the pod.")
         check(g, "camera meter", self.camera_meter, tip=
               "Checked: meter each camera from its own ISP statistics (ae_stats + wb_stats: the\n"
               "current frame, linear, zones touching no mask only) instead of RMS's saved frames,\n"
@@ -1413,7 +1417,6 @@ class App(tk.Tk):
             return
         if not self.ae_on:
             self.ae = self._make_ae(want)
-            self.ae_btn.config(text="%s: OFF" % self._ae_label(), fg="#000")
             return
         old = self.ae
         def _swap():
@@ -1425,7 +1428,6 @@ class App(tk.Tk):
             feed_sun(new, self.pod)
             new.takeover(self.pod.poll_all(timeout=4))
             self.ae, self.ae_info = new, None
-            self.after(0, lambda: self.ae_btn.config(text="%s: ON" % self._ae_label(), fg="#7fc776"))
         threading.Thread(target=_swap, daemon=True).start()
 
     def _ae_label(self):
@@ -1436,7 +1438,7 @@ class App(tk.Tk):
         self._schedule_save()
         if self.ae_on and bool(self.individual_ae.get()) != bool(getattr(self.ae, "individual", False)):
             self.ae = self._make_ae(bool(self.individual_ae.get()))    # the mode switch takes effect here
-        self.ae_btn.config(text="%s: %s" % (self._ae_label(), "ON" if self.ae_on else "OFF"),
+        self.ae_btn.config(text="AE: %s" % ("ON" if self.ae_on else "OFF"),
                            fg=("#7fc776" if self.ae_on else "#000"))
         if self.ae_on:
             # start from the cameras' current (darkest) exposure, not a fixed
@@ -1452,7 +1454,7 @@ class App(tk.Tk):
     def auto_all(self):
         self.ae_on = False
         self._schedule_save()
-        self.ae_btn.config(text="%s: OFF" % self._ae_label(), fg="#000")
+        self.ae_btn.config(text="AE: OFF", fg="#000")
         threading.Thread(target=lambda: self.pod.auto_all(), daemon=True).start()
 
     def _on_select(self, station_id):
@@ -1523,7 +1525,7 @@ class App(tk.Tk):
         if self.ae_on and not getattr(self.ae, "latched", False):
             messagebox.showinfo(
                 "Night gain calibration",
-                "Shared AE is still driving the pod (not yet latched at the night line).\n\n"
+                "AE is still driving the pod (not yet latched at the night line).\n\n"
                 "Calibrate at night, once it has latched.", parent=self)
             return
         self.calibrating = True

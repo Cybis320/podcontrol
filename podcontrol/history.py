@@ -190,7 +190,7 @@ def draw_history(canvas, records, hours=12.0, now=None, cam_order=None, night_de
         canvas.create_text(W - R + 6, Ys(a), text="%d\u00b0" % a, fill="#5a6a7a", anchor="w", font=("JetBrains Mono", 8))
     sp = [(X(r["t"]), Ys(r["sun_alt"])) for r in recs if r.get("sun_alt") is not None]
     if len(sp) > 1: canvas.create_line(*[c for p in sp for c in p], fill="#e8c060", dash=(2, 3))
-    canvas.create_text(L + 6, y0 + 2, text="exposure time (per camera; green = pod when Shared AE drives) \u00b7 sun altitude (dashed, right)", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
+    canvas.create_text(L + 6, y0 + 2, text="exposure time (per camera; green = pod when shared AE drives) \u00b7 sun altitude (dashed, right)", fill=fg, anchor="nw", font=("JetBrains Mono", 8))
 
     # ---- panel 1b: total gain (log) / ISO ----
     y0, y1 = panels[1]
