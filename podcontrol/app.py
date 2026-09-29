@@ -20,7 +20,7 @@ if __name__ == "__main__" and not __package__:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-import time, threading, queue, os, signal
+import math, time, threading, queue, os, signal
 import tkinter as tk
 import cv2
 import numpy as np
@@ -51,6 +51,7 @@ TINT_CLIP, TINT_HOT = (255, 0, 255), (0, 255, 255)        # what drives the AE
 OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
 MONO = "JetBrains Mono"
+SIDE_W = 470         # width of the options column on the right (px)
 SKY_SIZE = 900        # internal size of the sky composite (px); scaled to the canvas
 # Degrees of sun altitude ABOVE RMS's day/night switch at which podcontrol
 # stops touching colour. RMS owns colour across its switches, so going quiet
@@ -362,6 +363,30 @@ class Tile(tk.Frame):
             line3))
 
 
+_DRY_READS = ("wb", "query", "sysinfo", "ae_stats", "wb_stats", "af_stats", "noise_stats", "satu", "ccm",
+              "venc_qp", "venc_cqp", "venc_gop", "persist", "status")
+
+
+def _dry_pod(pod):
+    """PODCONTROL_DRY: every camera-WRITING path of a PodController becomes a no-op -- the
+    high-level setters AND the low-level broadcast senders (the venc_* setters go through
+    _bcast_venc), so nothing added later can slip past. one() still answers read queries
+    (bare read commands only); anything else is dropped."""
+    for name in ("manual_all", "release", "auto_all", "wb_all", "wb_auto_all", "satu_all", "ccm_all",
+                 "one_live", "_bcast", "_bcast_live", "_bcast_venc", "venc_qp_all", "venc_cqp_all",
+                 "venc_gop_all"):
+        setattr(pod, name, lambda *a, **k: {})
+    real_one = pod.one
+
+    def one(station_id, cmd, timeout=5.0):
+        p = (cmd or "").split()
+        if len(p) == 1 and p[0] in _DRY_READS:
+            return real_one(station_id, cmd, timeout)
+        return None
+    pod.one = one
+    return pod
+
+
 class App(tk.Tk):
     def __init__(self, allow_grab=True):
         super().__init__()
@@ -383,14 +408,7 @@ class App(tk.Tk):
         self.dry = bool(os.environ.get("PODCONTROL_DRY"))
         if self.dry:
             self.title("Pod Control %s — DRY RUN (no camera writes)" % VERSION.short())
-            self.pod.manual_all = lambda *a, **k: {}
-            self.pod.release = lambda *a, **k: {}
-            self.pod.auto_all = lambda *a, **k: {}
-            self.pod.wb_all = lambda *a, **k: {}          # the WB rung / Apply push wb
-            self.pod.wb_auto_all = lambda *a, **k: {}
-            self.pod.satu_all = lambda *a, **k: {}
-            self.pod.ccm_all = lambda *a, **k: {}
-            self.pod.one_live = lambda *a, **k: {}
+            _dry_pod(self.pod)
         self.allow_grab = allow_grab
         self.ae = self._make_ae(bool(self._saved_setting("individual_ae", False)))
         self.ae_on = False
@@ -471,7 +489,13 @@ class App(tk.Tk):
         self.ver_lbl.pack(side="right")
         Tip(self.ver_lbl, VERSION.detail())
 
-        grid = tk.Frame(self, bg=BG); grid.pack(fill="both", expand=True, padx=8, pady=8)
+        # ---- body: the image (tiles / sky map) on the left, all options in a column on the right
+        body = tk.Frame(self, bg=BG); body.pack(fill="both", expand=True, padx=8, pady=(4, 4))
+        self.side = tk.Frame(body, bg=BG); self.side.pack(side="right", fill="y", padx=(8, 0))
+        self.view_area = tk.Frame(body, bg=BG); self.view_area.pack(side="left", fill="both", expand=True)
+        self._side_groups = []
+
+        grid = tk.Frame(self.view_area, bg=BG); grid.pack(fill="both", expand=True)
         rows = (len(self.stations) + COLS - 1) // COLS
         for c in range(COLS):
             grid.columnconfigure(c, weight=1, uniform="tilecol")
@@ -488,7 +512,7 @@ class App(tk.Tk):
         # Rendered in the updater thread from the same frames, only while it
         # is shown (the hidden tiles are then not drawn at all); the Tk thread
         # only scales the finished image to the canvas.
-        self.sky_canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
+        self.sky_canvas = tk.Canvas(self.view_area, bg=BG, highlightthickness=0)
         self.sky_canvas.bind("<Configure>", self._on_sky_resize)
         self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE),
                                         vig_coeff=(VIGNETTE.clamp(self.vig_coeff.get())
@@ -505,15 +529,29 @@ class App(tk.Tk):
         self.view = v if v in ("tiles", "sky") else "tiles"
 
         # ---- toolbar: grouped controls on two rows, status on its own row ----
-        tb = tk.Frame(self, bg=BG); tb.pack(fill="x", padx=8, pady=(0, 6))
+        tb = self.side
         self.toolbar = tb
-        row1 = tk.Frame(tb, bg=BG); row1.pack(fill="x")
-        row2 = tk.Frame(tb, bg=BG); row2.pack(fill="x", pady=(4, 0))
+        from podcontrol.sunstrip import SunStrip
+        c_ = self.ae.cfg
+        sg = tk.LabelFrame(tb, text="sun (UTC)", fg="#a4967c", bg=BG, bd=1, relief="groove",
+                           font=(MONO, 8), padx=4, pady=2)
+        sg.pack(side="top", fill="x", pady=(0, 6))
+        self.sunstrip = SunStrip(sg, self.stations[0], width=SIDE_W - 20, height=190, bg=BG, levels=[
+            (0.0, "sunrise/set", "#f0c040"), (-6.0, "civil", "#c89a50"),
+            (float(c_.night_switch_deg), "RMS switch", "#7fc776"),
+            (float(c_.latch_deg), "night latch", "#6fa8dc"), (-18.0, "astro", "#8a7fb0")])
+        self.sunstrip.pack(fill="x")
+        Tip(self.sunstrip, "The sun's altitude over the UTC day around now (yellow), with the lines podcontrol\n"
+                           "and RMS act on: 0 deg sunrise/sunset, -6 civil twilight, the RMS day/night switch,\n"
+                           "the night latch, -18 astronomical twilight. Each crossing is marked with its UTC\n"
+                           "time; the white line is now. Recomputed every 10 minutes.")
+        row1 = row2 = tb
 
         def group(parent, title, tip=None):
             g = tk.LabelFrame(parent, text=title, fg="#a4967c", bg=BG, bd=1, relief="groove",
                               font=(MONO, 8), padx=6, pady=2)
-            g.pack(side="left", padx=(0, 8), fill="y")
+            g.pack(side="top", fill="x", pady=(0, 6))
+            self._side_groups.append(g)
             if tip:
                 Tip(g, tip)
             return g
@@ -777,6 +815,8 @@ class App(tk.Tk):
               "up on the science baseline. The durable place for a permanent change is the\n"
               "day entry of camera_settings.json.")
         self._update_satu_label()
+
+        self._flow_groups()
 
         self.status = tk.Label(self, text="starting\u2026", fg="#a4967c", bg=BG, font=(MONO, 9), anchor="w")
         self.status.pack(fill="x", padx=12, pady=(0, 6))
@@ -1148,14 +1188,14 @@ class App(tk.Tk):
         self.view_btn.config(text="View: %s" % self.view)
         if self.view == "sky":
             self.grid_frame.pack_forget()
-            self.sky_canvas.pack(fill="both", expand=True, padx=8, pady=8, before=self.toolbar)
+            self.sky_canvas.pack(fill="both", expand=True)
             if self._sky_rgb is None:
                 self._show_sky(None)                   # placeholder until the render lands
             if not initial:                            # at start the first cycle renders it anyway
                 self._pool.submit(self._sky_now)       # do not wait for the next cycle
         else:
             self.sky_canvas.pack_forget()
-            self.grid_frame.pack(fill="both", expand=True, padx=8, pady=8, before=self.toolbar)
+            self.grid_frame.pack(fill="both", expand=True)
             if self._last_cycle:
                 self._render_tiles(*self._last_cycle)  # the tiles were not drawn while hidden
 
@@ -1391,6 +1431,48 @@ class App(tk.Tk):
                 self.hist_canvas.delete("all")
                 self.hist_canvas.create_text(20, 20, text="history: %s" % e, fill="#b3402a", anchor="nw")
 
+    def _flow_groups(self):
+        """Wrap each option group's controls to the side panel's width: the widgets (built
+        packed in one row) become embedded windows of a Text in their own group, which lays
+        them out left to right and wraps between them. Nothing is re-created, so every
+        control, variable and tip is untouched."""
+        import tkinter.font as tkfont
+        cw = max(1, tkfont.nametofont("TkDefaultFont").measure("0"))
+        self._flows = []
+        for g in self._side_groups:
+            kids = g.pack_slaves()
+            for k in kids:
+                k.pack_forget()
+            t = tk.Text(g, bg=BG, fg=BG, bd=0, highlightthickness=0, wrap="word", cursor="arrow",
+                        width=max(20, (SIDE_W - 40) // cw), height=1, padx=0, pady=0, takefocus=0,
+                        font=("TkDefaultFont", 2))
+            for i, k in enumerate(kids):
+                t.window_create("end", window=k, padx=2, pady=2, align="center")
+                k.lift(t)                  # created before the Text: raise it or the Text hides it
+                # a (tiny) space is where a line may break: never after a label, so a label
+                # stays on the same line as the control it names
+                if i + 1 < len(kids) and not isinstance(k, tk.Label):
+                    t.insert("end", " ")
+            t.configure(state="disabled")
+            t.pack(fill="x")
+            self._flows.append(t)
+        self.after(300, self._fit_flows)
+        self.bind("<Map>", lambda e: self.after(100, self._fit_flows), add="+")
+
+    def _fit_flows(self):
+        """Size each flow Text to the height of its wrapped content."""
+        import tkinter.font as tkfont
+        for t in getattr(self, "_flows", []):
+            try:
+                ls = max(1, tkfont.Font(font=t.cget("font")).metrics("linespace"))   # the Text's own font
+                t.update_idletasks()
+                px = t.count("1.0", "end", "ypixels")
+                px = px[0] if isinstance(px, tuple) else px
+                if px:
+                    t.configure(height=max(1, int(math.ceil(px / float(ls)))))
+            except Exception:
+                pass
+
     def _saved_setting(self, key, default):
         try:
             return SETTINGS.load().get(key, default)
@@ -1404,6 +1486,11 @@ class App(tk.Tk):
         if individual:
             from podcontrol.individualae import IndividualAE
             ae = IndividualAE(self.pod, cfg=cfg)
+            if getattr(self, "dry", False):
+                # each camera's controller has its OWN one-camera PodController: stub those too,
+                # or a dry run writes to the cameras (it did, 2026-09-29, during a layout test)
+                for sub in ae.subs.values():
+                    _dry_pod(sub.pod)
         else:
             ae = SharedAE(self.pod, cfg=cfg) if cfg is not None else SharedAE(self.pod)
         configure_from_pod(ae, self.pod)
