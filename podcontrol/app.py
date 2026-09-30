@@ -1080,8 +1080,9 @@ class App(tk.Tk):
             ks = self._const_info["k"]
             txt = "constant exposure %.0f us-x   k: %s" % (self._const_info["e_ref"],
                    " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
-            cv2.putText(bgr, txt, (10, bgr.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(bgr, txt, (10, bgr.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # one line above the renderer's own caption (time, cameras, coverage) at h - 8
+            from podcontrol.skymap import _text
+            _text(bgr, txt, (6, bgr.shape[0] - 26), 0.45)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread
         return _fit_to(rgb, wh) if wh else rgb
