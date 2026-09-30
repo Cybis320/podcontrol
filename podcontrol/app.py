@@ -424,6 +424,8 @@ class App(tk.Tk):
         self.interval = tk.DoubleVar(value=sv("refresh_s", 5.0))
         self.overlay = tk.BooleanVar(value=sv("overlay", True))
         self.const_exp = tk.BooleanVar(value=sv("sky_constant_exposure", False))
+        _pj = saved.get("sky_projection", "equidistant")       # a string: sv() takes numbers only
+        self.sky_proj = tk.StringVar(value=_pj if _pj in skymap.RADIALS else "equidistant")
         self.sun_radius = tk.DoubleVar(value=sv("sun_radius_deg", F.SUN_RADIUS_DEG[0]))
         self.slew = tk.DoubleVar(value=sv("slew", self.ae.cfg.slew))
         self.slew_fast = tk.DoubleVar(value=sv("slew_fast", self.ae.cfg.slew_fast))
@@ -514,7 +516,9 @@ class App(tk.Tk):
         # only scales the finished image to the canvas.
         self.sky_canvas = tk.Canvas(self.view_area, bg=BG, highlightthickness=0)
         self.sky_canvas.bind("<Configure>", self._on_sky_resize)
-        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE),
+        self._sky_proj_live = self.sky_proj.get()      # the projection sky_r was built for
+        self._sky_proj_busy = False
+        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE, radial=self._sky_proj_live),
                                         vig_coeff=(VIGNETTE.clamp(self.vig_coeff.get())
                                                    if self.vig_on.get() else 0.0))
         self._sky_rgb = None
@@ -640,6 +644,21 @@ class App(tk.Tk):
         self.view_btn = btn(g, "View: tiles", self.toggle_view,
             "Switch between the six preview tiles and one all-sky composite of the whole pod,\n"
             "projected from the stations' RMS platepars.", padx=(6, 0))
+        proj_tip = ("Projection of the sky view, the same four as Janus's ground-truth editor (same\n"
+                    "constants), all centred on the zenith; only the radius changes:\n"
+                    "  equidistant    radius ~ zenith angle: the RMS base projection, the all-sky look\n"
+                    "  stereographic  radius ~ tan(zenith/2): shapes kept true near the horizon\n"
+                    "  aerial         the 10 km contrail layer seen from 30 km above it: to scale near\n"
+                    "                 the centre, compressed smoothly outward, the whole dome fits\n"
+                    "  ground         the contrail layer as a flat map, distances to scale; stops at\n"
+                    "                 10 deg altitude (it runs to infinity at the horizon)\n"
+                    "The first switch to a projection builds its lookup tables (~10 s, the old view\n"
+                    "stays up meanwhile); after that they come from the disk cache.")
+        f = unit_box(g, padx=(4, 0))
+        om = tk.OptionMenu(f, self.sky_proj, *skymap.RADIALS, command=lambda _v: self._sky_proj_changed())
+        om.config(width=12, bg=BG, fg="#c8bfa8", activebackground=BG, highlightthickness=0)
+        om.pack(side="left")
+        Tip(om, proj_tip)
 
         g = group(row1, "loop", "Loop timing and how fast the shared AE is allowed to move.")
         pair(g, "refresh", self.interval, 2, 60, 1, 4, tip=
@@ -1133,6 +1152,35 @@ class App(tk.Tk):
             self.after_cancel(self._sky_job)
         self._sky_job = self.after(80, self._fit_sky)
 
+    def _sky_proj_changed(self):
+        self._schedule_save()
+        if not self._sky_proj_busy:
+            self._sky_proj_busy = True
+            self._pool.submit(self._sky_proj_build)
+
+    def _sky_proj_build(self):
+        """Pool thread: build a renderer for the chosen projection (its LUTs take ~1.5 s per
+        camera the first time) and swap it in only once it is ready, so neither the AE loop
+        (which renders the sky view) nor the display stalls meanwhile. Loops if the choice
+        changed again during the build."""
+        try:
+            while True:
+                want = self.sky_proj.get()
+                if want == self._sky_proj_live:
+                    return
+                old = self.sky_r
+                r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE, radial=want),
+                                       old.feather_deg, old.mask_weight, vig_coeff=old.vig_coeff)
+                r.ensure()
+                r.set_vig_coeff(old.vig_coeff)         # a flat-field change during the build
+                self.sky_r, self._sky_proj_live = r, want
+                if self.view == "sky":
+                    self._sky_now()
+        except Exception as e:
+            print("sky projection %s failed: %s" % (self.sky_proj.get(), e))
+        finally:
+            self._sky_proj_busy = False
+
     def toggle_view(self):
         self.view = "sky" if self.view == "tiles" else "tiles"
         self._schedule_save()
@@ -1393,7 +1441,7 @@ class App(tk.Tk):
              "clip_limit_pct": float(self.clip_pct.get()), "ae_on": bool(self.ae_on),
              "wb_r": float(self.wb_r.get()), "wb_g": float(self.wb_g.get()), "wb_b": float(self.wb_b.get()),
              "history_open": bool(self.hist_win and self.hist_win.winfo_exists()),
-             "geometry": self.geometry(), "view": self.view}
+             "geometry": self.geometry(), "view": self.view, "sky_projection": self.sky_proj.get()}
         if self.hist_win and self.hist_win.winfo_exists():
             d["history_geometry"] = self.hist_win.geometry()
         return d

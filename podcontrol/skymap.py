@@ -28,6 +28,10 @@ downscaled once per file to the map's scale (cached), never decoded twice.
     python -m podcontrol.skymap                          # -> /tmp/podcontrol/skymap.png
     python -m podcontrol.skymap --size 1000 --loop 5 --out sky.png
     python -m podcontrol.skymap --proj pano --compass    # panorama, east to the right
+    python -m podcontrol.skymap --radial aerial          # the contrail layer seen from above
+
+The polar map offers the radial projections of Janus's ground-truth editor, with the same
+constants, so a scene looks the same in both tools (RADIALS; SkyGrid.r_of_theta).
 """
 
 if __name__ == "__main__" and not __package__:
@@ -64,22 +68,44 @@ def _sep_deg(alt1, az1, alt2, az2):
     return np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))
 
 
+# Radial projections of the polar map, as in Janus's ground-truth editor (MaskAssociationEditor
+# _proj_r_dst): zenith angle theta -> radius, all zenith-centred, so only the radius changes.
+RADIALS = ("equidistant", "stereographic", "aerial", "ground")
+LAYER_KM = 10.0           # contrail layer height (Janus: h)
+AERIAL_H_KM = 30.0        # 'aerial': virtual camera height above the layer (Janus: H, JANUS_AERIAL_H_KM)
+GROUND_RIM_ZEN = 80.0     # 'ground' diverges at the horizon: its rim is capped at this zenith angle
+AERIAL_CAP_ZEN = 89.5     # tan() cap for 'aerial' (finite at the horizon)
+
+
 class SkyGrid:
     """Geometry of the output map: pixel <-> (alt, az).
 
-    proj 'polar': zenith at the centre, alt_min at the rim, radius linear in
-    zenith distance (azimuthal equidistant). North up; east LEFT (sky view,
-    imagery keeps its handedness) unless compass=True (east right, a map).
+    proj 'polar': zenith at the centre, alt_min at the rim. North up; east LEFT
+    (sky view, imagery keeps its handedness) unless compass=True (east right, a
+    map). `radial` sets how zenith angle maps to radius (as in Janus):
+      equidistant    r ~ theta (the RMS base projection, the all-sky look)
+      stereographic  r ~ tan(theta/2): conformal, shapes kept near the horizon
+      aerial         r ~ atan(tan(theta) * h/H): the 10 km contrail layer seen
+                     from 30 km above it -- to scale near the centre, smoothly
+                     compressed outward, the whole dome still fits
+      ground         r ~ tan(theta): the contrail layer as a flat map (distances
+                     on the layer to scale); the rim stops at 80 deg zenith
     proj 'pano': equirectangular, az left->right S W N E S (north centred),
     alt top->bottom 90 -> alt_min."""
 
-    def __init__(self, size=800, proj="polar", alt_min=0.0, compass=False, margin=None):
+    def __init__(self, size=800, proj="polar", alt_min=0.0, compass=False, margin=None, radial="equidistant"):
         self.size, self.proj, self.alt_min, self.compass = int(size), proj, float(alt_min), bool(compass)
+        if radial not in RADIALS:
+            raise ValueError("radial must be one of %s" % (RADIALS,))
+        self.radial = radial if proj == "polar" else "equidistant"
         if proj == "polar":
             self.w = self.h = self.size
             self.margin = 24 if margin is None else int(margin)
             self.R = self.size / 2.0 - self.margin
             self.cx = self.cy = (self.size - 1) / 2.0
+            self._th_max = math.radians(90.0 - self.alt_min)          # zenith angle at alt_min
+            self._th_rim = (min(self._th_max, math.radians(GROUND_RIM_ZEN)) if self.radial == "ground"
+                            else self._th_max)
         elif proj == "pano":
             self.w = self.size
             self.h = max(1, int(round(self.size * (90.0 - self.alt_min) / 360.0)))
@@ -89,14 +115,63 @@ class SkyGrid:
         self._inside = None
 
     def params(self):
-        return {"size": self.size, "proj": self.proj, "alt_min": self.alt_min, "compass": self.compass,
-                "margin": self.margin}
+        d = {"size": self.size, "proj": self.proj, "alt_min": self.alt_min, "compass": self.compass,
+             "margin": self.margin}
+        if self.radial != "equidistant":          # equidistant keys (and disk caches) unchanged
+            d["radial"] = self.radial
+        return d
+
+    @property
+    def alt_rim(self):
+        """Lowest altitude on the map (alt_min, or 10 deg for the 'ground' polar map)."""
+        if self.proj == "polar":
+            return 90.0 - math.degrees(self._th_rim)
+        return self.alt_min
+
+    # ---- polar radial projection (numpy arrays or scalars, radians)
+    def r_of_theta(self, th):
+        th = np.asarray(th, float)
+        R, m = self.R, self.radial
+        if m == "stereographic":
+            return R * np.tan(th / 2.0) / math.tan(self._th_max / 2.0)
+        if m == "aerial":
+            cap = math.radians(AERIAL_CAP_ZEN)
+            phi = np.arctan(np.tan(np.minimum(th, cap)) * LAYER_KM / AERIAL_H_KM)
+            return R * phi / math.atan(math.tan(min(self._th_max, cap)) * LAYER_KM / AERIAL_H_KM)
+        if m == "ground":
+            with np.errstate(over="ignore", invalid="ignore"):
+                r = R * np.tan(np.minimum(th, math.radians(89.0))) / math.tan(self._th_rim)
+            return np.where(th <= self._th_rim, r, R * 1e6)
+        return R * th / self._th_max
+
+    def theta_of_r(self, r):
+        r = np.asarray(r, float)
+        R, m = self.R, self.radial
+        if m == "stereographic":
+            return 2.0 * np.arctan(math.tan(self._th_max / 2.0) * r / R)
+        if m == "aerial":
+            cap = math.radians(AERIAL_CAP_ZEN)
+            phi_max = math.atan(math.tan(min(self._th_max, cap)) * LAYER_KM / AERIAL_H_KM)
+            return np.arctan(np.tan(np.minimum(r / R * phi_max, math.pi / 2 - 1e-9)) * AERIAL_H_KM / LAYER_KM)
+        if m == "ground":
+            return np.arctan(math.tan(self._th_rim) * r / R)
+        return self._th_max * r / R
+
+    def r_of_alt(self, alt):
+        """Polar map radius (px) of an altitude (deg)."""
+        return self.r_of_theta(np.radians(90.0 - np.asarray(alt, float)))
 
     @property
     def px_per_deg(self):
-        """Radial (polar) / vertical (pano) scale of the map."""
+        """Radial (polar) / vertical (pano) scale of the map; for a non-equidistant
+        polar map the LARGEST radial scale anywhere on it (frames are downscaled
+        to this, so no part of the map is sampled coarser than the source)."""
         if self.proj == "polar":
-            return self.R / (90.0 - self.alt_min)
+            if self.radial == "equidistant":
+                return self.R / (90.0 - self.alt_min)
+            th = np.linspace(0.0, self._th_rim, 512)
+            r = self.r_of_theta(th)
+            return float(np.max(np.diff(r) / np.degrees(np.diff(th))))
         return self.h / (90.0 - self.alt_min)
 
     @property
@@ -113,7 +188,7 @@ class SkyGrid:
         if self.proj == "polar":
             dx, dy = xs - self.cx, ys - self.cy
             r = np.hypot(dx, dy)
-            alt = 90.0 - r / self.px_per_deg
+            alt = 90.0 - np.degrees(self.theta_of_r(r))
             ex = dx if self.compass else -dx
             az = np.degrees(np.arctan2(ex, -dy)) % 360.0
             return alt, az, r <= self.R
@@ -125,7 +200,7 @@ class SkyGrid:
         """Map pixel (float x, y) of a direction; arrays or scalars."""
         alt, az = np.asarray(alt, float), np.asarray(az, float)
         if self.proj == "polar":
-            r = (90.0 - alt) * self.px_per_deg
+            r = self.r_of_alt(alt)
             s = np.sin(np.radians(az)) * (1.0 if self.compass else -1.0)
             return self.cx + r * s, self.cy - r * np.cos(np.radians(az))
         x = ((az - 180.0) % 360.0) / 360.0 * self.w - 0.5
@@ -223,6 +298,7 @@ def build_lut(station, grid, feather_deg=2.5, mask_weight=0.02):
     fov_r = float(getFOVSelectionRadius(pp)) + 3.0
 
     alt, az, inside = grid.altaz()
+    inside = inside & (alt >= grid.alt_rim - 1e-6)
     sep = _sep_deg(alt, az, alt_c, az_c)
     idx = np.flatnonzero(inside & (sep < fov_r))
     map_x = np.full(alt.shape, -1.0, np.float32)
@@ -396,18 +472,24 @@ def draw_grid(img, grid):
     """Alt circles / az lines and the cardinal points."""
     if grid.proj == "polar":
         c = (int(round(grid.cx)), int(round(grid.cy)))
-        for a in (0.0, 30.0, 60.0):
-            if a >= grid.alt_min:
-                cv2.circle(img, c, int(round((90 - a) * grid.px_per_deg)), GRID_COLOUR, 1, cv2.LINE_AA)
+        rim = grid.alt_rim
+        for a in sorted({rim, 30.0, 60.0}):
+            if a >= rim:
+                cv2.circle(img, c, int(round(float(grid.r_of_alt(a)))), GRID_COLOUR, 1, cv2.LINE_AA)
+        if rim > 0.5:                                  # the ground map stops short of the horizon
+            x, y = grid.xy(rim + 1.0, 15.0)            # just inside the rim, clear of the "N"
+            _text(img, "%.0f deg" % rim, (x - 12, y + 12), 0.4, DIM_COLOUR)
         for azd in range(0, 360, 30):
-            x, y = grid.xy(grid.alt_min, azd)
+            x, y = grid.xy(rim, azd)
             x2, y2 = grid.xy(60.0, azd)
             cv2.line(img, (int(round(x2)), int(round(y2))), (int(round(x)), int(round(y))), GRID_COLOUR, 1, cv2.LINE_AA)
         for name, azd in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
-            x, y = grid.xy(grid.alt_min, azd)
+            x, y = grid.xy(rim, azd)
             dx, dy = x - grid.cx, y - grid.cy
             n = math.hypot(dx, dy) or 1.0
-            _text(img, name, (x + dx / n * 12 - 5, y + dy / n * 12 + 5), 0.5, TEXT_COLOUR, 1)
+            # outside the rim, except S: below the rim sits the caption line, which hid it
+            out_px = -14 if name == "S" else 12
+            _text(img, name, (x + dx / n * out_px - 5, y + dy / n * out_px + 5), 0.5, TEXT_COLOUR, 1)
     else:
         for a in (30.0, 60.0):
             if a >= grid.alt_min:
@@ -428,7 +510,7 @@ def draw_bodies(img, pod, grid, t):
         return
     for body, col in (("sun", (0, 230, 255)), ("moon", (255, 220, 170))):
         b = sunmask.body_altaz(st, body, t)
-        if not b or b["alt"] < grid.alt_min:
+        if not b or b["alt"] < grid.alt_rim:
             continue
         x, y = grid.xy(b["alt"], b["az"])
         p = (int(round(x)), int(round(y)))
@@ -758,6 +840,8 @@ if __name__ == "__main__":
     ap.add_argument("--size", type=int, default=800, help="map size in px (polar: diameter; pano: width)")
     ap.add_argument("--proj", choices=("polar", "pano"), default="polar")
     ap.add_argument("--alt-min", type=float, default=0.0, help="lowest altitude shown (deg)")
+    ap.add_argument("--radial", choices=RADIALS, default="equidistant",
+                    help="polar map radial projection (as in Janus's ground-truth editor)")
     ap.add_argument("--compass", action="store_true", help="east to the right (map view) instead of left (sky view)")
     ap.add_argument("--feather", type=float, default=2.5, help="blend feather at frame edges (deg)")
     ap.add_argument("--mask-weight", type=float, default=0.02, help="blend weight of RMS-masked pixels (0 = never shown)")
@@ -769,7 +853,7 @@ if __name__ == "__main__":
     ap.add_argument("--loop", type=float, default=0, help="re-render every N seconds (0 = once)")
     args = ap.parse_args()
     pod = get_pod()
-    grid = SkyGrid(args.size, args.proj, args.alt_min, args.compass)
+    grid = SkyGrid(args.size, args.proj, args.alt_min, args.compass, radial=args.radial)
     if args.no_cache:
         for st in pod:
             key = _lut_key(st, grid, args.feather, args.mask_weight)
