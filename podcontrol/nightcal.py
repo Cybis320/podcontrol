@@ -18,15 +18,25 @@ because the black subtraction takes ~6 linear codes too many (a 0.1 ms frame
 reads 0 with no noise); that is an offset, not lost sensitivity, so the
 background/noise ratio (snr) is not a fair score across gains.
 
-Two things do corrupt a step's noise figure, and such steps are not eligible:
+Three things corrupt a step's noise figure, and such steps are not eligible:
   - quantization: sky noise under ~1 code of the 8-bit output is under-read
     (lin = code^2, so one code is 2*code*4095/65025 linear units);
   - the black clip: a sky within 3 sigma of zero has its lower tail clipped.
-The noise-equivalent flux does NOT fall monotonically toward the top gain (it
-rose ~15% from 11x to 22x on every 10x camera), so steps are compared with the
-BEST eligible step, not the top one. The chosen gain is the lowest eligible
-step within `tol` of that best. One value goes to the whole pod: the HIGHEST of the per-camera choices,
-i.e. the darkest sky's need, so no camera loses sensitivity.
+    The sigma is the one the higher-gain steps PREDICT (their noise-equivalent
+    flux times this gain), not the measured one: clipping shrinks the measured
+    noise, so a clipped step judged by its own noise passes its own test;
+  - a dip: the noise-equivalent flux falling more than DIP below the steps
+    above it. Less gain can never make a camera more sensitive, so such a drop
+    is the clip under-reading the noise. The 2026-09-29 moonlit run on .102
+    picked exactly that: flat within ~5% from 22x down to 8x on every camera,
+    then 20-40% "better" at the one or two lowest steps, each passing the old
+    measured-sigma guard at 3.0-3.3 sigma.
+On the sky-limited plateau the noise-equivalent flux scatters by a few percent
+from step to step, so steps are compared with the plateau's MEDIAN (over the
+eligible steps), not its single lowest point. The chosen gain is the lowest
+eligible step within `tol` of that median. One value goes to the whole pod: the
+HIGHEST of the per-camera choices, i.e. the darkest sky's need, so no camera
+loses sensitivity.
 
 ISP digital gain is not swept. It comes after the ADC, so it adds no signal; it
 only has to restore full scale after the black-level subtraction:
@@ -51,6 +61,7 @@ from podcontrol.podctl import send, send_live
 BLACK_LEVEL = 240                                          # 12-bit pedestal, both sensors
 ISPD_FULL_SCALE = int(round(4095 * 1024 / (4095 - BLACK_LEVEL)))   # 1088 = 1.0625x
 STEPS = [22924, 16384, 11585, 8192, 5793, 4096]            # x1024, 3 dB apart; 22924 = IMX307 max
+DIP = 0.10                                                 # nef this far below the steps above = artifact
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
 LOG = os.path.expanduser("~/.config/podcontrol/nightcal.jsonl")
 
@@ -111,6 +122,28 @@ def eligible(r, min_std_code=1.0, min_sigma=3.0):
     return True, ""
 
 
+def screen(rows, min_sigma=3.0, dip=DIP):
+    """Mark the steps that only the whole sweep can expose (see the module
+    docstring): a black clip judged by the predicted sigma, and a dip. Walks
+    down from the top gain; each step is judged against the mean noise-
+    equivalent flux of the eligible steps above it."""
+    above = []
+    for r in sorted(rows, key=lambda r: -r["again_set"]):
+        if not r.get("eligible", True):
+            continue
+        if above:
+            ref = sum(above) / len(above)
+            sigma = ref * r["total_gain"]
+            if r["mean_lin"] < min_sigma * sigma:
+                r["eligible"], r["why"] = False, "black clip (sky %.1f predicted sigma)" % (r["mean_lin"] / sigma)
+                continue
+            if r["nef"] < ref * (1.0 - dip):
+                r["eligible"], r["why"] = False, "dip (nef %.0f%% below the steps above)" % (100 * (1 - r["nef"] / ref))
+                continue
+        above.append(r["nef"])
+    return rows
+
+
 def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
                  settle_s=1.0, on_row=None):
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves."""
@@ -138,18 +171,21 @@ def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
     return out
 
 
-def best(rows):
-    """The eligible step with the lowest noise-equivalent flux, or None."""
-    ok = [r for r in rows if r.get("eligible", True)]
-    return min(ok, key=lambda r: r["nef"]) if ok else None
+def plateau(rows):
+    """Median noise-equivalent flux of the eligible steps, or None."""
+    v = sorted(r["nef"] for r in rows if r.get("eligible", True))
+    if not v:
+        return None
+    m = len(v) // 2
+    return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2.0
 
 
 def choose(rows, tol):
-    """Lowest eligible analog gain whose noise-equivalent flux is within tol of the best's."""
-    b = best(rows)
-    if b is None:
+    """Lowest eligible analog gain whose noise-equivalent flux is within tol of the plateau's."""
+    p = plateau(rows)
+    if p is None:
         return None
-    ok = [r for r in rows if r.get("eligible", True) and r["nef"] <= b["nef"] * (1.0 + tol)]
+    ok = [r for r in rows if r.get("eligible", True) and r["nef"] <= p * (1.0 + tol)]
     return min(ok, key=lambda r: r["again_set"])["again_set"]
 
 
@@ -180,6 +216,7 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
                 c = f.result()
             except Exception as e:
                 c = {"rows": [], "ok": False, "reason": str(e)}
+            screen(c["rows"])                      # also for an invalid camera's table
             if c["ok"]:
                 if c["drift"] is None or c["drift"] > drift_max:
                     c["ok"] = False
@@ -205,15 +242,16 @@ def format_table(res):
             L.append("  %-8s  -- %s" % (sid, c.get("reason", "no data")))
             continue
         top = max(c["rows"], key=lambda r: r["again_set"])
-        ref = best(c["rows"]) or top
+        ref_nef = plateau(c["rows"]) or top["nef"]
+        pick = c.get("chosen") if c.get("ok") else None
         L.append("  %-8s  %s  sky %.2f  drift %s" % (
             sid, ("-> %.2fx" % (c["chosen"] / 1024.0)) if c.get("ok") else "INVALID: " + c.get("reason", ""),
             top["sky"], ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?"))
         for r in sorted(c["rows"], key=lambda r: -r["again_set"]):
             L.append("      again %6.2fx  bg %8.1f  noise %7.2f (%4.2f code)  nef %+5.1f%%  headroom %6.1fx  clip %.3f%%%s" % (
                 r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r.get("std_code", float("nan")),
-                100 * (r["nef"] / ref["nef"] - 1), 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0),
-                ("  " + r["why"]) if r.get("why") else ("  <- best" if r is ref else "")))
+                100 * (r["nef"] / ref_nef - 1), 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0),
+                ("  " + r["why"]) if r.get("why") else ("  <- chosen" if r["again_set"] == pick else "")))
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
     return "\n".join(L)
