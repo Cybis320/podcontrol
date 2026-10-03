@@ -805,10 +805,19 @@ class App(tk.Tk):
               "which rebuilds the magenta areas in the saved day frames. Cleared: the rung backs\n"
               "off to s = 1 whenever a frame shows raw saturation (no magenta at all).")
         check(g, "camera meter", self.camera_meter, tip=
-              "Checked: meter each camera from its own ISP statistics (ae_stats + wb_stats: the\n"
-              "current frame, linear, zones touching no mask only) instead of RMS's saved frames,\n"
-              "which can be ~50 s old. Cameras without those commands (older isp_ctl) keep using\n"
-              "the frame meter. Cleared: frame meter for every camera.")
+              "Checked: take the LEVEL from each camera's own ISP statistics (ae_stats +\n"
+              "wb_stats), which are current rather than up to ~50 s old. Peak, clipping and raw\n"
+              "saturation still come from RMS's saved frames whatever this is set to, and the\n"
+              "sample is timed by the frame, because those are what the corrections are computed\n"
+              "from.\n\n"
+              "The camera does not measure them reliably. Checked against the pixels of the same\n"
+              "frames on 2026-10-03 it invented raw saturation of 0.00126 where no green pixel\n"
+              "reached 255, and read 0.00000 where 6.1% of them did. That figure gates the WB\n"
+              "rung at 0.0002, so a false reading disqualifies the one mechanism that recovers\n"
+              "red/blue clipping: the pod sat with 3.6% of pixels blown while the controller\n"
+              "reported 0.00006 and asked to brighten.\n\n"
+              "Cleared: the level comes from the frames too. A camera with no frame this cycle\n"
+              "falls back to its own full reading either way.")
 
         g = group(row2, "white balance (x gains, pod-wide)",
                   "Manual white balance for the whole pod. RMS owns colour at its day/night\n"

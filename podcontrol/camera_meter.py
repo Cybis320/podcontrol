@@ -201,27 +201,53 @@ def controller_stats(st, t=None):
             "n_zones": int(ae_ok.sum()), "exp_us": int(hdr.get("exp_us", 0))}
 
 
+# Fields the CAMERA may supply. Everything else comes from the frame, because
+# the camera's own statistics proved unreliable in both directions on 2026-10-03:
+# against the pixels of the same saved frames, it invented raw saturation of
+# 0.00126 on a camera where no green pixel reached 255, and reported 0.00000 on
+# one where 6.1% of them did. The frame meter matched the pixels to four decimals
+# on every camera. That number gates the WB rung at a threshold of 0.0002, so an
+# invented reading permanently disqualifies the one mechanism that recovers
+# red/blue clipping, which is how the pod sat at 3.6% of pixels blown while the
+# controller reported 0.00006 and asked to brighten.
+#
+# Level is different: it was calibrated against 290 daylight frame pairs
+# (LEVEL_CAL) and it is fresher than any saved frame, so the camera keeps it.
+CAMERA_FIELDS = ("mean",)
+
+
 def meter_set_hybrid(stations, allow_grab=False, wb_scale_fn=None):
-    """Like frames.meter_set, but each camera that supports it is metered by the camera
-    (current frame, t = now); the rest by the frame meter. Returns (met, newest_t)."""
+    """Frame metering, with the LEVEL taken from the camera where it can supply one.
+
+    The frame is authoritative for peak, clipping and saturation, and its capture
+    time is the sample's `t`: those are what the corrections are computed from,
+    and SharedAE._need judges a sample at the light index in force when it was
+    taken, so the timestamp has to belong to the measurements that drive it.
+
+    A camera with no frame this cycle falls back to its own full reading rather
+    than dropping out, since a stale opinion still beats none, and says so in
+    `src` so the caller can tell them apart. Returns (met, newest_t)."""
     from podcontrol import frames
-    met, newest, rest = {}, None, []
+    fm, fslot = frames.meter_set(stations, allow_grab=allow_grab, wb_scale_fn=wb_scale_fn)
+    met, newest = {}, fslot
     for st in stations:
         try:
-            m = controller_stats(st)
+            cam = controller_stats(st)
         except Exception:
-            m = None
-        if m is None:
-            rest.append(st)
-        else:
+            cam = None
+        f = fm.get(st.id)
+        if f is not None:
+            m = dict(f, src="frames")
+            if cam:
+                for k in CAMERA_FIELDS:
+                    if cam.get(k) is not None:
+                        m[k] = cam[k]
+                m["src"] = "frames+camera"
+                m["mean_frames"] = f.get("mean")     # kept for the comparison tools
             met[st.id] = m
-            newest = m["t"] if newest is None else max(newest, m["t"])
-    if rest:
-        fm, fslot = frames.meter_set(rest, allow_grab=allow_grab, wb_scale_fn=wb_scale_fn)
-        for sid, m in fm.items():
-            met[sid] = dict(m, src="frames")
-        if fslot is not None:
-            newest = fslot if newest is None else max(newest, fslot)
+        elif cam:
+            met[st.id] = dict(cam, src="camera")     # no frame: the camera alone
+            newest = cam["t"] if newest is None else max(newest, cam["t"])
     return met, newest
 
 
