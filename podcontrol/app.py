@@ -432,6 +432,17 @@ class App(tk.Tk):
         self.stations = get_pod()
         self.by_id = {s.id: s for s in self.stations}
         self.pod = PodController(self.stations)
+        # each camera's real code<->light curve (podcontrol.decode), fetched in the
+        # background and refreshed every 30 min (a reflash or gamma change shows up)
+        from podcontrol import decode as _decode
+        def _decode_loop(stations=self.stations):
+            while True:
+                try:
+                    _decode.fetch_all(stations)
+                except Exception:
+                    pass
+                time.sleep(1800)
+        threading.Thread(target=_decode_loop, daemon=True).start()
         # PODCONTROL_DRY=1: never send exposure commands (demo / UI testing on
         # a live pod); the loop still meters and shows what it WOULD do
         self.dry = bool(os.environ.get("PODCONTROL_DRY"))

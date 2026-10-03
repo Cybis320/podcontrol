@@ -61,8 +61,13 @@ def rolloff(lin, knee=KNEE):
     return np.where(lin <= knee, lin, knee + (1.0 - knee) * (1.0 - np.exp(-over / (1.0 - knee))))
 
 
-def scale(img, k, knee=KNEE):
-    """img (uint8, gamma 0.5) scaled by k in linear light, highlights rolled off, back to uint8."""
+def scale(img, k, knee=KNEE, sid=None):
+    """img (uint8 camera codes) scaled by k in linear light, highlights rolled off, back to
+    uint8. With sid, through that camera's real curve (podcontrol.decode: linear below the
+    gamma table's first node, not code^2); without, the pure 0.5 curve."""
+    if sid is not None:
+        from podcontrol import decode
+        return decode.to_code(rolloff(decode.to_linear(img, sid) * k, knee), sid)
     lin = (img.astype(np.float32) / 255.0) ** 2 * k
     return (255.0 * np.sqrt(np.clip(rolloff(lin, knee), 0.0, 1.0)) + 0.5).astype(np.uint8)
 
@@ -105,7 +110,7 @@ def constant_exposure(paths, records, e_ref=None):
         if img is None:
             continue
         k = ref / es[sid] if sid in es else 1.0
-        imgs[sid] = scale(img, k)                  # every tile through the same curve
+        imgs[sid] = scale(img, k, sid=sid)         # through that camera's own curve
         tagged[sid] = "%s#k=%.4f" % (p, k)
         ks[sid] = k
     return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src}
