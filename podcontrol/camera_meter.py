@@ -52,6 +52,43 @@ ZONE_PX = 60 * 34                # pixels in one WB statistics zone (32x32 over 
 MASK_TTL_S = 30.0                # clean-zone grids are recomputed this often (the sun mask moves
                                  # ~0.1 deg in 30 s; computing it costs ~1.4 s per camera)
 FULL = 65535.0
+HIST_FULL = 1023                 # the AE histogram's top bin: 10-bit full scale
+SAT_CAL = 2.34                   # frame-meter raw_sat_all / histogram top-bin fraction.
+                                 # They count different things: the histogram counts RAW
+                                 # pixels at full scale, the frame counts OUTPUT green at
+                                 # 255, and gamma expands near-saturation so the frame's
+                                 # set is the larger one. Measured 2026-10-03 on the two
+                                 # saturated cameras over 8 samples: median 2.34, spread
+                                 # 2.17-2.40. Thin (two cameras, one minute) but steady;
+                                 # revisit if the gamma or the ISP gain changes.
+
+
+def _hist_top(text):
+    """Fraction of the frame in the histogram's top bin: raw sensor saturation.
+
+    This replaces a count derived from the WB statistics' zone_count, which was
+    wrong in both directions when checked against the pixels of the same frames
+    on 2026-10-03 -- it invented 0.00121 on a camera with no saturated green
+    pixel at all, and read 0.00000 on one where 4.2% of them were saturated. The
+    invented reading is what crossed the 0.0002 threshold that gates the WB rung
+    and stranded the pod with blown highlights it would not correct. The top bin
+    agreed with the frames on all six cameras."""
+    line = next((l for l in (text or "").splitlines() if l.startswith("hist ")), None)
+    if not line:
+        return None
+    total = top = 0.0
+    for pair in line[5:].split(","):
+        if ":" not in pair:
+            continue
+        b, _, c = pair.partition(":")
+        try:
+            b, c = int(b), float(c)
+        except ValueError:
+            continue
+        total += c
+        if b >= HIST_FULL:
+            top += c
+    return (top / total) if total > 0 else None
 H, W = 1080, 1920
 
 # AE grid, read from `ae_stats full` on the Goke (uniform, 113 x 72 px)
@@ -181,9 +218,15 @@ def controller_stats(st, t=None):
     sat = 1.0 - cnt / FULL
     min_frac = max(frames.CLIP_MIN_BLOB_PX[0], MIN_CLIP_PX) / float(ZONE_PX)
     sat_c = sat[wb_ok]
+    # zone_count still gives the only MASKED-AWARE saturation the camera has, so it
+    # keeps driving `clip` and the peak-pins-at-255 rule, where counting a
+    # streetlight under the mask would be a regression. It is no longer trusted
+    # for raw saturation, which is what gates the WB rung.
     clip_sensor = float(np.where(sat_c >= min_frac, sat_c, 0.0).mean())
-    raw_sat = clip_sensor                     # same blob floor: a few glinting pixels never count
-    raw_sat_all = float(sat.mean())
+    top = _hist_top(ae_t)
+    if top is None:
+        return None                           # no histogram: fall back to the frame meter
+    raw_sat = raw_sat_all = SAT_CAL * top     # whole frame; the camera cannot split it by mask
     # red/blue gain clipping risk: clean zones whose post-WB R or B mean is above the margin
     rb_zone = (np.maximum(zr, zb) >= RB_MARGIN * FULL) & ae_ok
     rb_only = RB_ZONE_TO_PX * float(rb_zone.sum()) / float(ae_ok.sum())
@@ -213,7 +256,18 @@ def controller_stats(st, t=None):
 #
 # Level is different: it was calibrated against 290 daylight frame pairs
 # (LEVEL_CAL) and it is fresher than any saved frame, so the camera keeps it.
-CAMERA_FIELDS = ("mean",)
+# raw_sat_all joins `mean` now that it comes from the histogram top bin rather
+# than zone_count: calibrated it agrees with the frame meter to within 3%
+# (C1 0.01925 vs 0.01976, F1 0.04524 vs 0.04410) and the rung gate agrees on all
+# six cameras, where the old path disagreed on three. It is worth taking fresh,
+# because sensor saturation can appear in seconds when the sun breaks through
+# cloud, and the frame it would otherwise be read from can be ~50 s old.
+#
+# Red/blue clipping is NOT here and cannot be: it is produced by the WB gains,
+# downstream of where the camera's statistics are taken. On A1 the raw green
+# 99.9th percentile sits at 186 of 255 while red and blue are pinned at full
+# scale, so no camera-side measurement can see it.
+CAMERA_FIELDS = ("mean", "raw_sat_all")
 
 
 def meter_set_hybrid(stations, allow_grab=False, wb_scale_fn=None):
