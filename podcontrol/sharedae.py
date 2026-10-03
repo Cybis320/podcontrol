@@ -756,7 +756,19 @@ class SharedAE:
         kw = {"again": analog, "dgain": 1024, "ispdgain": boost, "exp_us": exp}
         r = self.pod.manual_all(timeout=timeout, **kw)
         ws = self.wb_scale_for(self.li)
-        if (self.wb_base and hasattr(self.pod, "wb_all")
+        if self._rms_owns_wb():
+            # Below RMS's night switch the WB is RMS's (`wb unity`), never ours.
+            # Restoring the base here pushed the DAY WB over it: on 2026-10-03 the
+            # rung was still engaged at dusk (scale 0.55), RMS set unity at -9 deg,
+            # and at -12 deg the latch took the scale back to 1.0 and sent
+            # 460/256/490 to the whole .20x pod, which kept it all night. RMS's
+            # switch already undid any attenuation, so there is nothing to restore:
+            # just record that we are at scale 1.0 (at dawn RMS sends the day base).
+            self._applied_wb_scale = 1.0
+            self._wb_force = False
+            self._wb_target = None
+            self.wb_unconfirmed = []
+        elif (self.wb_base and hasattr(self.pod, "wb_all")
                 and (abs(ws - self._applied_wb_scale) > 0.01 or self._wb_force)):
             # CONFIRM EVERY CAMERA. The scale used to be marked applied the moment
             # the broadcast returned, without reading the per-camera replies, so a
@@ -791,11 +803,18 @@ class SharedAE:
             self.hist.pop(0)
         return r
 
+    def _rms_owns_wb(self):
+        """True below RMS's day/night switch altitude: RMS has set its night WB
+        (`wb unity`) and podcontrol must not send any WB until RMS's dawn switch."""
+        return self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg
+
     def release(self, timeout=5.0):
         """Hand the cameras back exactly as they were (snapshot), never a bare
         'auto' (it resets the Goke AE ranges, e.g. sensor DGain max -> 126x).
-        A WB attenuation in force is undone first."""
-        if self._applied_wb_scale < 0.999 and self.wb_base and hasattr(self.pod, "wb_all"):
+        A WB attenuation in force is undone first -- by day only: below RMS's
+        night switch RMS owns WB and has already replaced it."""
+        if (self._applied_wb_scale < 0.999 and self.wb_base and hasattr(self.pod, "wb_all")
+                and not self._rms_owns_wb()):
             R, G, B = self.wb_base
             self.pod.wb_all(int(round(R * 256)), int(round(G * 256)), int(round(B * 256)), timeout=timeout)
             self._applied_wb_scale = 1.0
