@@ -960,8 +960,24 @@ class App(tk.Tk):
         try:
             self._drain_once()
         except Exception as e:                  # never let a display error stop the loop
+            # Say WHERE. "display error: '<' not supported between NoneType and
+            # float" names a Python rule, not a line, and the status bar is the
+            # only place it ever appeared: the traceback went nowhere. The last
+            # in-app frame is the one worth reading, and the full trace goes to
+            # stderr once per distinct site so a terminal or log has it all.
+            import traceback
+            tb = traceback.extract_tb(e.__traceback__)
+            here = [f for f in tb if "podcontrol" in (f.filename or "")]
+            where = ("%s:%d in %s" % (os.path.basename(here[-1].filename), here[-1].lineno,
+                                      here[-1].name)) if here else "?"
+            seen = getattr(self, "_drain_errs", None)
+            if seen is None:
+                seen = self._drain_errs = set()
+            if where not in seen:
+                seen.add(where)
+                traceback.print_exc()
             try:
-                self.status.config(text="display error: %s" % e, fg="#b3402a")
+                self.status.config(text="display error at %s: %s" % (where, e), fg="#b3402a")
             except Exception:
                 pass
         self.after(200, self._drain)
