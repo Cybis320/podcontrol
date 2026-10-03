@@ -13,14 +13,24 @@ The figure of merit is the noise-equivalent flux (noise divided by total gain):
 how faint a signal each gain can still separate from the sky. The reported gain
 is the right divisor: on .102 (CV300, 2026-09-26) the response measured as the
 40 ms - 20 ms background difference tracked the reported gain within 2% from
-5.6x to 22x. The background itself does NOT scale with gain at the low end,
-because the black subtraction takes ~6 linear codes too many (a 0.1 ms frame
-reads 0 with no noise); that is an offset, not lost sensitivity, so the
+5.6x to 22x. On CV300 images before 971faffb the background did not scale with
+gain at the low end either: the ISP subtracted 240 while the sensor's black sits
+at ~236 (measured 2026-10-03), an offset rather than lost sensitivity, so the
 background/noise ratio (snr) is not a fair score across gains.
+
+CODE -> LINEAR. The camera reports `decode=table` (2026-10-03 venc): it converts
+each 8-bit code through its LIVE gamma node table. The ISP draws straight lines
+between nodes (CV300: one per 16 linear units, Goke: one per 4), so codes 0-16 on
+the CV300 are LINEAR in light, not quadratic; the old pure-0.5 decode (code^2)
+mis-read them by up to 2x in noise variance and made the noise per unit gain look
+gain-dependent when it only tracked the output level (the "11.31x anomaly"). A
+camera on an older image (no `decode=` in the reply) still decodes code^2: its
+steps below code 16 are marked untrustworthy.
 
 Three things corrupt a step's noise figure, and such steps are not eligible:
   - quantization: sky noise under ~1 code of the 8-bit output is under-read
-    (lin = code^2, so one code is 2*code*4095/65025 linear units);
+    (the width of one code in linear units is what the camera reports as
+    lin_per_code; older images: assumed 2*code*4095/65025);
   - the black clip: a sky within 3 sigma of zero has its lower tail clipped.
     The sigma is the one the higher-gain steps PREDICT (their noise-equivalent
     flux times this gain), not the measured one: clipping shrinks the measured
@@ -78,6 +88,8 @@ def parse_noise(text):
             d[k] = float(v)
         except ValueError:
             pass
+    m = re.search(r"\bdecode=(\w+)", text)
+    d["decode"] = m.group(1) if m else None      # None: an older image that decodes code^2
     return d if "mean_lin" in d and "std_lin" in d else None
 
 
@@ -102,19 +114,27 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s):
     r["total_gain"] = g
     r["nef"] = r["std_lin"] / g                # noise-equivalent flux: lower = more sensitive
     r["sky"] = r["mean_lin"] / g               # sky brightness in gain-free units
-    r["std_code"] = r["std_lin"] / code_step(r["mean_lin"])
+    lpc = r.get("lin_per_code") if r.get("decode") == "table" else None
+    r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r["mean_lin"]))
     r["eligible"], r["why"] = eligible(r)
     return r
 
 
 def code_step(mean_lin):
-    """Linear units per 8-bit output code at this level (lin = code^2 * 4095/65025)."""
+    """Linear units per 8-bit output code at this level, ASSUMING a pure 0.5 decode
+    (lin = code^2 * 4095/65025). Only for older images; a camera that reports
+    decode=table gives the true width as lin_per_code."""
     code = math.sqrt(max(mean_lin, 0.0) * 65025.0 / 4095.0)
     return max(2.0 * code, 1.0) * 4095.0 / 65025.0
 
 
+OLD_DECODE_MIN_CODE = 16    # below this an older image's code^2 decode is wrong (CV300 linear first segment)
+
+
 def eligible(r, min_std_code=1.0, min_sigma=3.0):
     """Is this step's noise figure trustworthy? (ok, reason)"""
+    if r.get("decode") != "table" and r.get("mean_code", 99) < OLD_DECODE_MIN_CODE:
+        return False, "old decode (code %.0f < %d: update the camera image)" % (r.get("mean_code", 0), OLD_DECODE_MIN_CODE)
     if r["std_code"] < min_std_code:
         return False, "quantized (noise %.2f code)" % r["std_code"]
     if r["mean_lin"] < min_sigma * r["std_lin"]:
