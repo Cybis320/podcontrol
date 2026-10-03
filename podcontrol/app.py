@@ -1153,10 +1153,15 @@ class App(tk.Tk):
                           outlines=overlay_on, labels=overlay_on, bodies=overlay_on)
         if self.const_exp.get() and getattr(self, "_const_info", None) and self._const_info.get("e_ref"):
             ks = self._const_info["k"]
+            from podcontrol import decode as _decode
+            own = [sid for sid in sorted(ks) if _decode.source(sid) == "table"]
+            fb = [sid[-2] for sid in sorted(ks) if sid not in own]
+            curves = "decode: %d/%d camera curves%s" % (len(own), len(ks), ("   pure 0.5: %s" % " ".join(fb)) if fb else "")
             txt = "constant exposure %.0f us-x   k: %s" % (self._const_info["e_ref"],
                    " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
-            # one line above the renderer's own caption (time, cameras, coverage) at h - 8
+            # above the renderer's own caption (time, cameras, coverage) at h - 8
             from podcontrol.skymap import _text
+            _text(bgr, curves, (6, bgr.shape[0] - 44), 0.45)
             _text(bgr, txt, (6, bgr.shape[0] - 26), 0.45)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread

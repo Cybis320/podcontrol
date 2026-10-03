@@ -279,9 +279,13 @@ def format_table(res):
         top = max(c["rows"], key=lambda r: r["again_set"])
         ref_nef = plateau(c["rows"]) or top["nef"]
         pick = c.get("chosen") if c.get("ok") else None
-        L.append("  %-8s  %s  sky %.2f  drift %s" % (
+        decs = set(r.get("decode") for r in c["rows"])
+        dec = ("decode table" if decs == {"table"} else
+               "decode code^2 (old image)" if decs == {None} else
+               "decode " + "/".join(sorted(str(d or "code^2") for d in decs)))
+        L.append("  %-8s  %s  sky %.2f  drift %s  %s" % (
             sid, ("-> %.2fx" % (c["chosen"] / 1024.0)) if c.get("ok") else "INVALID: " + c.get("reason", ""),
-            top["sky"], ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?"))
+            top["sky"], ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?", dec))
         for r in sorted(c["rows"], key=lambda r: -r["again_set"]):
             L.append("      again %6.2fx  bg %8.1f  noise %7.2f (%4.2f code)  nef %+5.1f%%  headroom %6.1fx  clip %.3f%%%s" % (
                 r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r.get("std_code", float("nan")),
