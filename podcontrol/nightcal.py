@@ -5,8 +5,12 @@ analog gain the sky's own shot noise, not the sensor's read noise, sets the
 noise floor; any gain beyond that point adds no sensitivity and only spends
 highlight headroom (bright meteors clip sooner). This finds that point.
 
-For each camera it sweeps the analog gain down from the top at fixed exposure
-and ISP gain, and at every step asks the camera for `noise_stats` -- venc
+For each camera it sweeps the analog gain down from the top at fixed exposure,
+holding the TOTAL gain constant with the ISP digital gain (compensating_ispd,
+2026-10-03): every step then lands at the same output level, so the 8-bit
+output's quantization -- which made the CV300's low-noise steps read low and
+"improve" with less gain -- affects every step alike and drops out. At every
+step it asks the camera for `noise_stats` -- venc
 measures the sky background and its frame-to-frame noise itself, on the
 uncompressed picture, so no second RTSP stream is opened while RMS captures.
 The figure of merit is the noise-equivalent flux (noise divided by total gain):
@@ -75,6 +79,7 @@ from podcontrol.podctl import send, send_live
 BLACK_LEVEL = 240                                          # 12-bit pedestal, both sensors
 ISPD_FULL_SCALE = int(round(4095 * 1024 / (4095 - BLACK_LEVEL)))   # 1088 = 1.0625x
 STEPS = [22924, 16384, 11585, 8192, 5793, 4096]            # x1024, 3 dB apart; 22924 = IMX307 max
+ISPD_MAX = 16384                                           # 16x: the compensating ISP gain's ceiling
 DIP = 0.10                                                 # nef this far below the steps above = artifact
 SETTLE_S = 2.0                                             # s after each gain change (see _measure)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
@@ -108,7 +113,7 @@ def night_line(station):
     return get("a"), get("i"), get("e")
 
 
-def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None):
+def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd=ISPD_FULL_SCALE):
     send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
     # The picture reads ~5% low for ~1.2 s after a gain change (Goke .206, ae_stats sampled
     # every 0.4 s, 2026-10-03); a 1 s settle sometimes measured inside that window, which the
@@ -119,7 +124,12 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None):
         return None
     g = (r.get("again") or again) / 1024.0 * (r.get("ispdgain") or ispd) / 1024.0
     r["again_set"] = again
+    r["ispd_set"] = ispd
     r["platform"] = platform
+    # the same step at the PRODUCTION ISP gain: background and noise scale with the ISP gain
+    k = prod_ispd / float(r.get("ispdgain") or ispd)
+    r["prod_bg"], r["prod_std"] = r["mean_lin"] * k, r["std_lin"] * k
+    r["prod_std_code"] = r["prod_std"] / prod_code_width(r["prod_bg"], platform)
     r["total_gain"] = g
     r["nef"] = r["std_lin"] / g                # noise-equivalent flux: lower = more sensitive
     r["sky"] = r["mean_lin"] / g               # sky brightness in gain-free units
@@ -127,6 +137,17 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None):
     r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r["mean_lin"]))
     r["eligible"], r["why"] = eligible(r)
     return r
+
+
+def prod_code_width(lin, platform):
+    """Linear width of one output code at this level in a real frame: the gamma table's
+    straight first segment (CV300 below 16 linear units: 1.0; Goke below 4: 0.5), else the
+    pure 0.5 curve, which the nodes follow within ~1% above it."""
+    if platform == "cv300" and lin < 16.0:
+        return 16.0 / 15.94
+    if platform == "goke" and lin < 4.0:
+        return 4.0 / 7.97
+    return code_step(lin)
 
 
 def code_step(mean_lin):
@@ -162,6 +183,10 @@ def eligible(r, min_std_code=MIN_STD_CODE, min_sigma=3.0):
         return False, "old decode (code %.0f < %d: update the camera image)" % (r.get("mean_code", 0), lim)
     if r["std_code"] < min_std_code:
         return False, "quantized (noise %.2f code)" % r["std_code"]
+    if r.get("prod_std_code") is not None and r["prod_std_code"] < min_std_code:
+        # measured fine at the boosted level, but at night settings this gain's frames would
+        # carry under 1.5 codes of noise: the 8-bit output itself would cost sensitivity
+        return False, "night frames quantized (noise %.2f code)" % r["prod_std_code"]
     if r["mean_lin"] < min_sigma * r["std_lin"]:
         return False, "black clip (sky %.1f sigma)" % (r["mean_lin"] / max(r["std_lin"], 1e-9))
     return True, ""
@@ -189,15 +214,26 @@ def screen(rows, min_sigma=3.0, dip=DIP):
     return rows
 
 
+def compensating_ispd(again, top, ispd=ISPD_FULL_SCALE):
+    """ISP digital gain (x1024) that holds the TOTAL gain at the top step's: every step then
+    lands at the same output level, with the same noise in codes and the same code width,
+    so the 8-bit output's quantization affects every step alike and drops out of the
+    comparison. ISP gain comes after the ADC, so it scales signal and noise together and
+    leaves the analog stage's noise -- what is being compared -- unchanged."""
+    return int(min(ISPD_MAX, max(ispd, round(top * ispd / float(again)))))
+
+
 def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
                  settle_s=SETTLE_S, on_row=None):
-    """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves."""
+    """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves.
+    Each analog step is measured at the CONSTANT total gain of the top step
+    (compensating_ispd); the production ISP gain is `ispd`."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
     plat = platform_of(ip)
     try:
         for a in steps:
-            r = _measure(ip, a, ispd, exp_us, frames, settle_s, plat)
+            r = _measure(ip, a, compensating_ispd(a, steps[0], ispd), exp_us, frames, settle_s, plat, prod_ispd=ispd)
             if r is None:
                 probe = send(ip, "noise_stats 2", timeout=10) or "no answer"
                 out["reason"] = ("camera has no noise_stats (needs the 2026-09-25 image)"
@@ -207,7 +243,8 @@ def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
             if on_row:
                 on_row(station, r)
         # stability: the sky must not have moved during the sweep
-        rep = _measure(ip, steps[0], ispd, exp_us, frames, settle_s, plat)
+        rep = _measure(ip, steps[0], compensating_ispd(steps[0], steps[0], ispd), exp_us, frames, settle_s,
+                       plat, prod_ispd=ispd)
         if rep is not None:
             s0 = out["rows"][0]["sky"]
             out["drift"] = abs(rep["sky"] - s0) / s0 if s0 else None
@@ -298,9 +335,11 @@ def format_table(res):
             sid, ("-> %.2fx" % (c["chosen"] / 1024.0)) if c.get("ok") else "INVALID: " + c.get("reason", ""),
             top["sky"], ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?", dec))
         for r in sorted(c["rows"], key=lambda r: -r["again_set"]):
-            L.append("      again %6.2fx  bg %8.1f  noise %7.2f (%4.2f code)  nef %+5.1f%%  headroom %6.1fx  clip %.3f%%%s" % (
-                r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r.get("std_code", float("nan")),
-                100 * (r["nef"] / ref_nef - 1), 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0),
+            L.append("      again %6.2fx  isp %5.2fx  bg %8.1f  noise %7.2f (%4.2f code)  nef %+5.1f%%  night bg %6.1f (%4.2f code)  headroom %6.1fx  clip %.3f%%%s" % (
+                r["again_set"] / 1024.0, r.get("ispd_set", res["ispdgain"]) / 1024.0, r["mean_lin"], r["std_lin"],
+                r.get("std_code", float("nan")), 100 * (r["nef"] / ref_nef - 1),
+                r.get("prod_bg", r["mean_lin"]), r.get("prod_std_code", float("nan")),
+                4095.0 / max(r.get("prod_bg", r["mean_lin"]), 1e-6), r.get("clip_pct", 0),
                 ("  " + r["why"]) if r.get("why") else ("  <- chosen" if r["again_set"] == pick else "")))
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
