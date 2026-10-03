@@ -103,7 +103,7 @@ def night_line(station):
     return get("a"), get("i"), get("e")
 
 
-def _measure(ip, again, ispd, exp_us, frames, settle_s):
+def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None):
     send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
     time.sleep(settle_s)                       # the sensor applies gain within ~2 frames
     r = parse_noise(send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20))
@@ -111,6 +111,7 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s):
         return None
     g = (r.get("again") or again) / 1024.0 * (r.get("ispdgain") or ispd) / 1024.0
     r["again_set"] = again
+    r["platform"] = platform
     r["total_gain"] = g
     r["nef"] = r["std_lin"] / g                # noise-equivalent flux: lower = more sensitive
     r["sky"] = r["mean_lin"] / g               # sky brightness in gain-free units
@@ -128,13 +129,26 @@ def code_step(mean_lin):
     return max(2.0 * code, 1.0) * 4095.0 / 65025.0
 
 
-OLD_DECODE_MIN_CODE = 16    # below this an older image's code^2 decode is wrong (CV300 linear first segment)
+# Below this code an older image's code^2 decode is wrong: the gamma table's straight first
+# segment (CV300: 257 nodes, first at 16 linear units = code 16; Goke: 1025, first at 4 = code 8).
+OLD_DECODE_MIN_CODE = {"cv300": 16, "goke": 8}
+
+
+def platform_of(ip):
+    """'cv300' | 'goke' from the camera's sysinfo, None if it does not say."""
+    s = send(ip, "sysinfo", timeout=8) or ""
+    if "hi3516cv300" in s:
+        return "cv300"
+    if "gk7205" in s:
+        return "goke"
+    return None
 
 
 def eligible(r, min_std_code=1.0, min_sigma=3.0):
     """Is this step's noise figure trustworthy? (ok, reason)"""
-    if r.get("decode") != "table" and r.get("mean_code", 99) < OLD_DECODE_MIN_CODE:
-        return False, "old decode (code %.0f < %d: update the camera image)" % (r.get("mean_code", 0), OLD_DECODE_MIN_CODE)
+    lim = OLD_DECODE_MIN_CODE.get(r.get("platform"), 16)
+    if r.get("decode") != "table" and r.get("mean_code", 99) < lim:
+        return False, "old decode (code %.0f < %d: update the camera image)" % (r.get("mean_code", 0), lim)
     if r["std_code"] < min_std_code:
         return False, "quantized (noise %.2f code)" % r["std_code"]
     if r["mean_lin"] < min_sigma * r["std_lin"]:
@@ -169,9 +183,10 @@ def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
+    plat = platform_of(ip)
     try:
         for a in steps:
-            r = _measure(ip, a, ispd, exp_us, frames, settle_s)
+            r = _measure(ip, a, ispd, exp_us, frames, settle_s, plat)
             if r is None:
                 probe = send(ip, "noise_stats 2", timeout=10) or "no answer"
                 out["reason"] = ("camera has no noise_stats (needs the 2026-09-25 image)"
@@ -181,7 +196,7 @@ def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
             if on_row:
                 on_row(station, r)
         # stability: the sky must not have moved during the sweep
-        rep = _measure(ip, steps[0], ispd, exp_us, frames, settle_s)
+        rep = _measure(ip, steps[0], ispd, exp_us, frames, settle_s, plat)
         if rep is not None:
             s0 = out["rows"][0]["sky"]
             out["drift"] = abs(rep["sky"] - s0) / s0 if s0 else None
