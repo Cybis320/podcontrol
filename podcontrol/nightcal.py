@@ -72,6 +72,7 @@ BLACK_LEVEL = 240                                          # 12-bit pedestal, bo
 ISPD_FULL_SCALE = int(round(4095 * 1024 / (4095 - BLACK_LEVEL)))   # 1088 = 1.0625x
 STEPS = [22924, 16384, 11585, 8192, 5793, 4096]            # x1024, 3 dB apart; 22924 = IMX307 max
 DIP = 0.10                                                 # nef this far below the steps above = artifact
+SETTLE_S = 2.0                                             # s after each gain change (see _measure)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
 LOG = os.path.expanduser("~/.config/podcontrol/nightcal.jsonl")
 
@@ -182,7 +183,7 @@ def screen(rows, min_sigma=3.0, dip=DIP):
 
 
 def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
-                 settle_s=2.0, on_row=None):
+                 settle_s=SETTLE_S, on_row=None):
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
@@ -247,7 +248,7 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
         raise RuntimeError("no RMS night `manual` line in %s" % (st0.settings_path or "(no settings file)"))
     res["exp_us"] = nl[2]
     with ThreadPoolExecutor(max_workers=len(pod.stations)) as ex:
-        futs = {s.id: ex.submit(sweep_camera, s, nl[2], ISPD_FULL_SCALE, STEPS, frames, 1.0, on_row)
+        futs = {s.id: ex.submit(sweep_camera, s, nl[2], ISPD_FULL_SCALE, STEPS, frames, SETTLE_S, on_row)
                 for s in pod.stations}
         for sid, f in futs.items():
             try:
