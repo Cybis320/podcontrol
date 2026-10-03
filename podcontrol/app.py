@@ -1561,20 +1561,45 @@ class App(tk.Tk):
             t.configure(state="disabled")
             t.pack(fill="x")
             self._flows.append(t)
-        self.after(300, self._fit_flows)
+        # One pass is not enough. The embedded widgets have no size until Tk has
+        # laid them out, so an early measurement returns almost nothing and the
+        # group collapses to a bar -- which is what the busiest groups (control,
+        # loop, masks & overlay, white balance) did, while the short ones
+        # happened to be ready in time. Re-fit on a few delays AND whenever a
+        # flow's width changes, since wrapping, and so height, depends on it.
+        for ms in (300, 800, 1500, 3000):
+            self.after(ms, self._fit_flows)
         self.bind("<Map>", lambda e: self.after(100, self._fit_flows), add="+")
+        for t in self._flows:
+            t.bind("<Configure>", self._flow_reflow, add="+")
+
+    def _flow_reflow(self, _e=None):
+        """Re-fit soon after a flow changes width, debounced: setting a height
+        is itself a Configure, so an immediate re-fit would feed itself."""
+        if getattr(self, "_flow_job", None):
+            try:
+                self.after_cancel(self._flow_job)
+            except Exception:
+                pass
+        self._flow_job = self.after(120, self._fit_flows)
 
     def _fit_flows(self):
         """Size each flow Text to the height of its wrapped content."""
         import tkinter.font as tkfont
+        self._flow_job = None
         for t in getattr(self, "_flows", []):
             try:
                 ls = max(1, tkfont.Font(font=t.cget("font")).metrics("linespace"))   # the Text's own font
                 t.update_idletasks()
                 px = t.count("1.0", "end", "ypixels")
                 px = px[0] if isinstance(px, tuple) else px
-                if px:
-                    t.configure(height=max(1, int(math.ceil(px / float(ls)))))
+                if not px:
+                    continue
+                want = max(1, int(math.ceil(px / float(ls))))
+                # only when it actually changes: a no-op configure still emits a
+                # Configure event, and that would loop through _flow_reflow
+                if int(t.cget("height")) != want:
+                    t.configure(height=want)
             except Exception:
                 pass
 
