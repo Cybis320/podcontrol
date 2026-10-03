@@ -105,7 +105,10 @@ def night_line(station):
 
 def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None):
     send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
-    time.sleep(settle_s)                       # the sensor applies gain within ~2 frames
+    # The picture reads ~5% low for ~1.2 s after a gain change (Goke .206, ae_stats sampled
+    # every 0.4 s, 2026-10-03); a 1 s settle sometimes measured inside that window, which the
+    # drift check then blamed on the sky. 2 s clears it.
+    time.sleep(settle_s)
     r = parse_noise(send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20))
     if r is None:
         return None
@@ -179,7 +182,7 @@ def screen(rows, min_sigma=3.0, dip=DIP):
 
 
 def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
-                 settle_s=1.0, on_row=None):
+                 settle_s=2.0, on_row=None):
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
