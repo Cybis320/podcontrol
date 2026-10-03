@@ -581,7 +581,10 @@ class SharedAE:
                          "reason": "latched at night line", "li": self.li, "target": self.target,
                          "to_go": 0.0, "exp_us": exp, "analog_x": analog, "boost_x": boost,
                          "total_gain_x": analog * boost, "driver": None, "driver_why": None,
-                         "needs": {}, "changed": self._applied_li is None, "state": self.state}
+                         "needs": {}, "changed": self._applied_li is None, "state": self.state,
+                         # the other branch always reports it; omitting it here made
+                         # every consumer carry its own default
+                         "wb_scale": self.wb_scale_for(self.li)}
             return self.last
         self.evaluate(metering)
         # FEED-FORWARD: travel with the sky so the slew only has to correct the

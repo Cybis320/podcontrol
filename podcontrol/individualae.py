@@ -148,7 +148,11 @@ class IndividualAE(object):
             "reason": "individual: %s" % top, "driver": None, "driver_why": None,
             "needs": {sid: (i["needs"][sid] if sid in (i.get("needs") or {}) else (0.0, i.get("reason")))
                       for sid, i in infos.items()},
-            "state": self.state, "wb_scale": med("wb_scale"),
+            # `or 1.0`: med() is None when no sub-controller reported a scale,
+            # which is the normal night case (a latched controller sends no WB at
+            # all). None then reached the status bar and raised on `< 0.999`.
+            # "nothing attenuating" is scale 1.0, not "unknown".
+            "state": self.state, "wb_scale": med("wb_scale") or 1.0,
             "changed": any(i.get("changed") for i in infos.values()),
             "per_cam": {sid: {"li": i.get("li"), "target": i.get("target"), "exp_us": i.get("exp_us"),
                               "total_gain_x": i.get("total_gain_x"), "wb_scale": i.get("wb_scale"),

@@ -50,7 +50,32 @@ TINT_MOON = (140, 200, 255)                               # moon zone
 TINT_CLIP, TINT_HOT = (255, 0, 255), (0, 255, 255)        # what drives the AE
 OVERLAY_ALPHA = 0.45
 DRIVE_COLOR = {"clipping": "#ff5ad6", "headroom": "#5ae0ff", "at target": "#7fc776"}
-MONO = "JetBrains Mono"
+MONO = "JetBrains Mono"          # replaced at startup by the first family actually installed
+
+
+def pick_mono(preferred=("JetBrains Mono", "DejaVu Sans Mono", "Liberation Mono",
+                         "Noto Sans Mono", "Ubuntu Mono", "Courier New")):
+    """The first installed family from `preferred`, else Tk's own fixed font.
+
+    Naming a family Tk cannot find does not raise and does not warn: Tk
+    substitutes silently, and on a machine without JetBrains Mono it chose Noto
+    Sans, which is PROPORTIONAL ("iiii" 12 px, "WWWW" 44 px against a monospace
+    font's 28 and 28). Every column in the telemetry and the status bar is laid
+    out by character count, and the options panel sizes its wrapping from the
+    width of a digit, so the whole layout garbles -- while looking perfect on
+    any machine that happens to have the font."""
+    import tkinter.font as tkfont
+    try:
+        fams = set(tkfont.families())
+    except Exception:
+        return preferred[0]
+    for f in preferred:
+        if f in fams:
+            return f
+    try:
+        return tkfont.nametofont("TkFixedFont").cget("family")
+    except Exception:
+        return preferred[0]
 SIDE_W = 470         # width of the options column on the right (px)
 SKY_SIZE = 900        # internal size of the sky composite (px); scaled to the canvas
 # Degrees of sun altitude ABOVE RMS's day/night switch at which podcontrol
@@ -390,6 +415,10 @@ def _dry_pod(pod):
 class App(tk.Tk):
     def __init__(self, allow_grab=True):
         super().__init__()
+        # Before any widget: every font tuple below reads MONO, and a family Tk
+        # cannot find is substituted silently with whatever it likes.
+        global MONO
+        MONO = pick_mono()
         self.title("Pod Control %s — pod as one camera" % VERSION.short())
         self.configure(bg=BG)
         self.geometry("1400x820")
@@ -1016,7 +1045,7 @@ class App(tk.Tk):
                 if info:
                     ae = "  AE[%s] %s exp=%dus gain=%.2fx%s (to go %+.2f stop; set %s)" % (
                         info.get("state", "?"), info["reason"], info["exp_us"], info["total_gain_x"],
-                        (" wb\u00d7%.2f" % info["wb_scale"]) if info.get("wb_scale", 1.0) < 0.999 else "",
+                        (" wb\u00d7%.2f" % info["wb_scale"]) if (info.get("wb_scale") or 1.0) < 0.999 else "",
                         info.get("to_go", 0.0),
                         ("%.0fs old" % (time.time() - self.ae_slot)) if self.ae_slot else "none")
                 note = ""
