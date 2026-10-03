@@ -28,9 +28,13 @@ camera on an older image (no `decode=` in the reply) still decodes code^2: its
 steps below code 16 are marked untrustworthy.
 
 Three things corrupt a step's noise figure, and such steps are not eligible:
-  - quantization: sky noise under ~1 code of the 8-bit output is under-read
+  - quantization: sky noise under ~1.5 codes of the 8-bit output is under-read
     (the width of one code in linear units is what the camera reports as
-    lin_per_code; older images: assumed 2*code*4095/65025);
+    lin_per_code; older images: assumed 2*code*4095/65025). Under a 0.5 gamma
+    the shot noise is the same number of codes at every level, ~2*sqrt(K*gain):
+    K ~0.025 on the CV300/IMX291, so below ~16x its noise is under 1.5 codes and
+    reads LOW (2026-10-03: nef "improving" as gain fell -- impossible). K ~0.13 on
+    the Goke/IMX307 keeps it above 1.5 codes down to 4x;
   - the black clip: a sky within 3 sigma of zero has its lower tail clipped.
     The sigma is the one the higher-gain steps PREDICT (their noise-equivalent
     flux times this gain), not the measured one: clipping shrinks the measured
@@ -148,7 +152,10 @@ def platform_of(ip):
     return None
 
 
-def eligible(r, min_std_code=1.0, min_sigma=3.0):
+MIN_STD_CODE = 1.5         # noise below this many output codes is under-read (see the docstring)
+
+
+def eligible(r, min_std_code=MIN_STD_CODE, min_sigma=3.0):
     """Is this step's noise figure trustworthy? (ok, reason)"""
     lim = OLD_DECODE_MIN_CODE.get(r.get("platform"), 16)
     if r.get("decode") != "table" and r.get("mean_code", 99) < lim:
