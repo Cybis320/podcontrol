@@ -367,8 +367,11 @@ class Tile(tk.Frame):
             # how far down its rung THIS camera is. In individual AE every camera
             # has its own, and the status bar shows only the median across six,
             # so a pod spread across the rung reads as one wrong number there.
+            # Always shown, x1.00 included: hiding it while the rung is idle made
+            # the field invisible exactly when you want to confirm it is there,
+            # and an absent number reads the same as a camera with no AE state.
             ws = (ae or {}).get("wb_scale")
-            if ws is not None and ws < 0.999:
+            if ws is not None:
                 line3 += "\u00d7%.2f " % ws
         if qp and qp.get("maxqp") is not None:
             line3 += "qp %s " % qp["maxqp"]
