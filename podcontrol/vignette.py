@@ -44,17 +44,38 @@ residual's correlation with radius falls to -0.019.
 import math
 import numpy as np
 
-# Fitted 2026-09-28 from 14 frame sets, ~300k overlap samples, residual 5.1%.
-# For scale: RMS's default is 0.000667 and the one platepar RMS actually fitted
-# (US05E1) holds 0.000398, which is 15% from this -- an independent check, since
-# that came from star photometry and this from sky background.
-DEFAULT_COEFF = 0.000347        # rad/px
+# DOMAIN MATTERS, and getting it wrong cost a wrong conclusion once already.
+#
+# DEFAULT_COEFF is fitted on, and applied to, the saved frames' 8-BIT DISPLAY
+# CODES, which are gamma-encoded (the cameras' own decode tables; see
+# podcontrol/decode.py). The sky view multiplies warped display values by
+# 1/V(r), so fitting and correcting in the same domain is self-consistent and
+# does flatten the composite -- the residual's correlation with radius fell to
+# -0.019 after it.
+#
+# It is NOT comparable with the platepar's vignetting_coeff. RMS fits that
+# against star FLUX, which is linear light. Refitting the same overlaps in
+# linear light (decoding each frame first) gives a coefficient of 0.00049,
+# almost exactly twice the display one in log terms, as a gamma of 0.5 requires.
+# An earlier note here compared 0.000347 against RMS's 0.000398 and explained
+# the gap by an unmodelled sensor pedestal. That was wrong twice over: the two
+# numbers are in different domains, and in the domain where they ARE comparable
+# this fit is HIGHER than RMS's, not lower, so a pedestal (which only makes a
+# measured falloff shallower) cannot account for it. The gap is unexplained.
+#
+# Use LINEAR_COEFF for anything photometric -- the constant-exposure view works
+# in linear light and would need that one, not DEFAULT_COEFF.
+DEFAULT_COEFF = 0.000347        # rad/px, DISPLAY domain (8-bit gamma-encoded codes)
+LINEAR_COEFF = 0.000490         # rad/px, LINEAR light; comparable with the platepar
 MAX_COEFF = 0.0015              # refuse anything past roughly twice RMS's default
 MAX_GAIN = 4.0                  # clamp the corner boost, so a bad coefficient cannot blow up
 
 
 def response(r_px, coeff):
-    """V(r): the fraction of light that reaches the sensor at radius r_px."""
+    """V(r) = cos(coeff*r)**4, in whatever domain `coeff` was fitted in.
+
+    With DEFAULT_COEFF that is display codes; with LINEAR_COEFF it is light.
+    The caller must pass the coefficient matching the data it is correcting."""
     if not coeff:
         return np.ones_like(np.asarray(r_px, np.float32))
     x = np.clip(np.asarray(r_px, np.float32) * float(coeff), 0.0, 1.45)
