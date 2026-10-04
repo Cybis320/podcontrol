@@ -46,7 +46,10 @@ def _f(text, pat):
     return m.group(1) if m else None
 
 
-def _parse_goke(q):
+def _parse_query(q):
+    """The camera's `query` report. Every science camera prints the same text since
+    2026-10-04 (silicon_research venc_override/ctl_reply.h): G3S/IMX307, K662/IMX662 and
+    CV300/IMX291 alike, so there is ONE parser and no per-platform branch."""
     def n(k):
         v = _f(q, k + r":\s*(-?\d+)")
         return int(v) if v is not None else None
@@ -73,19 +76,6 @@ def _parse_goke(q):
         "optype": _f(q, r"OpType:\s*(\w+)"),
         "exp_max": (_f(q, r"ExposureMAX:\s*(\w+)") or "").lower() == "yes",
         "ranges": ranges, "stages": stages,
-    }
-
-
-def _parse_ae_line(text):
-    def x(k):
-        v = _f(text, k + r"=([\d.]+)x")
-        return float(v) if v else None
-    us = _f(text, r"~(\d+)\s*us")
-    return {
-        "again_x": x("AGain"), "sysgain_x": x("SysGain"), "dgain_x": None, "ispdgain_x": None,
-        "exp_us": int(us) if us else None,
-        "iso": int(_f(text, r"ISO=(\d+)") or 0) or None,
-        "avelum": None, "chiptemp": None, "optype": None, "exp_max": None,
     }
 
 
@@ -121,7 +111,7 @@ def _parse_gop(text):
 
 
 def _parse_satu(text):
-    """'ISP saturation: opType=MANUAL manual=128 (128=1.00x -> 1.00x)'."""
+    """'ISP saturation: opType=MANUAL manual=128 (128=1.00x -> 1.00x)' (every platform)."""
     if not text or "saturation" not in text:
         return None
     v = _f(text, r"manual=(\d+)")
@@ -197,6 +187,21 @@ def venc_chn(ip, timeout=5.0):
     return _VENC_CHN[ip]
 
 
+# Platform per camera, from its own `sysinfo` (soc=...), learned once. The reply format is
+# the same everywhere; the platform label is still needed by callers whose PHYSICS differ
+# (e.g. nightcal's per-platform gamma node spacing).
+_PLATFORM = {}
+
+
+def platform_of(ip, timeout=5.0):
+    if ip not in _PLATFORM:
+        soc = _f(send(ip, "sysinfo", timeout) or "", r"soc=(\S+)")
+        if not soc:
+            return None
+        _PLATFORM[ip] = "imx291" if soc.startswith("hi3516cv300") else "goke"
+    return _PLATFORM[ip]
+
+
 def poll(ip, timeout=5.0, full=True):
     """Unified telemetry for one camera. platform in {goke, imx291, None}.
     full=False asks only `query` (exposure) and skips the wb/venc_* reads --
@@ -206,11 +211,11 @@ def poll(ip, timeout=5.0, full=True):
     if q is None:
         return {"online": False, "platform": None}
     enc = _encoder_telemetry(ip, timeout) if full else {}
-    if "Exposure Info" in q:                     # Goke isp_ctl
-        return {"online": True, "platform": "goke", **_parse_goke(q), **enc}
-    if "ae:" in q or "AGain=" in q:              # IMX291 hisp_ctl
-        return {"online": True, "platform": "imx291", **_parse_ae_line(q), **enc}
-    return {"online": True, "platform": "unknown", "raw": q}
+    plat = platform_of(ip, timeout)
+    if "Exposure Info" in q:
+        return {"online": True, "platform": plat, **_parse_query(q), **enc}
+    # a firmware older than the shared reply format (silicon_research 13642f7): no parse
+    return {"online": True, "platform": plat or "unknown", "raw": q}
 
 
 class PodController:
