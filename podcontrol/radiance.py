@@ -64,6 +64,11 @@ def rolloff(lin, knee=KNEE):
 _FLAT = {}          # (h, w, coeff) -> per-pixel 1/V(r); static, so built once
 
 
+def vignette_linear_default():
+    from podcontrol import vignette
+    return vignette.LINEAR_COEFF
+
+
 def flat_field(shape, coeff=None):
     """Per-pixel lens correction 1/V(r) for a full frame, in LINEAR light.
 
@@ -131,8 +136,9 @@ def constant_exposure(paths, records, e_ref=None, flat=False):
     """({sid: scaled image}, {sid: cache path tagged with k}, info) for the sky compositor.
     Cameras whose exposure cannot be found are left out of the scaling (drawn as they are).
 
-    flat=True also divides out the lens falloff, in linear light, before the
-    highlight rolloff. The caller must then tell the compositor NOT to apply its
+    `flat` divides out the lens falloff, in linear light, before the highlight
+    rolloff: pass a LINEAR coefficient (auto-tune fits one), or True for the
+    module default. The caller must then tell the compositor NOT to apply its
     own display-space correction, or the frames are flattened twice."""
     es, src = {}, {}
     for sid, p in paths.items():
@@ -153,11 +159,16 @@ def constant_exposure(paths, records, e_ref=None, flat=False):
         if img is None:
             continue
         k = ref / es[sid] if sid in es else 1.0
-        ff = flat_field(img.shape) if flat else None
+        # flat may be True (use the module default) or a coefficient from auto-tune
+        flat_coeff = (vignette_linear_default() if flat is True else float(flat)) if flat else 0.0
+        ff = flat_field(img.shape, flat_coeff) if flat_coeff else None
         imgs[sid] = scale(img, k, sid=sid, flat=ff)   # through that camera's own curve
-        # the tag keys the compositor's frame cache: the flat changes the pixels,
-        # so it has to change the tag too or a toggle would show a stale image
-        tagged[sid] = "%s#k=%.4f%s" % (p, k, "#flat" if ff is not None else "")
+        # the tag keys the compositor's frame cache AND the downscale cache, so it
+        # must carry everything that changed the pixels. The COEFFICIENT has to be
+        # in it, not just the fact of a flat: tagging only "#flat" made a changed
+        # coefficient reuse the previous composite, so auto-tune appeared to do
+        # nothing.
+        tagged[sid] = "%s#k=%.4f%s" % (p, k, ("#flat%.6f" % flat_coeff) if ff is not None else "")
         ks[sid] = k
     return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src,
-                          "flat": bool(flat)}
+                          "flat": bool(flat), "flat_coeff": flat_coeff if flat else 0.0}

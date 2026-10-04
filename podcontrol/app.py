@@ -487,6 +487,10 @@ class App(tk.Tk):
         # the rest. Off by default all the same: it changes displayed pixels.
         self.vig_on = tk.BooleanVar(value=bool(sv("vignette_on", False)))
         self.vig_coeff = tk.DoubleVar(value=float(sv("vignette_coeff", VIGNETTE.DEFAULT_COEFF)))
+        # the same lens in LINEAR light, for the constant-exposure view. Separate
+        # because the fit on display codes and the fit on light differ by roughly
+        # a factor of two in log terms, and auto-tune now sets both.
+        self.vig_coeff_lin = tk.DoubleVar(value=float(sv("vignette_coeff_linear", VIGNETTE.LINEAR_COEFF)))
         self._vig_busy = False
         self.satu = tk.IntVar(value=int(sv("satu", 128)))
         cm = saved.get("ccm_mode")
@@ -1162,7 +1166,8 @@ class App(tk.Tk):
             # highlights had already been compressed.
             from podcontrol import radiance
             imgs, paths, cinfo = radiance.constant_exposure(
-                paths, list(self.history.records), flat=self.vig_on.get())
+                paths, list(self.history.records),
+                flat=(VIGNETTE.clamp(self.vig_coeff_lin.get()) if self.vig_on.get() else 0.0))
             self._const_info = cinfo
             if cinfo.get("flat"):
                 vig_override = 0.0
@@ -1310,11 +1315,16 @@ class App(tk.Tk):
             messagebox.showwarning("Sky flat field", "Could not fit:\n\n%s" % res.get("error", "no result"))
             return
         self.vig_coeff.set(round(res["coeff"], 6))
+        if res.get("coeff_linear"):
+            self.vig_coeff_lin.set(round(res["coeff_linear"], 6))
         self.vig_on.set(True)
         self._vig_apply()
         gains = res.get("gains") or {}
         spread = (100 * (max(gains.values()) / min(gains.values()) - 1)) if gains else 0.0
         lines = ["k = %.6f rad/px  (%.2fx at the corner)" % (res["coeff"], res["corner"]),
+                 "   on display codes, for the sky view",
+                 "k = %s rad/px  in linear light, for constant exposure"
+                 % (("%.6f" % res["coeff_linear"]) if res.get("coeff_linear") else "not fitted"),
                  "residual %.1f%% over %d overlap samples from %d frame sets"
                  % (100 * res["residual"], res["samples"], res["sets"]), "",
                  "Per-camera gain, which is the pod's exposure mismatch with the",
@@ -1513,6 +1523,7 @@ class App(tk.Tk):
              "slew_fast": float(self.slew_fast.get()),
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
+             "vignette_coeff_linear": float(self.vig_coeff_lin.get()),
              "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "wb_rung_magenta_ok": bool(self.magenta_ok.get()),
              "camera_meter": bool(self.camera_meter.get()), "individual_ae": bool(self.individual_ae.get()),

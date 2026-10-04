@@ -154,7 +154,22 @@ def fit(renderer, sets, progress=None):
         rmax[sid] = float(lut.r_px.max()) or 1.0
     scale = max(rmax.values())          # normalise so the solve is well scaled
 
-    rows, rhs = [], []
+    # each camera's real code -> linear curve, for the second (linear) fit
+    from podcontrol import decode as _decode
+    _codes = np.arange(256.0)
+    _tables = {}
+    for sid in ids:
+        try:
+            _decode.fetch(renderer.by_id[sid])
+        except Exception:
+            pass
+        _tables[sid] = _decode.table(sid)
+
+    def _lin(sid, codes):
+        """Fractional 8-bit codes (the remap interpolates) -> linear light."""
+        return np.maximum(np.interp(codes, _codes, _tables[sid]), 1e-6)
+
+    rows, rhs, rhs_lin = [], [], []
     for si, paths in enumerate(sets):
         if progress:
             progress(si, len(sets))
@@ -191,22 +206,39 @@ def fit(renderer, sets, progress=None):
                 row[:, 1 + b] = -1.0
                 rows.append(row)
                 rhs.append(np.log(warp[ia][ys, xs]) - np.log(warp[ib][ys, xs]))
+                # the SAME samples in linear light, through each camera's own
+                # gamma table. The sky view corrects display codes and wants the
+                # display fit; the constant-exposure view works in light and
+                # wants this one. Fitting both here is what keeps auto-tune from
+                # updating one and leaving the other on a hardcoded constant.
+                rhs_lin.append(np.log(_lin(ia, warp[ia][ys, xs])) - np.log(_lin(ib, warp[ib][ys, xs])))
     if not rows:
         return {"error": "no usable overlap samples (too dark, clipped, or no shared sky)"}
     A = np.vstack(rows)
-    y = np.concatenate(rhs)
     # gauge: the gains are only defined up to a common factor, so pin their sum
     g = np.zeros((1, 1 + n), np.float32)
     g[0, 1:] = 1.0
-    sol, *_ = np.linalg.lstsq(np.vstack([A, g * 50.0]), np.concatenate([y, [0.0]]), rcond=None)
-    res = float(np.sqrt(np.mean((A @ sol - y) ** 2)))
+    Ag = np.vstack([A, g * 50.0])
+
+    def solve(parts):
+        y = np.concatenate(parts)
+        sol, *_ = np.linalg.lstsq(Ag, np.concatenate([y, [0.0]]), rcond=None)
+        return sol, float(np.sqrt(np.mean((A @ sol - y) ** 2))), len(y)
+
+    def to_k(c_norm):
+        """exp(-c r_norm^2) -> cos(k r_px)^4, matched at the corner."""
+        v = math.exp(-c_norm)
+        return clamp(math.acos(min(1.0, v ** 0.25)) / scale), 1.0 / v
+
+    sol, res, ny = solve(rhs)
     c_norm = float(sol[0])
     if c_norm <= 0:
         return {"error": "fit produced a brightening lens (%.3f): not enough overlap signal" % c_norm,
-                "residual": res, "samples": int(len(y))}
-    # exp(-c r_norm^2) -> cos(k r_px)^4 matched at the corner
-    v_corner = math.exp(-c_norm)
-    k = math.acos(min(1.0, v_corner ** 0.25)) / scale
-    return {"coeff": clamp(k), "residual": res, "samples": int(len(y)),
-            "corner": 1.0 / v_corner, "sets": len(sets),
+                "residual": res, "samples": int(ny)}
+    k, corner = to_k(c_norm)
+    sol_l, res_l, _ = solve(rhs_lin)
+    k_lin = to_k(float(sol_l[0]))[0] if float(sol_l[0]) > 0 else None
+    return {"coeff": clamp(k), "coeff_linear": k_lin, "residual": res,
+            "residual_linear": res_l, "samples": int(ny),
+            "corner": corner, "sets": len(sets),
             "gains": {sid: float(np.exp(sol[1 + pos[sid]])) for sid in ids}}
