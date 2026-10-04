@@ -380,8 +380,12 @@ class Tile(tk.Frame):
             line3 += "satu x%.2f " % (sa["value"] / 128.0)
         if cm:
             line3 += "ccm %s " % ("off" if cm.get("stage") == "bypassed" else (cm.get("mode") or "?"))
-        if need is not None:
-            line3 += "   need %+.2f stop (%s)" % (need, why or "")
+        # The demand gets its own line. Appended to line 3 it sat behind wb, qp,
+        # satu and ccm and ran past the tile's width, so the one field that says
+        # what the controller is about to DO was the one being cut off. The line
+        # is emitted even when empty, so a tile does not change height as the
+        # shared AE is switched on and off and shuffle the grid around it.
+        line4 = ("need %+.2f stop (%s)" % (need, why or "")) if need is not None else ""
         masked = (" mask%.0f%%" % (100 * luma["masked"])) if luma and luma.get("masked") else ""
         si = (layers or {}).get("sun_info")
         if si and si.get("alt") is not None and si["alt"] > -si["radius_deg"]:
@@ -394,12 +398,12 @@ class Tile(tk.Frame):
             gains += " D%.2f" % tel["dgain_x"]
         if tel.get("ispdgain_x"):
             gains += " I%.2f" % tel["ispdgain_x"]
-        self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\n%s  ISO %s  %s\n%s" % (
+        self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\n%s  ISO %s  %s\n%s\n%s" % (
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
             (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
             tel.get("exp_us"), gains, tel.get("iso"),
             ("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or ""),
-            line3))
+            line3.rstrip(), line4))
 
 
 _DRY_READS = ("wb", "query", "sysinfo", "ae_stats", "wb_stats", "af_stats", "noise_stats", "satu", "ccm",
