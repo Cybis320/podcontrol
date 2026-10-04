@@ -265,12 +265,17 @@ class Tile(tk.Frame):
         return (fx(min(x0, x1)), fy(min(y0, y1)), fx(max(x0, x1)), fy(max(y0, y1)))
 
     # --- rendering -----------------------------------------------------------
-    def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None, sig=None):
+    def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None, sig=None,
+               ae=None):
         """drive: None, or (is_driver, why, need_stops) for the shared AE.
+        ae: this camera's own controller state (individual AE) or the pod's
+        (shared), for the WB rung scale -- which the poll cannot report, since
+        the camera only knows the resulting gains, not how far down its rung
+        they came from.
         sig: a hashable signature of the image content + overlay settings; when
         it matches the last render (and the canvas size did not change) the
         image is left alone and only the text is refreshed."""
-        self._last = (img, source, tel, luma, layers, overlay, drive, None)
+        self._last = (img, source, tel, luma, layers, overlay, drive, None, ae)
         is_driver, why, need = drive if drive else (False, None, None)
         same = (sig is not None and sig == getattr(self, "_sig", None)
                 and img is not None and self._img_id is not None
@@ -359,6 +364,12 @@ class Tile(tk.Frame):
         if wb and wb.get("gains"):
             g = wb["gains"]                     # R, Gr[, Gb], B as the daemon reports them
             line3 += "wb %s%.2f/%.2f/%.2f " % ("auto " if wb.get("op") == "auto" else "", g[0], g[1], g[-1])
+            # how far down its rung THIS camera is. In individual AE every camera
+            # has its own, and the status bar shows only the median across six,
+            # so a pod spread across the rung reads as one wrong number there.
+            ws = (ae or {}).get("wb_scale")
+            if ws is not None and ws < 0.999:
+                line3 += "\u00d7%.2f " % ws
         if qp and qp.get("maxqp") is not None:
             line3 += "qp %s " % qp["maxqp"]
         sa, cm = tel.get("satu"), tel.get("ccm")
@@ -1102,8 +1113,13 @@ class App(tk.Tk):
             if info:
                 n = needs.get(sid)
                 drive = (sid == driver, (n[1] if n else None), (n[0] if n else None))
+            # individual AE keeps per-camera state; shared AE's own dict carries
+            # the single pod-wide scale, so one lookup serves both
+            per = (info or {}).get("per_cam") or {}
+            ae_i = per.get(sid) if per else info
+            ws = (ae_i or {}).get("wb_scale")
             t.render(img, src, poll.get(sid), lumas.get(sid),
-                     layers.get(sid), ov[0], drive, sig=(path, ov, drive))
+                     layers.get(sid), ov[0], drive, sig=(path, ov, drive, ws), ae=ae_i)
 
     # ---- sky view ------------------------------------------------------------
     def _render_sky(self, poll, cyc_frames=None, cyc_layers=None):
