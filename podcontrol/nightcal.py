@@ -349,7 +349,11 @@ def format_table(res):
 def update_settings(path, again, ispd):
     """Rewrite the -a/-i values of every Isp `manual` line (RMS init + night) in
     place, keeping the file's hand formatting. Backup first, atomic replace,
-    re-parse and verify. Returns the backup path."""
+    re-parse and verify. Returns the backup path.
+
+    ispd may be "restore" (the firmware computes the black-level restoration floor
+    4095/(4095-pedestal) per camera, silicon_research science_gain.h); a number or
+    "restore" already in the file is replaced either way."""
     txt = open(path).read()
     data = json.loads(txt)
     if any(isinstance(e, list) and len(e) > 1 and e[0] == "Isp" and e[1] == "manual"
@@ -359,7 +363,7 @@ def update_settings(path, again, ispd):
     for line in txt.splitlines(True):
         if re.search(r'"Isp"\s*,\s*"manual"', line):
             line = re.sub(r'("-a"\s*,\s*")\d+(")', r"\g<1>%d\g<2>" % again, line)
-            line = re.sub(r'("-i"\s*,\s*")\d+(")', r"\g<1>%d\g<2>" % ispd, line)
+            line = re.sub(r'("-i"\s*,\s*")(?:\d+|restore)(")', r"\g<1>%s\g<2>" % ispd, line)
             n += 1
         out.append(line)
     new = "".join(out)
@@ -382,16 +386,18 @@ def update_settings(path, again, ispd):
 def apply(pod, res):
     """Set the proposed gain on every camera (saved, as RMS would) and in each
     station's settings file; log the calibration. Returns a list of notes."""
-    a, i, e = res["pod_again"], res["ispdgain"], res["exp_us"]
+    # ISP gain: the camera's own black-level restoration ("-i restore"), not a fixed
+    # 1088 -- that is right only for a 240 pedestal (CV300 236 -> 1087, IMX662 200 -> 1077).
+    a, i, e = res["pod_again"], "restore", res["exp_us"]
     if not a:
         raise RuntimeError("nothing to apply")
     notes = []
     for s in pod.stations:
-        r = send(s.ip, "manual -a %d -i %d -e %d" % (a, i, e), timeout=10)
+        r = send(s.ip, "manual -a %d -i %s -e %d" % (a, i, e), timeout=10)
         notes.append("%s: %s" % (s.id, "set" if r and "ERROR" not in r else "FAILED (%s)" % (r or "no answer")))
     for path in sorted({s.settings_path for s in pod.stations if s.settings_path}):
         bak, n = update_settings(path, a, i)
-        notes.append("%s: %d manual line(s) -> -a %d -i %d (backup %s)" % (path, n, a, i, os.path.basename(bak)))
+        notes.append("%s: %d manual line(s) -> -a %d -i %s (backup %s)" % (path, n, a, i, os.path.basename(bak)))
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     with open(LOG, "a") as f:
         f.write(json.dumps({"applied": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **res}) + "\n")

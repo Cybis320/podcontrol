@@ -142,6 +142,8 @@ class AEConfig:
         self.night_line = cmd
         self.exp_max_us = int(m["e"])
         self.analog_max_x = int(m["a"]) / 1024.0
+        # "-i restore" (no number): the camera sets ISP gain to its black-level restoration
+        # floor and enforces it on everything we send, so our boost ceiling is 1.0x on top.
         self.boost_max_x = int(m.get("i", 1024)) / 1024.0
         return True
 
