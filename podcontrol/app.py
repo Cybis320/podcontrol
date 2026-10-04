@@ -38,6 +38,7 @@ from podcontrol import settings as SETTINGS
 from podcontrol import version as VERSION
 from podcontrol import vignette as VIGNETTE
 from podcontrol import netbw as NETBW
+from podcontrol import memtrim as MEMTRIM
 from podcontrol.colour import cct_from_gains, gains_from_cct
 from podcontrol import skymap
 
@@ -1035,6 +1036,12 @@ class App(tk.Tk):
                 except Exception as e:
                     sky = ("sky: %s" % e,)
             self.q.put((frames, poll, lumas, layers, time.time() - t0, sky))
+            # hand the cycle's freed heap back to the OS. Six decoded frames,
+            # their masks and the composite are large and short-lived; glibc
+            # keeps the pages otherwise, which parks the plateau ~110 MB higher
+            # (424 MB against 315 measured over twelve cycles). ~1.3 ms, and it
+            # touches nothing live, so it runs every cycle.
+            MEMTRIM.trim()
             for _ in range(int(self.interval.get() * 10)):
                 if not self.running:
                     return

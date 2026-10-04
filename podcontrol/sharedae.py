@@ -881,6 +881,11 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
                 ae.apply(platform=_pod_platform(poll))
             if on_tick:
                 on_tick(info, poll)
+            try:
+                from podcontrol import memtrim
+                memtrim.trim()          # same reason as the GUI loop; ~1.3 ms
+            except Exception:
+                pass
             for _ in range(int(cfg.period_s * 10)):
                 if stop():
                     break
