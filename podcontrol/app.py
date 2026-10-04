@@ -1153,20 +1153,30 @@ class App(tk.Tk):
         # the overlay checkbox governs the FOV overlay too: with it off the sky
         # view is the bare composite (plus the alt/az grid and the caption), no
         # footprints, camera labels, telemetry or sun/moon markers
+        vig_override = None
         if self.const_exp.get():
-            # DEMO: every tile brought to one common exposure (podcontrol.radiance)
+            # DEMO: every tile brought to one common exposure (podcontrol.radiance).
+            # The lens flat goes in THERE, in linear light before its highlight
+            # rolloff, so the compositor must not flatten again: vig_coeff=0 for
+            # this render. Correcting after the rolloff would boost corners whose
+            # highlights had already been compressed.
             from podcontrol import radiance
-            imgs, paths, cinfo = radiance.constant_exposure(paths, list(self.history.records))
+            imgs, paths, cinfo = radiance.constant_exposure(
+                paths, list(self.history.records), flat=self.vig_on.get())
             self._const_info = cinfo
+            if cinfo.get("flat"):
+                vig_override = 0.0
         bgr, _ = r.render(imgs, paths, t, spread, telem=poll, drive=drive, layers=layers,
-                          outlines=overlay_on, labels=overlay_on, bodies=overlay_on)
+                          outlines=overlay_on, labels=overlay_on, bodies=overlay_on,
+                          vig_coeff=vig_override)
         if self.const_exp.get() and getattr(self, "_const_info", None) and self._const_info.get("e_ref"):
             ks = self._const_info["k"]
             from podcontrol import decode as _decode
             own = [sid for sid in sorted(ks) if _decode.source(sid) == "table"]
             fb = [sid[-2] for sid in sorted(ks) if sid not in own]
             curves = "decode: %d/%d camera curves%s" % (len(own), len(ks), ("   pure 0.5: %s" % " ".join(fb)) if fb else "")
-            txt = "constant exposure %.0f us-x   k: %s" % (self._const_info["e_ref"],
+            txt = "constant exposure %.0f us-x%s   k: %s" % (self._const_info["e_ref"],
+                   "   flat (linear)" if self._const_info.get("flat") else "",
                    " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
             # above the renderer's own caption (time, cameras, coverage) at h - 8
             from podcontrol.skymap import _text

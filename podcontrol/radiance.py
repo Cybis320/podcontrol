@@ -61,15 +61,54 @@ def rolloff(lin, knee=KNEE):
     return np.where(lin <= knee, lin, knee + (1.0 - knee) * (1.0 - np.exp(-over / (1.0 - knee))))
 
 
-def scale(img, k, knee=KNEE, sid=None):
+_FLAT = {}          # (h, w, coeff) -> per-pixel 1/V(r); static, so built once
+
+
+def flat_field(shape, coeff=None):
+    """Per-pixel lens correction 1/V(r) for a full frame, in LINEAR light.
+
+    Uses vignette.LINEAR_COEFF, not DEFAULT_COEFF: this path works in light, and
+    the two coefficients differ by a factor of two in log terms because the
+    display one was fitted on gamma-encoded codes. Radius is measured from the
+    frame centre, which is how the coefficient was fitted."""
+    from podcontrol import vignette
+    c = vignette.LINEAR_COEFF if coeff is None else coeff
+    if not c:
+        return None
+    h, w = shape[:2]
+    key = (int(h), int(w), round(float(c), 8))
+    g = _FLAT.get(key)
+    if g is None:
+        yy, xx = np.mgrid[0:h, 0:w]
+        g = vignette.gain(np.hypot(xx - w / 2.0, yy - h / 2.0), c)
+        if len(_FLAT) > 4:
+            _FLAT.clear()
+        _FLAT[key] = g
+    return g
+
+
+def scale(img, k, knee=KNEE, sid=None, flat=None):
     """img (uint8 camera codes) scaled by k in linear light, highlights rolled off, back to
     uint8. With sid, through that camera's real curve (podcontrol.decode: linear below the
-    gamma table's first node, not code^2); without, the pure 0.5 curve."""
+    gamma table's first node, not code^2); without, the pure 0.5 curve.
+
+    `flat` is an optional per-pixel gain applied in linear light alongside k, for
+    the lens falloff. It belongs HERE rather than at composite time because the
+    rolloff below is non-linear: correcting the corners after their highlights
+    have been compressed would boost an already-compressed value, where doing it
+    first lets the rolloff see the light that actually arrived."""
+    def _apply(lin):
+        # in place: each of these is a ~25 MB float32 array per camera, and six
+        # cameras a cycle made the allocations, not the arithmetic, the cost
+        lin *= k
+        if flat is not None:
+            lin *= (flat[:, :, None] if lin.ndim == 3 else flat)
+        return rolloff(lin, knee)
     if sid is not None:
         from podcontrol import decode
-        return decode.to_code(rolloff(decode.to_linear(img, sid) * k, knee), sid)
-    lin = (img.astype(np.float32) / 255.0) ** 2 * k
-    return (255.0 * np.sqrt(np.clip(rolloff(lin, knee), 0.0, 1.0)) + 0.5).astype(np.uint8)
+        return decode.to_code(_apply(decode.to_linear(img, sid)), sid)
+    return (255.0 * np.sqrt(np.clip(_apply((img.astype(np.float32) / 255.0) ** 2), 0.0, 1.0))
+            + 0.5).astype(np.uint8)
 
 
 def frame_exposure(path):
@@ -88,9 +127,13 @@ def frame_exposure(path):
         return None
 
 
-def constant_exposure(paths, records, e_ref=None):
+def constant_exposure(paths, records, e_ref=None, flat=False):
     """({sid: scaled image}, {sid: cache path tagged with k}, info) for the sky compositor.
-    Cameras whose exposure cannot be found are left out of the scaling (drawn as they are)."""
+    Cameras whose exposure cannot be found are left out of the scaling (drawn as they are).
+
+    flat=True also divides out the lens falloff, in linear light, before the
+    highlight rolloff. The caller must then tell the compositor NOT to apply its
+    own display-space correction, or the frames are flattened twice."""
     es, src = {}, {}
     for sid, p in paths.items():
         e = frame_exposure(p)                  # exact, from the frame itself
@@ -110,7 +153,11 @@ def constant_exposure(paths, records, e_ref=None):
         if img is None:
             continue
         k = ref / es[sid] if sid in es else 1.0
-        imgs[sid] = scale(img, k, sid=sid)         # through that camera's own curve
-        tagged[sid] = "%s#k=%.4f" % (p, k)
+        ff = flat_field(img.shape) if flat else None
+        imgs[sid] = scale(img, k, sid=sid, flat=ff)   # through that camera's own curve
+        # the tag keys the compositor's frame cache: the flat changes the pixels,
+        # so it has to change the tag too or a toggle would show a stale image
+        tagged[sid] = "%s#k=%.4f%s" % (p, k, "#flat" if ff is not None else "")
         ks[sid] = k
-    return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src}
+    return imgs, tagged, {"e_ref": ref, "k": ks, "exposure": es, "source": src,
+                          "flat": bool(flat)}

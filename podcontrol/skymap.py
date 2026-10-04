@@ -601,10 +601,17 @@ class SkyRenderer:
             self._static_small.pop(sid, None)
             self._ov_small.pop(sid, None)
 
-    def _weights(self, ids):
+    def _weights(self, ids, vig_coeff=None):
         """Normalised blend weight per camera for this set of cameras (static;
-        cached), the covered mask and the covered fraction of the sky."""
-        key = (ids, self.vig_coeff)
+        cached), the covered mask and the covered fraction of the sky.
+
+        vig_coeff overrides the renderer's flat field for this call; 0 disables
+        it. The constant-exposure view needs that, because it flattens in linear
+        light before its highlight rolloff and must not be flattened again here.
+        The cache is keyed on the effective coefficient, so alternating between
+        the two costs a dict lookup rather than a rebuild."""
+        vig = self.vig_coeff if vig_coeff is None else vignette.clamp(vig_coeff)
+        key = (ids, vig)
         hit = self._wcache.get(key)
         if hit is not None:
             return hit
@@ -626,8 +633,8 @@ class SkyRenderer:
             # blend is sum(value_i * w_i) with sum(w_i) = 1, so folding 1/V(r)
             # in here makes each term the CORRECTED value and leaves the blend a
             # weighted mean. Static, so compose() is untouched and pays nothing.
-            if self.vig_coeff and lut.r_px is not None:
-                a = a * vignette.gain(lut.r_px, self.vig_coeff)
+            if vig and lut.r_px is not None:
+                a = a * vignette.gain(lut.r_px, vig)
             wn[sid] = a[:, :, None]
         inside = self.grid.inside
         frac = float(cov[inside].mean()) if inside.any() else 0.0
@@ -636,14 +643,15 @@ class SkyRenderer:
         self._wcache[key] = (wn, cov, frac)
         return self._wcache[key]
 
-    def compose(self, imgs, paths=None, show_grid=True, outlines=True):
+    def compose(self, imgs, paths=None, show_grid=True, outlines=True, vig_coeff=None):
         """(bgr, used_ids): the blended map for these frames ({id: bgr or
         None} + {id: path}) with the static decorations; cached on the
         frames' file paths so an unchanged set costs nothing."""
         paths = paths or {}
         ids = [st.id for st in self.pod if self.luts.get(st.id) is not None
                and (imgs.get(st.id) is not None or paths.get(st.id))]
-        key = ((tuple((sid, paths.get(sid)) for sid in ids), show_grid, outlines)
+        key = ((tuple((sid, paths.get(sid)) for sid in ids), show_grid, outlines,
+                self.vig_coeff if vig_coeff is None else vig_coeff)
                if ids and all(paths.get(sid) for sid in ids) else None)
         if key is not None and key == self._base_key:
             return self._base, self._used
@@ -659,7 +667,7 @@ class SkyRenderer:
                 acc = np.zeros((h, w, 3), np.float32)
             used.append(sid)
         if used:
-            wn, cov, _ = self._weights(frozenset(used))
+            wn, cov, _ = self._weights(frozenset(used), vig_coeff)
             for sid in used:
                 lut = self.luts[sid]
                 small = small_frame(imgs.get(sid), paths.get(sid), lut.small)
@@ -811,7 +819,7 @@ class SkyRenderer:
                   (6, self.grid.h - 8), 0.45)
 
     def render(self, imgs=None, paths=None, t=None, spread=0.0, telem=None, drive=None, layers=None,
-               show_grid=True, outlines=True, **kw):
+               show_grid=True, outlines=True, vig_coeff=None, **kw):
         """Full render: (bgr, info). imgs/paths default to the newest complete
         set; layers (see tinted) are optional. `outlines` draws the camera
         footprints and pairs with `labels` (passed through to decorate): both
@@ -820,9 +828,9 @@ class SkyRenderer:
             if imgs is None:
                 imgs, paths, t, spread = pod_frames(self.pod, decode=False)
             self.ensure()
-            base, used = self.compose(imgs, paths, show_grid, outlines)
+            base, used = self.compose(imgs, paths, show_grid, outlines, vig_coeff)
             out = (self.tinted(base, layers) if layers else base).copy()
-            covered = self._weights(frozenset(used))[2] if used else 0.0
+            covered = self._weights(frozenset(used), vig_coeff)[2] if used else 0.0
             self.decorate(out, t, used, telem, drive, spread, covered, **kw)
             return out, {"t": t, "used": used, "spread": spread, "covered": covered}
 

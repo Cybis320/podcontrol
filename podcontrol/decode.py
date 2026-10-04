@@ -67,7 +67,26 @@ def to_linear(img, sid):
     return (table(sid)[img] / 4095.0).astype(np.float32)
 
 
+_inv_cache = {}
+
+
+def inverse(sid):
+    """4096-entry linear-12-bit -> 8-bit code table, the inverse of this camera's
+    curve. Built once: np.interp over a whole frame was the single slowest step
+    in the constant-exposure view at ~1.5 s per camera, because it searches the
+    knots for every one of 6.2M samples. Inverting onto a 4096-entry grid costs
+    that search 4096 times instead, and the frame then becomes an array index."""
+    with _lock:
+        inv = _inv_cache.get(sid)
+    if inv is None:
+        t = table(sid)
+        inv = (np.interp(np.arange(4096.0), t, np.arange(256)) + 0.5).astype(np.uint8)
+        with _lock:
+            _inv_cache[sid] = inv
+    return inv
+
+
 def to_code(lin, sid):
     """linear light 0..1 -> 8-bit codes through the inverse of the camera's curve."""
-    t = table(sid)
-    return (np.interp(np.clip(lin, 0.0, 1.0) * 4095.0, t, np.arange(256)) + 0.5).astype(np.uint8)
+    idx = np.clip(lin, 0.0, 1.0) * 4095.0
+    return inverse(sid)[idx.astype(np.int32)]
