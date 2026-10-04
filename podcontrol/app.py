@@ -37,6 +37,7 @@ from podcontrol.history import HistoryLog, make_record, draw_history
 from podcontrol import settings as SETTINGS
 from podcontrol import version as VERSION
 from podcontrol import vignette as VIGNETTE
+from podcontrol import netbw as NETBW
 from podcontrol.colour import cct_from_gains, gains_from_cct
 from podcontrol import skymap
 
@@ -266,7 +267,7 @@ class Tile(tk.Frame):
 
     # --- rendering -----------------------------------------------------------
     def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None, sig=None,
-               ae=None):
+               ae=None, mbps=None):
         """drive: None, or (is_driver, why, need_stops) for the shared AE.
         ae: this camera's own controller state (individual AE) or the pod's
         (shared), for the WB rung scale -- which the poll cannot report, since
@@ -275,7 +276,7 @@ class Tile(tk.Frame):
         sig: a hashable signature of the image content + overlay settings; when
         it matches the last render (and the canvas size did not change) the
         image is left alone and only the text is refreshed."""
-        self._last = (img, source, tel, luma, layers, overlay, drive, None, ae)
+        self._last = (img, source, tel, luma, layers, overlay, drive, None, ae, mbps)
         is_driver, why, need = drive if drive else (False, None, None)
         same = (sig is not None and sig == getattr(self, "_sig", None)
                 and img is not None and self._img_id is not None
@@ -398,11 +399,14 @@ class Tile(tk.Frame):
             gains += " D%.2f" % tel["dgain_x"]
         if tel.get("ispdgain_x"):
             gains += " I%.2f" % tel["ispdgain_x"]
+        # what RMS is actually pulling from THIS camera. A camera that has
+        # stopped streaming reads 0, which is the point.
+        net = ("  %.0f Mb/s" % mbps) if mbps is not None else ""
         self.tele.config(fg=bcol, text="%s  lum %s%s%s  exp %sus\n%s  ISO %s  %s\n%s\n%s" % (
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
             (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
             tel.get("exp_us"), gains, tel.get("iso"),
-            ("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or ""),
+            (("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or "")) + net,
             line3.rstrip(), line4))
 
 
@@ -580,6 +584,11 @@ class App(tk.Tk):
         self.sky_canvas.bind("<Configure>", self._on_sky_resize)
         self._sky_proj_live = self.sky_proj.get()      # the projection sky_r was built for
         self._sky_proj_busy = False
+        # stream bandwidth from the kernel's TCP counters: ~14 ms a cycle, no
+        # camera contact. Catches a renegotiated link, which is otherwise
+        # invisible and cost four hours of blind AE on 2026-10-03.
+        self.bw = NETBW.Meter(self.stations)
+        self.bw_rates, self.bw_total = {}, None
         self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE, radial=self._sky_proj_live),
                                         vig_coeff=(VIGNETTE.clamp(self.vig_coeff.get())
                                                    if self.vig_on.get() else 0.0))
@@ -1014,6 +1023,10 @@ class App(tk.Tk):
                                                 sun, self.ae_on, self.ae._max_li(), self.ae_slot))
             except Exception:
                 pass
+            try:
+                self.bw_rates, self.bw_total = self.bw.rates()
+            except Exception:
+                pass                              # bandwidth is never worth a cycle
             self._last_poll = poll
             sky = None
             if self.view == "sky":
@@ -1097,10 +1110,26 @@ class App(tk.Tk):
                     note = "  [%s]" % self._colour_note
                 elif self.colour_hold.get() and self._colour_quiet():
                     note = "  [colour: RMS owns it until dawn]"
-                self.status.config(text="%d/%d daemon  bright %s%s  (%.1fs)  %s%s" % (
+                # total stream bandwidth against the link. The link speed is the
+                # number that matters: 337 Mb/s is a third of a gigabit link and
+                # three times a 100 Mb/s one, and the pod cannot tell you which
+                # it is on from anything else it measures.
+                net = ""
+                if self.bw_total is not None:
+                    sp = self.bw.speed
+                    net = "  net %.0f" % self.bw_total
+                    if sp:
+                        net += "/%d Mb/s (%.0f%%)" % (sp, 100.0 * self.bw_total / sp)
+                        if self.bw_total > 0.85 * sp:
+                            note += "  [LINK SATURATED: %.0f of %d Mb/s]" % (self.bw_total, sp)
+                        elif self.bw_total > 0.70 * sp:
+                            note += "  [link %.0f%% used]" % (100.0 * self.bw_total / sp)
+                    else:
+                        net += " Mb/s"
+                self.status.config(text="%d/%d daemon  bright %s%s%s  (%.1fs)  %s%s" % (
                     daemons, len(self.stations),
                     ("%d–%d" % (int(min(brights)), int(max(brights)))) if brights else "—",
-                    ae, dt, time.strftime("%H:%M:%S"), note))
+                    net, ae, dt, time.strftime("%H:%M:%S"), note))
         except queue.Empty:
             pass
         # live chart: redraw once per completed cycle (the queue drained)
@@ -1125,8 +1154,10 @@ class App(tk.Tk):
             per = (info or {}).get("per_cam") or {}
             ae_i = per.get(sid) if per else info
             ws = (ae_i or {}).get("wb_scale")
+            mbps = self.bw_rates.get(sid)
             t.render(img, src, poll.get(sid), lumas.get(sid),
-                     layers.get(sid), ov[0], drive, sig=(path, ov, drive, ws), ae=ae_i)
+                     layers.get(sid), ov[0], drive, sig=(path, ov, drive, ws), ae=ae_i,
+                     mbps=mbps)
 
     # ---- sky view ------------------------------------------------------------
     def _render_sky(self, poll, cyc_frames=None, cyc_layers=None):
