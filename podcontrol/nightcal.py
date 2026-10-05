@@ -117,7 +117,9 @@ BLACK_SIGMA = 2.5                                          # sky this many sigma
 STEP_RETRIES = 2                                           # re-measure a step whose sky moved, this many times
 DRIFT_MAX = 0.05                                           # sky flux change over the sweep (response-based)
 DIP = 0.10                                                 # nef this far below the steps above = artifact
-SETTLE_S = 2.0                                             # s after each gain change (see _measure)
+SETTLE_S = 2.0                                             # s after each setting change (see _measure)
+BLACK_SETTLE_MIN_S = 12.0                                  # after a GAIN change: watch the black this long ...
+BLACK_SETTLE_MAX_S = 20.0                                  # ... and at most this long (_black_settle)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
 LOG = os.path.expanduser("~/.config/podcontrol/nightcal.jsonl")
 # Every run, dry or applied, writes every raw camera read here (one JSON line each), so an odd
@@ -171,10 +173,15 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
     t_set = time.time()
     reply = send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
     _trace(dict(tag, ev="set", t=t_set, dt_set=round(time.time() - t_set, 3), reply=(reply or "")[:120]))
+    gain_changed = _last_gain.get(ip) != (again, ispd)
+    _last_gain[ip] = (again, ispd)
     # The picture reads ~5% low for ~1.2 s after a gain change (Goke .206, ae_stats sampled
     # every 0.4 s, 2026-10-03); a 1 s settle sometimes measured inside that window, which the
-    # drift check then blamed on the sky. 2 s clears it.
+    # drift check then blamed on the sky. 2 s clears it -- except the black level after a GAIN
+    # change, which is waited for explicitly (_black_settle).
     time.sleep(settle_s)
+    if gain_changed:
+        _black_settle(ip, tag)
     # The step must be measured at the gain that was set. 2026-10-05 (.205) a sweep's 11.31x
     # row carried the 16x row's background and noise to 1% -- the measured frames were not at
     # 11.31x -- and was chosen. noise_stats reports the gains in effect over its frames:
@@ -209,6 +216,37 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
     r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r["mean_lin"]))
     r["eligible"], r["why"] = eligible(r)
     return r
+
+
+_last_gain = {}                 # ip -> (again, ispd) last set by this module (a gain change -> _black_settle)
+
+
+def _black_settle(ip, tag, min_s=BLACK_SETTLE_MIN_S, max_s=BLACK_SETTLE_MAX_S, frames=5):
+    """After an analog-gain change, watch the picture's level until the black has re-settled.
+    On some IMX307s the black level JUMPS by ~2 DN some 5-10 s after a gain change (2026-10-05
+    trace 075630: F1's first step read -2.0 units at +2 s and still at +5.7 s, settled by +9.4 s;
+    D1 11.3x jumped during its +5.7 s read, A1 during its +9.4 s read; the noise is unchanged,
+    so it is an offset; E1 and B1 settle within 2 s). A read before the jump is offset by ~2
+    units: that tripped 'sky moved during the step' and made F1's 21% 'drift'. Two quick reads
+    agreeing is not enough (they agree before the jump), so the level is watched for at least
+    min_s, then until the last two quick reads agree within 0.25 units (or 0.4%). Every quick
+    read is traced (ev "settle"), so a run shows when each camera's black moved. Exposure
+    changes do not do this. Returns the seconds waited."""
+    t0 = time.time(); prev = None
+    while True:
+        raw = send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20)
+        r = parse_noise(raw)
+        m = r["mean_lin"] if r else None
+        el = time.time() - t0
+        _trace(dict(tag, ev="settle", since_gain=round(el, 3), mean=m))
+        if (el >= min_s and m is not None and prev is not None
+                and abs(m - prev) <= max(0.25, 0.004 * prev)):
+            return el
+        if el > max_s:
+            _trace(dict(tag, ev="settle_timeout", waited=round(el, 3)))
+            return el
+        prev = m
+        time.sleep(max(0.0, (t0 + el + 1.0) - time.time()))      # ~1 read/s: light on the camera
 
 
 def _gain_applied(r, again, ispd, exp_us=None, tol=0.03):
@@ -408,6 +446,7 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
     Each analog step is measured by _measure_step at the production ISP gain `ispd`
     (default: the camera's own floor, which differs by pedestal: 1088 / 1087 / 1077)."""
     ip = station.ip
+    _last_gain.pop(ip, None)                   # the camera's gain is whatever RMS left: a change
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
     plat = platform_of(ip)
     ispd = ispd or isp_floor(ip) or ISPD_FULL_SCALE
