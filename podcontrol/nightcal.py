@@ -68,12 +68,21 @@ Three things corrupt a step's noise figure, and such steps are not eligible:
     then 20-40% "better" at the one or two lowest steps, each passing the old
     measured-sigma guard at 3.0-3.3 sigma.
 A step is also not eligible when its gain or exposure was not applied, or when
-its two night-exposure reads differ by more than STEP_DRIFT (the sky moved
-during the step). The bracketed measurement repeats within ~0.6%, so steps are
-compared with the BEST eligible noise-equivalent flux; the chosen gain is the
-lowest eligible step within `tol` of it. One value goes to the whole pod: the
-HIGHEST of the per-camera choices, i.e. the darkest sky's need, so no camera
-loses sensitivity.
+its two night-exposure reads differ by more than STEP_DRIFT; such a step is
+measured again (STEP_RETRIES) rather than lost -- a lost best step pushes that
+camera's choice up a whole step (D1, 2026-10-05: 16x lost -> 22.39x for the
+pod). The bracketed measurement repeats within ~0.6%, so steps are compared with
+the BEST eligible noise-equivalent flux.
+
+THE POD'S GAIN comes from all cameras at once (pod_decision). Converted to
+electrons at the sensor, the noise a gain adds beyond the best step is a
+property of the CAMERA, not of the sky: x = sqrt(S*((nef/best)^2 - 1)) came out
+the same on S = 18.5 and S = 10.5 e- skies (2026-10-05: 11.3x 1.4-1.7 e-, 8x
+2.0-2.2, 5.66x 2.3-2.6, 4x 3.2-3.3 on all six Goke cameras). So x per gain is the
+MEDIAN over the pod's cameras of one platform, and the darkest sky -- the fewest
+electrons, the most to lose -- sets the allowance: within tol of sky-limited
+needs x^2 <= S*((1+tol)^2 - 1), ~0.65 e- at S = 10.5. One disturbed step on one
+camera cannot move the pod. Each camera's own choice is still shown.
 
 ISP digital gain is not swept. It comes after the ADC, so it adds no signal; it
 only has to restore full scale after the black-level subtraction:
@@ -81,8 +90,12 @@ only has to restore full scale after the black-level subtraction:
 reaches code 255 (measured on the Moon, 2026-09-25).
 
 Guards: the sun must be well below the horizon; each camera's sweep ends by
-re-measuring its first step, and a sky that moved (clouds, the Moon rising)
-invalidates that camera's run; the Moon's altitude and phase are recorded,
+re-measuring its first step, and a sky whose FLUX moved by more than DRIFT_MAX
+(clouds, the Moon rising) invalidates that camera's run. Flux, not level: the
+comparison is on the response (the exposure bracket's difference), because on
+the Goke the black level moves ~1 DN at every gain change and the same setting
+revisited reads up to +-1 linear unit off (LEDGER goke_black_wander) -- that,
+not the sky, was the 6% 'drift' of 2026-10-05 07:18; the Moon's altitude and phase are recorded,
 because a moonlit sky favours a lower gain than a dark one. Sweep steps are
 LIVE only (never saved); every camera is handed back its saved state
 (`ae_restore`) when the sweep ends. Nothing persists until apply().
@@ -101,6 +114,8 @@ STEPS = [22924, 16384, 11585, 8192, 5793, 4096]            # x1024, 3 dB apart; 
 EXP_STEP = 0.7                                             # response = mean's change from this x exposure
 STEP_DRIFT = 0.03                                          # a step's two night-exposure reads must agree
 BLACK_SIGMA = 2.5                                          # sky this many sigma above black (clip guard)
+STEP_RETRIES = 2                                           # re-measure a step whose sky moved, this many times
+DRIFT_MAX = 0.05                                           # sky flux change over the sweep (response-based)
 DIP = 0.10                                                 # nef this far below the steps above = artifact
 SETTLE_S = 2.0                                             # s after each gain change (see _measure)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
@@ -370,7 +385,15 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
     out["platform"] = plat
     try:
         for a in steps:
-            r = _measure_step(ip, a, ispd, exp_us, frames, settle_s, plat)
+            # a step whose two night-exposure reads disagree caught the sky moving (a cloud edge,
+            # a plane): measure it again rather than lose it -- a lost best step pushes the choice
+            # up a whole step (D1, 2026-10-05: 16x lost to a 5.4% jump -> 22.39x for the pod)
+            for attempt in range(1 + STEP_RETRIES):
+                r = _measure_step(ip, a, ispd, exp_us, frames, settle_s, plat)
+                if r is None or r.get("step_drift") is None or r["step_drift"] <= STEP_DRIFT:
+                    break
+            if r is not None:
+                r["attempts"], r["t"] = attempt + 1, time.time()
             if r is None:
                 probe = send(ip, "noise_stats 2", timeout=10) or "no answer"
                 out["reason"] = ("camera has no noise_stats (needs the 2026-09-25 image)"
@@ -380,14 +403,70 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
             if on_row:
                 on_row(station, r)
         # stability: the sky must not have moved during the sweep
-        rep = _measure(ip, steps[0], ispd, exp_us, frames, settle_s, plat, prod_ispd=ispd)
+        # Did the SKY change during the sweep? Compared on the RESPONSE (the mean's change across
+        # the exposure bracket), which is proportional to the sky flux and free of the black
+        # level. The level itself is not a sky measure on the Goke: the IMX307's black moves
+        # ~1 DN at every gain change, so the same setting revisited a minute later reads up to
+        # +-1 linear unit off -- 6% of the darkest skies (2026-10-05, LEDGER goke_black_wander).
+        rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat)
         if rep is not None:
-            s0 = out["rows"][0]["sky"]
-            out["drift"] = abs(rep["sky"] - s0) / s0 if s0 else None
+            r0 = out["rows"][0]
+            out["drift"] = (abs(rep["resp"] - r0["resp"]) / r0["resp"]) if r0.get("resp") else None
         out["ok"] = True
     finally:
         send(ip, "ae_restore", timeout=10)     # back to the saved (RMS) state
     return out
+
+
+def sky_electrons(rows):
+    """Sky electrons per pixel per frame: the photon-transfer value of the two highest eligible
+    gains, where the camera behaves as an ideal photon counter (they agree within ~3%). Both
+    inputs are differences across the exposure bracket, so the black level drops out."""
+    v = [r["sky_e"] for r in sorted(rows, key=lambda r: -r["again_set"])
+         if r.get("eligible", True) and r.get("sky_e") and r["sky_e"] > 0][:2]
+    return sum(v) / len(v) if v else None
+
+
+def excess_electrons(rows, sky_e):
+    """Per step: the camera's noise beyond the best step's, in electrons at the sensor. The
+    measured noise-equivalent flux is sqrt(S + x^2)/S against sqrt(S)/S at the best step, so
+    x = sqrt(S * ((nef/best)^2 - 1)). It is a property of the camera at that gain, not of the
+    sky: 2026-10-05 it came out the same on S = 18.5 and S = 10.5 e- skies (11.3x 1.6-1.7 e-,
+    8x 2.0-2.1, 5.66x 2.6, 4x 3.2-3.4)."""
+    b = best_nef(rows)
+    for r in rows:
+        r["excess_e"] = (math.sqrt(max(0.0, sky_e * ((r["nef"] / b) ** 2 - 1.0)))
+                         if (b and sky_e and r.get("eligible", True)) else None)
+
+
+def pod_decision(cameras, tol):
+    """One analog gain for the pod, from all cameras at once: the camera's excess noise per
+    gain is the MEDIAN over the pod's cameras of the same platform (the same sensor), and the
+    darkest sky -- the fewest electrons, the most to lose -- sets the allowance: within tol of
+    sky-limited needs x^2 <= S * ((1 + tol)^2 - 1). A single disturbed step on one camera then
+    cannot move the pod. Returns (again, detail) or (None, reason)."""
+    out, detail = [], {}
+    by_plat = {}
+    for sid, c in cameras.items():
+        if c.get("ok") and c.get("sky_e"):
+            by_plat.setdefault(c.get("platform") or "?", []).append((sid, c))
+    for plat, cams in by_plat.items():
+        dark_sid, dark = min(cams, key=lambda sc: sc[1]["sky_e"])
+        allow = math.sqrt(dark["sky_e"] * ((1.0 + tol) ** 2 - 1.0))
+        pooled = {}
+        for g in sorted({r["again_set"] for _, c in cams for r in c["rows"]}):
+            v = sorted(r["excess_e"] for _, c in cams for r in c["rows"]
+                       if r["again_set"] == g and r.get("excess_e") is not None)
+            if v:
+                pooled[g] = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
+        ok = [g for g, x in pooled.items() if x <= allow]
+        if not ok:
+            continue
+        g = min(ok)
+        out.append(g)
+        detail[plat] = {"again": g, "allow_e": allow, "dark_sky_e": dark["sky_e"], "dark": dark_sid,
+                        "n": len(cams), "pooled_excess_e": pooled}
+    return (max(out), detail) if out else (None, detail)
 
 
 def best_nef(rows):
@@ -405,7 +484,7 @@ def choose(rows, tol):
     return min(ok, key=lambda r: r["again_set"])["again_set"]
 
 
-def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=None):
+def calibrate_pod(pod, tol=0.02, frames=25, drift_max=DRIFT_MAX, force=False, on_row=None):
     """Measure every camera in parallel and propose one pod-wide night gain."""
     st0 = pod.stations[0]
     res = {"t": time.time(), "tol": tol, "frames": frames, "ispdgain": ISPD_FULL_SCALE,
@@ -439,6 +518,8 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
                     c["reason"] = ("sky changed %.0f%% during the sweep -- rerun" % (100 * c["drift"])
                                    if c["drift"] is not None else "stability re-measure failed")
                 else:
+                    c["sky_e"] = sky_electrons(c["rows"])
+                    excess_electrons(c["rows"], c["sky_e"])
                     c["chosen"] = choose(c["rows"], tol)
                     if c["chosen"] is None:
                         c["ok"] = False
@@ -451,7 +532,10 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
                         c["isp"] = c["isp_t"] if AVOID_TOE else c["isp_q"]
             res["cameras"][sid] = c
     good = [c["chosen"] for c in res["cameras"].values() if c.get("ok")]
-    res["pod_again"] = max(good) if good else None     # the darkest sky's need
+    res["per_camera_max"] = max(good) if good else None
+    res["pod_again"], res["pooled"] = pod_decision(res["cameras"], tol)
+    if res["pod_again"] is None:
+        res["pod_again"] = res["per_camera_max"]      # no sky electrons: the darkest camera's own choice
     # ISP gain: the pod's highest need too (the darkest sky); "restore" when every camera is
     # served by its own floor, so the settings file keeps the per-camera floor
     recs = [c for c in res["cameras"].values() if c.get("ok") and c.get("isp")]
@@ -480,17 +564,25 @@ def format_table(res):
         dec = ("decode table" if decs == {"table"} else
                "decode code^2 (old image)" if decs == {None} else
                "decode " + "/".join(sorted(str(d or "code^2") for d in decs)))
-        se = top.get("sky_e")
+        se = c.get("sky_e") or top.get("sky_e")
         L.append("  %-8s  %s  sky %s  drift %s  %s" % (
             sid, ("-> %.2fx" % (c["chosen"] / 1024.0)) if c.get("ok") else "INVALID: " + c.get("reason", ""),
             ("%.1f e-/px/frame" % se) if se else "?",
             ("%.1f%%" % (100 * c["drift"])) if c.get("drift") is not None else "?", dec))
         for r in sorted(c["rows"], key=lambda r: -r["again_set"]):
-            L.append("      again %6.2fx  bg %7.1f  noise %6.2f (%4.2f code)  response %7.2f  nef %.4f %+6.1f%%  headroom %6.1fx  clip %.3f%%%s" % (
+            x = r.get("excess_e")
+            L.append("      again %6.2fx  bg %7.1f  noise %6.2f (%4.2f code)  response %7.2f  nef %.4f %+6.1f%%  excess %s  headroom %6.1fx  clip %.3f%%%s%s" % (
                 r["again_set"] / 1024.0, r["mean_lin"], r["std_lin"], r.get("std_code", float("nan")),
                 r.get("resp", float("nan")), r["nef"], 100 * (r["nef"] / ref_nef - 1),
+                ("%4.2f e-" % x) if x is not None else "   --  ",
                 4095.0 / max(r["mean_lin"], 1e-6), r.get("clip_pct", 0),
+                ("  (%d tries)" % r["attempts"]) if r.get("attempts", 1) > 1 else "",
                 ("  " + r["why"]) if r.get("why") else ("  <- chosen" if r["again_set"] == pick else "")))
+    for plat, d in sorted((res.get("pooled") or {}).items()):
+        L.append("  pod (%s, %d cameras): camera excess noise per gain (median) %s" % (
+            plat, d["n"], "  ".join("%.2fx %.2f" % (g / 1024.0, x) for g, x in sorted(d["pooled_excess_e"].items(), reverse=True))))
+        L.append("  darkest sky %s: %.1f e-/px/frame -> within %.0f%% of sky-limited needs excess <= %.2f e- -> %.2fx" % (
+            d["dark"], d["dark_sky_e"], 100 * res["tol"], d["allow_e"], d["again"] / 1024.0))
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
     # ISP gain: what each camera needs for quantization alone, and with the sky kept out of the
