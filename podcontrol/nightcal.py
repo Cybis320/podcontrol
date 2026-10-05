@@ -5,12 +5,17 @@ analog gain the sky's own shot noise, not the sensor's read noise, sets the
 noise floor; any gain beyond that point adds no sensitivity and only spends
 highlight headroom (bright meteors clip sooner). This finds that point.
 
-For each camera it sweeps the analog gain down from the top at fixed exposure,
-holding the TOTAL gain constant with the ISP digital gain (compensating_ispd,
-2026-10-03): every step then lands at the same output level, so the 8-bit
-output's quantization -- which made the CV300's low-noise steps read low and
-"improve" with less gain -- affects every step alike and drops out. At every
-step it asks the camera for `noise_stats` -- venc
+For each camera it sweeps the analog gain down from the top at fixed exposure
+and at the PRODUCTION ISP gain (the camera's floor), i.e. exactly the frames RMS
+would get at each gain. (2026-10-03..05 the sweep instead held the TOTAL gain
+constant with a compensating ISP gain; that lifts every step above a fixed
+output-domain loss of ~1 code -- offset and noise -- that real low-gain frames
+sit on, and it proposed 5.66x on a sky that needs 16x. Measured on .205,
+2026-10-05, same sky: 5.66x analog at ISP 1.06 = nef +14%, sky reads 15% low;
+the same 5.66x at ISP 4.2 = +2%; 16x at ISP 1.06 = -1.7%. MEASURE_AT_PRODUCTION.)
+The 8-bit quantization that motivated the compensation is handled by the
+eligibility guard below (a step under ~1.5 codes of noise is not trusted).
+At every step it asks the camera for `noise_stats` -- venc
 measures the sky background and its frame-to-frame noise itself, on the
 uncompressed picture, so no second RTSP stream is opened while RMS captures.
 The figure of merit is the noise-equivalent flux (noise divided by total gain):
@@ -80,6 +85,8 @@ BLACK_LEVEL = 240                                          # 12-bit pedestal, bo
 ISPD_FULL_SCALE = int(round(4095 * 1024 / (4095 - BLACK_LEVEL)))   # 1088 = 1.0625x
 STEPS = [22924, 16384, 11585, 8192, 5793, 4096]            # x1024, 3 dB apart; 22924 = IMX307 max
 ISPD_MAX = 16384                                           # 16x: the compensating ISP gain's ceiling
+MEASURE_AT_PRODUCTION = True       # sweep at the production ISP gain (see the module doc); False = old
+                                   # constant-total-gain sweep, kept only to reproduce that comparison
 DIP = 0.10                                                 # nef this far below the steps above = artifact
 SETTLE_S = 2.0                                             # s after each gain change (see _measure)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
@@ -119,9 +126,19 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
     # every 0.4 s, 2026-10-03); a 1 s settle sometimes measured inside that window, which the
     # drift check then blamed on the sky. 2 s clears it.
     time.sleep(settle_s)
-    r = parse_noise(send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20))
-    if r is None:
-        return None
+    # The step must be measured at the gain that was set. 2026-10-05 (.205) a sweep's 11.31x
+    # row carried the 16x row's background and noise to 1% -- the measured frames were not at
+    # 11.31x -- and was chosen. noise_stats reports the gains in effect over its frames:
+    # re-measure until they match the request, else the step is not trusted.
+    for attempt in range(3):
+        r = parse_noise(send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20))
+        if r is None:
+            return None
+        if _gain_applied(r, again, ispd):
+            break
+        send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
+        time.sleep(settle_s)
+    r["gain_ok"] = _gain_applied(r, again, ispd)
     g = (r.get("again") or again) / 1024.0 * (r.get("ispdgain") or ispd) / 1024.0
     r["again_set"] = again
     r["ispd_set"] = ispd
@@ -137,6 +154,14 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
     r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r["mean_lin"]))
     r["eligible"], r["why"] = eligible(r)
     return r
+
+
+def _gain_applied(r, again, ispd, tol=0.03):
+    """Do the gains noise_stats measured at match the request? (the sensor rounds the analog
+    gain to its own steps: 16384 -> 16229 on the IMX307, hence the tolerance)"""
+    ra, ri = r.get("again"), r.get("ispdgain")
+    return ((ra is None or abs(ra - again) <= tol * again) and
+            (ri is None or abs(ri - ispd) <= tol * ispd))
 
 
 def prod_code_width(lin, platform):
@@ -239,6 +264,8 @@ MIN_STD_CODE = 1.5         # noise below this many output codes is under-read (s
 
 def eligible(r, min_std_code=MIN_STD_CODE, min_sigma=3.0):
     """Is this step's noise figure trustworthy? (ok, reason)"""
+    if r.get("gain_ok") is False:
+        return False, "gain not applied (measured again %s ispd %s)" % (r.get("again"), r.get("ispdgain"))
     lim = OLD_DECODE_MIN_CODE.get(r.get("platform"), 16)
     if r.get("decode") != "table" and r.get("mean_code", 99) < lim:
         return False, "old decode (code %.0f < %d: update the camera image)" % (r.get("mean_code", 0), lim)
@@ -287,9 +314,9 @@ def compensating_ispd(again, top, ispd=ISPD_FULL_SCALE):
 def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
                  settle_s=SETTLE_S, on_row=None):
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves.
-    Each analog step is measured at the CONSTANT total gain of the top step
-    (compensating_ispd); the production ISP gain is `ispd` (default: the camera's own
-    floor, which differs by pedestal: 1088 / 1087 / 1077)."""
+    Each analog step is measured at the production ISP gain `ispd` (default: the camera's
+    own floor, which differs by pedestal: 1088 / 1087 / 1077) -- the frames RMS would get.
+    MEASURE_AT_PRODUCTION = False restores the constant-total-gain sweep."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
     plat = platform_of(ip)
@@ -298,7 +325,8 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
     out["platform"] = plat
     try:
         for a in steps:
-            r = _measure(ip, a, compensating_ispd(a, steps[0], ispd), exp_us, frames, settle_s, plat, prod_ispd=ispd)
+            step_ispd = ispd if MEASURE_AT_PRODUCTION else compensating_ispd(a, steps[0], ispd)
+            r = _measure(ip, a, step_ispd, exp_us, frames, settle_s, plat, prod_ispd=ispd)
             if r is None:
                 probe = send(ip, "noise_stats 2", timeout=10) or "no answer"
                 out["reason"] = ("camera has no noise_stats (needs the 2026-09-25 image)"
@@ -308,8 +336,8 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
             if on_row:
                 on_row(station, r)
         # stability: the sky must not have moved during the sweep
-        rep = _measure(ip, steps[0], compensating_ispd(steps[0], steps[0], ispd), exp_us, frames, settle_s,
-                       plat, prod_ispd=ispd)
+        rep = _measure(ip, steps[0], ispd if MEASURE_AT_PRODUCTION else compensating_ispd(steps[0], steps[0], ispd),
+                       exp_us, frames, settle_s, plat, prod_ispd=ispd)
         if rep is not None:
             s0 = out["rows"][0]["sky"]
             out["drift"] = abs(rep["sky"] - s0) / s0 if s0 else None
