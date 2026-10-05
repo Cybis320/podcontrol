@@ -103,7 +103,7 @@ LIVE only (never saved); every camera is handed back its saved state
     python -m podcontrol.nightcal                 # measure + propose (dry run)
     python -m podcontrol.nightcal --apply         # ... then set cameras + JSON
 """
-import json, math, os, re, shutil, time
+import json, math, os, re, shutil, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 from podcontrol.podctl import send, send_live
@@ -120,6 +120,22 @@ DIP = 0.10                                                 # nef this far below 
 SETTLE_S = 2.0                                             # s after each gain change (see _measure)
 SUN_MAX_ALT = -12.0                                        # deg: nautical night or darker
 LOG = os.path.expanduser("~/.config/podcontrol/nightcal.jsonl")
+# Every run, dry or applied, writes every raw camera read here (one JSON line each), so an odd
+# row can be traced to what the camera actually measured instead of argued about.
+RUN_DIR = os.path.expanduser("~/.config/podcontrol/nightcal_runs")
+_run = {"path": None, "lock": threading.Lock(), "t0": None}
+
+
+def _trace(rec):
+    """Append one record to the current run's trace (no-op outside calibrate_pod)."""
+    if not _run["path"]:
+        return
+    rec = dict(rec, t_rel=round(time.time() - _run["t0"], 3))
+    try:
+        with _run["lock"], open(_run["path"], "a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except OSError:
+        pass
 
 
 def parse_noise(text):
@@ -149,8 +165,12 @@ def night_line(station):
     return get("a"), get("i"), get("e")
 
 
-def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd=ISPD_FULL_SCALE):
-    send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
+def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd=ISPD_FULL_SCALE,
+             tag=None):
+    tag = dict(tag or {}, ip=ip, req_again=again, req_ispd=ispd, req_exp=exp_us)
+    t_set = time.time()
+    reply = send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
+    _trace(dict(tag, ev="set", t=t_set, dt_set=round(time.time() - t_set, 3), reply=(reply or "")[:120]))
     # The picture reads ~5% low for ~1.2 s after a gain change (Goke .206, ae_stats sampled
     # every 0.4 s, 2026-10-03); a 1 s settle sometimes measured inside that window, which the
     # drift check then blamed on the sky. 2 s clears it.
@@ -160,11 +180,17 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
     # 11.31x -- and was chosen. noise_stats reports the gains in effect over its frames:
     # re-measure until they match the request, else the step is not trusted.
     for attempt in range(3):
-        r = parse_noise(send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20))
+        t_rd = time.time()
+        raw = send(ip, "noise_stats %d" % frames, timeout=frames / 5.0 + 20)
+        r = parse_noise(raw)
+        _trace(dict(tag, ev="read", read_try=attempt + 1, t=t_rd, since_set=round(t_rd - t_set, 3),
+                    dt_read=round(time.time() - t_rd, 3), raw=(raw or "").strip()[:400],
+                    gain_ok=bool(r and _gain_applied(r, again, ispd, exp_us))))
         if r is None:
             return None
         if _gain_applied(r, again, ispd, exp_us):
             break
+        t_set = time.time()
         send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
         time.sleep(settle_s)
     r["gain_ok"] = _gain_applied(r, again, ispd, exp_us)
@@ -194,17 +220,18 @@ def _gain_applied(r, again, ispd, exp_us=None, tol=0.03):
             (exp_us is None or re_ is None or abs(re_ - exp_us) <= tol * exp_us))
 
 
-def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None):
+def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None, tag=None):
     """One sweep step at the production ISP gain: the night exposure, EXP_STEP of it, the
     night exposure again. Returns the row (None if the camera has no noise_stats): the sky's
     mean and noise at the night exposure, and the MEASURED response `resp` -- the mean's
     change per unit of sky flux -- so nef = noise / response (see the module docstring)."""
     lo_us = int(round(exp_us * EXP_STEP))
-    hi1 = _measure(ip, again, ispd, exp_us, frames, settle_s, platform, prod_ispd=ispd)
+    tag = dict(tag or {}, step=again)
+    hi1 = _measure(ip, again, ispd, exp_us, frames, settle_s, platform, prod_ispd=ispd, tag=dict(tag, role="hi1"))
     if hi1 is None:
         return None
-    lo = _measure(ip, again, ispd, lo_us, frames, settle_s, platform, prod_ispd=ispd)
-    hi2 = _measure(ip, again, ispd, exp_us, frames, settle_s, platform, prod_ispd=ispd)
+    lo = _measure(ip, again, ispd, lo_us, frames, settle_s, platform, prod_ispd=ispd, tag=dict(tag, role="lo"))
+    hi2 = _measure(ip, again, ispd, exp_us, frames, settle_s, platform, prod_ispd=ispd, tag=dict(tag, role="hi2"))
     if lo is None or hi2 is None:
         return None
     r = dict(hi1)
@@ -226,6 +253,9 @@ def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None):
     r["prod_bg"], r["prod_std"] = mh, r["std_lin"]
     r["prod_std_code"] = r["prod_std"] / prod_code_width(mh, platform)
     r["eligible"], r["why"] = eligible(r)
+    _trace(dict(tag, ev="step", ip=ip, resp=r["resp"], nef=r["nef"], step_drift=r["step_drift"],
+                mean_hi1=hi1["mean_lin"], mean_lo=lo["mean_lin"], mean_hi2=hi2["mean_lin"], std=r["std_lin"],
+                sky_e=r["sky_e"], eligible=r["eligible"], why=r["why"]))
     return r
 
 
@@ -389,7 +419,8 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
             # a plane): measure it again rather than lose it -- a lost best step pushes the choice
             # up a whole step (D1, 2026-10-05: 16x lost to a 5.4% jump -> 22.39x for the pod)
             for attempt in range(1 + STEP_RETRIES):
-                r = _measure_step(ip, a, ispd, exp_us, frames, settle_s, plat)
+                r = _measure_step(ip, a, ispd, exp_us, frames, settle_s, plat,
+                                  tag={"cam": station.id, "step_try": attempt + 1})
                 if r is None or r.get("step_drift") is None or r["step_drift"] <= STEP_DRIFT:
                     break
             if r is not None:
@@ -408,7 +439,8 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
         # level. The level itself is not a sky measure on the Goke: the IMX307's black moves
         # ~1 DN at every gain change, so the same setting revisited a minute later reads up to
         # +-1 linear unit off -- 6% of the darkest skies (2026-10-05, LEDGER goke_black_wander).
-        rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat)
+        rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat,
+                            tag={"cam": station.id, "final": True})
         if rep is not None:
             r0 = out["rows"][0]
             out["drift"] = (abs(rep["resp"] - r0["resp"]) / r0["resp"]) if r0.get("resp") else None
@@ -486,6 +518,24 @@ def choose(rows, tol):
 
 def calibrate_pod(pod, tol=0.02, frames=25, drift_max=DRIFT_MAX, force=False, on_row=None):
     """Measure every camera in parallel and propose one pod-wide night gain."""
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        _run["path"] = os.path.join(RUN_DIR, time.strftime("nightcal_%Y%m%d_%H%M%S.jsonl", time.gmtime()))
+    except OSError:
+        _run["path"] = None
+    _run["t0"] = time.time()
+    try:
+        res = _calibrate_pod(pod, tol, frames, drift_max, force, on_row)
+        res["trace"] = _run["path"]
+        _trace({"ev": "result", "pod_again": res.get("pod_again"), "pooled": res.get("pooled"),
+                "cameras": {sid: {k: c.get(k) for k in ("ok", "reason", "drift", "chosen", "sky_e")}
+                            for sid, c in res["cameras"].items()}})
+        return res
+    finally:
+        _run["path"] = None
+
+
+def _calibrate_pod(pod, tol, frames, drift_max, force, on_row):
     st0 = pod.stations[0]
     res = {"t": time.time(), "tol": tol, "frames": frames, "ispdgain": ISPD_FULL_SCALE,
            "cameras": {}, "pod_again": None, "sun_alt": None, "moon": None, "exp_us": None}
@@ -503,6 +553,8 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=DRIFT_MAX, force=False, on
     if not nl or not nl[2]:
         raise RuntimeError("no RMS night `manual` line in %s" % (st0.settings_path or "(no settings file)"))
     res["exp_us"] = nl[2]
+    _trace({"ev": "start", "sun_alt": res["sun_alt"], "moon": res["moon"], "exp_us": nl[2], "tol": tol,
+            "frames": frames, "settle_s": SETTLE_S, "cameras": [(s.id, s.ip) for s in pod.stations]})
     with ThreadPoolExecutor(max_workers=len(pod.stations)) as ex:
         futs = {s.id: ex.submit(sweep_camera, s, nl[2], None, STEPS, frames, SETTLE_S, on_row)
                 for s in pod.stations}
@@ -583,6 +635,8 @@ def format_table(res):
             plat, d["n"], "  ".join("%.2fx %.2f" % (g / 1024.0, x) for g, x in sorted(d["pooled_excess_e"].items(), reverse=True))))
         L.append("  darkest sky %s: %.1f e-/px/frame -> within %.0f%% of sky-limited needs excess <= %.2f e- -> %.2fx" % (
             d["dark"], d["dark_sky_e"], 100 * res["tol"], d["allow_e"], d["again"] / 1024.0))
+    if res.get("trace"):
+        L.append("  trace: %s" % res["trace"])
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
     # ISP gain: what each camera needs for quantization alone, and with the sky kept out of the
