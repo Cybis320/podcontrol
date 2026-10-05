@@ -340,12 +340,16 @@ def platform_of(ip):
 def isp_floor(ip):
     """The camera's ISP digital gain floor (x1024): the black-level restoration
     4095/(4095 - pedestal), what `manual -i restore` sets (silicon_research science_gain.h:
-    G3S 240 -> 1088, CV300 236 -> 1087, K662 200 -> 1077). None if the camera cannot say."""
+    rounded up to the ISP's 1/256 step: G3S/CV300 236 -> 1088, K662 200 -> 1080). None if the
+    camera cannot say."""
     m = re.search(r"levels=\[(\d+)", send(ip, "blacklevel", timeout=8) or "")
     if not m:
         return None
     p = int(m.group(1))
-    return (1024 * 4095 + (4095 - p) // 2) // (4095 - p) if 0 < p < 4095 else None
+    if not 0 < p < 4095:
+        return None
+    f = -(-1024 * 4095 // (4095 - p))          # science_gain.h sci_ispd_floor: ceil ...
+    return -(-f // 4) * 4                      # ... then up to the ISP's 1/256 step (236 -> 1088)
 
 
 # ---- the night ISP gain recommendation ------------------------------------------------
