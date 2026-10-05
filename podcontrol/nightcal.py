@@ -164,13 +164,74 @@ OLD_DECODE_MIN_CODE = {"cv300": 16, "goke": 8}
 
 
 def platform_of(ip):
-    """'cv300' | 'goke' from the camera's sysinfo, None if it does not say."""
+    """'cv300' | 'goke' from the camera's sysinfo, None if it does not say. The K662
+    (GK7605V100) has the Goke ISP and its 1025-node gamma table: 'goke' here."""
     s = send(ip, "sysinfo", timeout=8) or ""
     if "hi3516cv300" in s:
         return "cv300"
-    if "gk7205" in s:
+    if "gk7205" in s or "gk7605" in s:
         return "goke"
     return None
+
+
+def isp_floor(ip):
+    """The camera's ISP digital gain floor (x1024): the black-level restoration
+    4095/(4095 - pedestal), what `manual -i restore` sets (silicon_research science_gain.h:
+    G3S 240 -> 1088, CV300 236 -> 1087, K662 200 -> 1077). None if the camera cannot say."""
+    m = re.search(r"levels=\[(\d+)", send(ip, "blacklevel", timeout=8) or "")
+    if not m:
+        return None
+    p = int(m.group(1))
+    return (1024 * 4095 + (4095 - p) // 2) // (4095 - p) if 0 < p < 4095 else None
+
+
+# ---- the night ISP gain recommendation ------------------------------------------------
+# ISP gain comes after the ADC: it adds no signal-to-noise, so the ANALOG gain is chosen for
+# sensitivity (choose()). What ISP gain still decides is how the night sky is REPRESENTED in
+# the 8-bit gamma-0.5 video. Two failures, both cured only by output scale:
+#  * quantization -- sky noise under ~1.5 codes stops dithering the 8-bit steps;
+#  * the gamma table's straight first segment -- below code 16 (CV300) / 8 (Goke) the curve
+#    is linear, and RMS's code^2 decode misreads it: faint-star photometry ~0.2-0.5 mag too
+#    bright on a CV300 sky at codes 10-14 (model, 2026-10-05).
+# The price is highlight headroom: everything above 4095/gain of the linear range clips.
+ISPD_REC_MAX = 2048                         # the AUTO ceiling of the gain policy (science_gain.h)
+TOE_CODE = {"cv300": 16, "goke": 8}         # end of the straight segment, in output codes
+# Keeping the sky out of the straight segment only HEDGES RMS's code^2 decode: decoded with the
+# camera's own table (`gamma decode`) the segment is good data -- finer, not coarser. Set False
+# once RMS decodes with the table; quantization is then the only criterion. Both are reported.
+AVOID_TOE = True
+
+
+def lin_to_code(lin, platform):
+    """Output code of a linear (12-bit) level under the camera's table (toe, then pure 0.5)."""
+    if platform == "cv300" and lin < 16.0:
+        return lin * 15.94 / 16.0
+    if platform == "goke" and lin < 4.0:
+        return lin * 7.97 / 4.0
+    return math.sqrt(max(lin, 0.0) * 65025.0 / 4095.0)
+
+
+def recommend_ispd(row, floor, platform, min_std_code=None, cap=ISPD_REC_MAX, avoid_toe=True):
+    """Lowest ISP gain in [floor, cap] at which this measured sky (one sweep row) carries
+    >= min_std_code of noise (and, with avoid_toe, sits above the straight segment). -> dict
+    with the gain and what it achieves; 'met' False when even the cap is not enough (the cap
+    is returned)."""
+    if min_std_code is None:
+        min_std_code = MIN_STD_CODE
+    meas = float(row.get("ispdgain") or row.get("ispd_set") or floor)
+    toe = TOE_CODE.get(platform, 16)
+    best = None
+    for f in list(range(int(floor), int(cap) + 1, 8)) + [int(cap)]:
+        bg, sd = row["mean_lin"] * f / meas, row["std_lin"] * f / meas
+        code = lin_to_code(bg, platform)
+        sc = sd / prod_code_width(bg, platform)
+        cand = {"ispd": f, "sky_code": code, "std_code": sc, "headroom_pct": 100.0 * 1024.0 / f}
+        if (code > toe or not avoid_toe) and sc >= min_std_code:
+            cand["met"] = True
+            return cand
+        best = cand
+    best["met"] = False
+    return best
 
 
 MIN_STD_CODE = 1.5         # noise below this many output codes is under-read (see the docstring)
@@ -223,14 +284,18 @@ def compensating_ispd(again, top, ispd=ISPD_FULL_SCALE):
     return int(min(ISPD_MAX, max(ispd, round(top * ispd / float(again)))))
 
 
-def sweep_camera(station, exp_us, ispd=ISPD_FULL_SCALE, steps=STEPS, frames=25,
+def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
                  settle_s=SETTLE_S, on_row=None):
     """Sweep one camera. Returns {rows, drift, chosen?, ok, reason}; never saves.
     Each analog step is measured at the CONSTANT total gain of the top step
-    (compensating_ispd); the production ISP gain is `ispd`."""
+    (compensating_ispd); the production ISP gain is `ispd` (default: the camera's own
+    floor, which differs by pedestal: 1088 / 1087 / 1077)."""
     ip = station.ip
     out = {"rows": [], "drift": None, "ok": False, "reason": ""}
     plat = platform_of(ip)
+    ispd = ispd or isp_floor(ip) or ISPD_FULL_SCALE
+    out["isp_floor"] = ispd
+    out["platform"] = plat
     try:
         for a in steps:
             r = _measure(ip, a, compensating_ispd(a, steps[0], ispd), exp_us, frames, settle_s, plat, prod_ispd=ispd)
@@ -292,7 +357,7 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
         raise RuntimeError("no RMS night `manual` line in %s" % (st0.settings_path or "(no settings file)"))
     res["exp_us"] = nl[2]
     with ThreadPoolExecutor(max_workers=len(pod.stations)) as ex:
-        futs = {s.id: ex.submit(sweep_camera, s, nl[2], ISPD_FULL_SCALE, STEPS, frames, SETTLE_S, on_row)
+        futs = {s.id: ex.submit(sweep_camera, s, nl[2], None, STEPS, frames, SETTLE_S, on_row)
                 for s in pod.stations}
         for sid, f in futs.items():
             try:
@@ -310,9 +375,24 @@ def calibrate_pod(pod, tol=0.02, frames=25, drift_max=0.05, force=False, on_row=
                     if c["chosen"] is None:
                         c["ok"] = False
                         c["reason"] = "no step with a trustworthy noise figure"
+                    else:
+                        row = next(r for r in c["rows"] if r["again_set"] == c["chosen"])
+                        fl = c.get("isp_floor") or ISPD_FULL_SCALE
+                        c["isp_q"] = recommend_ispd(row, fl, c.get("platform"), avoid_toe=False)
+                        c["isp_t"] = recommend_ispd(row, fl, c.get("platform"), avoid_toe=True)
+                        c["isp"] = c["isp_t"] if AVOID_TOE else c["isp_q"]
             res["cameras"][sid] = c
     good = [c["chosen"] for c in res["cameras"].values() if c.get("ok")]
     res["pod_again"] = max(good) if good else None     # the darkest sky's need
+    # ISP gain: the pod's highest need too (the darkest sky); "restore" when every camera is
+    # served by its own floor, so the settings file keeps the per-camera floor
+    recs = [c for c in res["cameras"].values() if c.get("ok") and c.get("isp")]
+    if recs:
+        need = max(c["isp"]["ispd"] for c in recs)
+        at_floor = all(c["isp"]["ispd"] <= (c.get("isp_floor") or ISPD_FULL_SCALE) for c in recs)
+        res["pod_ispd"] = "restore" if at_floor else need
+    else:
+        res["pod_ispd"] = None
     return res
 
 
@@ -343,6 +423,19 @@ def format_table(res):
                 ("  " + r["why"]) if r.get("why") else ("  <- chosen" if r["again_set"] == pick else "")))
     L.append("PROPOSED pod night analog gain: %s" % (
         ("%d (%.2fx)" % (res["pod_again"], res["pod_again"] / 1024.0)) if res["pod_again"] else "none (no valid camera)"))
+    # ISP gain: what each camera needs for quantization alone, and with the sky kept out of the
+    # gamma table's straight segment (only a hedge for RMS's code^2 decode -- AVOID_TOE)
+    fmt = lambda i: "%4d (%.2fx) sky code %5.1f  noise %4.2f code  keeps %3.0f%% headroom%s" % (
+        i["ispd"], i["ispd"] / 1024.0, i["sky_code"], i["std_code"], i["headroom_pct"], "" if i["met"] else "  NOT MET at the cap")
+    for sid, c in sorted(res["cameras"].items()):
+        if c.get("isp_q"):
+            L.append("  ISP %-8s floor %4d | quantization only: %s" % (sid, c.get("isp_floor") or 0, fmt(c["isp_q"])))
+            L.append("  %-12s %4s | + out of straight seg: %s" % ("", "", fmt(c["isp_t"])))
+    pi = res.get("pod_ispd")
+    L.append("PROPOSED pod night ISP gain: %s   (%s)" % (
+        "restore (each camera's own floor)" if pi == "restore" else ("%d (%.2fx)" % (pi, pi / 1024.0)) if pi else "none",
+        "quantization + straight segment avoided (AVOID_TOE: RMS still decodes code^2)" if AVOID_TOE
+        else "quantization only (RMS decodes with the camera table)"))
     return "\n".join(L)
 
 
@@ -386,9 +479,10 @@ def update_settings(path, again, ispd):
 def apply(pod, res):
     """Set the proposed gain on every camera (saved, as RMS would) and in each
     station's settings file; log the calibration. Returns a list of notes."""
-    # ISP gain: the camera's own black-level restoration ("-i restore"), not a fixed
-    # 1088 -- that is right only for a 240 pedestal (CV300 236 -> 1087, IMX662 200 -> 1077).
-    a, i, e = res["pod_again"], "restore", res["exp_us"]
+    # ISP gain: calibrate_pod's proposal -- "restore" (each camera's own black-level floor,
+    # 1088 / 1087 / 1077 by pedestal) unless the night sky needs more for quantization (or, while
+    # AVOID_TOE, to stay out of the gamma table's straight segment); then that number.
+    a, i, e = res["pod_again"], res.get("pod_ispd") or "restore", res["exp_us"]
     if not a:
         raise RuntimeError("nothing to apply")
     notes = []
