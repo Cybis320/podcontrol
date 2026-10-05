@@ -223,6 +223,11 @@ _last_gain = {}                 # ip -> (again, ispd) last set by this module (a
 
 def _black_settle(ip, tag, min_s=BLACK_SETTLE_MIN_S, max_s=BLACK_SETTLE_MAX_S, frames=5):
     """After an analog-gain change, watch the picture's level until the black has re-settled.
+    ROOT CAUSE (2026-10-05, .206, LEDGER goke_black_wander): the IMX307's internal optical-black
+    clamp re-converges after a gain change in ~2 DN steps, 0.3-10 s late, and at high gain can
+    dither between two steps for a few seconds -- in total darkness too, with the ISP's actual
+    black level and every sensor register (0x300A BLKLEVEL, 0x3009, gain, SHS) constant. At a
+    fixed gain it settles and stays (6 min, 0.13 code). Earlier reading of the same data:
     On some IMX307s the black level JUMPS by ~2 DN some 5-10 s after a gain change (2026-10-05
     trace 075630: F1's first step read -2.0 units at +2 s and still at +5.7 s, settled by +9.4 s;
     D1 11.3x jumped during its +5.7 s read, A1 during its +9.4 s read; the noise is unchanged,
@@ -478,8 +483,12 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
         # level. The level itself is not a sky measure on the Goke: the IMX307's black moves
         # ~1 DN at every gain change, so the same setting revisited a minute later reads up to
         # +-1 linear unit off -- 6% of the darkest skies (2026-10-05, LEDGER goke_black_wander).
-        rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat,
-                            tag={"cam": station.id, "final": True})
+        # measured like any step: a bracket the sensor's black clamp stepped inside is re-done
+        for attempt in range(1 + STEP_RETRIES):
+            rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat,
+                                tag={"cam": station.id, "final": True, "step_try": attempt + 1})
+            if rep is None or rep.get("step_drift") is None or rep["step_drift"] <= STEP_DRIFT:
+                break
         if rep is not None:
             r0 = out["rows"][0]
             out["drift"] = (abs(rep["resp"] - r0["resp"]) / r0["resp"]) if r0.get("resp") else None
