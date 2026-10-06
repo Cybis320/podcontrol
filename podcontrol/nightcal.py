@@ -154,7 +154,16 @@ def parse_noise(text):
             pass
     m = re.search(r"\bdecode=(\w+)", text)
     d["decode"] = m.group(1) if m else None      # None: an older image that decodes code^2
-    return d if "mean_lin" in d and "std_lin" in d else None
+    if "mean_lin" not in d or "std_lin" not in d:
+        return None
+    # Optical-black reference (venc in OB mode 3, 2026-10-06): the camera also reports the read's
+    # mean OB level (ob_lin), its frame-to-frame jitter (ob_jit) and the per-frame OB-referenced
+    # mean/noise. The raw mean/noise stay the measurement; _measure_step uses the OB level only to
+    # catch the sensor clamp STEPPING between the reads of a bracket (see _ob_gate).
+    d["ob_ref"] = bool(USE_OB and "ob_lin" in d and "mean_lin_ob" in d)
+    if d["ob_ref"]:
+        d["mean_lin_raw"] = d["mean_lin"]
+    return d
 
 
 def night_line(station):
@@ -201,24 +210,58 @@ def _measure(ip, again, ispd, exp_us, frames, settle_s, platform=None, prod_ispd
         send_live(ip, "manual -a %d -i %d -e %d" % (again, ispd, exp_us))
         time.sleep(settle_s)
     r["gain_ok"] = _gain_applied(r, again, ispd, exp_us)
+    if ip in _blc_drop and "mean_lin_raw" in r:          # the output level at the PRODUCTION black
+        r["mean_lin_raw"] -= OB_BLC_DROP * (r.get("ispdgain") or ispd) / 1024.0
     g = (r.get("again") or again) / 1024.0 * (r.get("ispdgain") or ispd) / 1024.0
     r["again_set"] = again
     r["ispd_set"] = ispd
     r["platform"] = platform
     # the same step at the PRODUCTION ISP gain: background and noise scale with the ISP gain
     k = prod_ispd / float(r.get("ispdgain") or ispd)
-    r["prod_bg"], r["prod_std"] = r["mean_lin"] * k, r["std_lin"] * k
+    r["prod_bg"], r["prod_std"] = r.get("mean_lin_raw", r["mean_lin"]) * k, r["std_lin"] * k
     r["prod_std_code"] = r["prod_std"] / prod_code_width(r["prod_bg"], platform)
     r["total_gain"] = g
     r["nef"] = r["std_lin"] / g                # noise-equivalent flux: lower = more sensitive
     r["sky"] = r["mean_lin"] / g               # sky brightness in gain-free units
     lpc = r.get("lin_per_code") if r.get("decode") == "table" else None
-    r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r["mean_lin"]))
+    r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(r.get("mean_lin_raw", r["mean_lin"])))
     r["eligible"], r["why"] = eligible(r)
     return r
 
 
 _last_gain = {}                 # ip -> (again, ispd) last set by this module (a gain change -> _black_settle)
+
+# The sky-drift reference: a quiet gain, measured at the START and the END of the sweep. The IMX307
+# clamp disturbs 24-27% of the 22.39x brackets on C1/D1/F1 (5-14% at 16x, 0% at 8x and below; 40
+# traced runs, 2026-10-06), and the drift check used to revisit 22.39x -- most 'sky changed' refusals
+# were the check measuring the clamp.
+DRIFT_GAIN = 8192
+
+# Optical-black reference (only with a venc that reports OB fields; the production image does not).
+# USE_OB False (--no-ob) ignores the camera's OB fields: the control arm
+# of the 2026-10-06 A/B. With it, the ISP black is lowered OB_BLC_DROP counts for the sweep: at the
+# production 236 the OB rows sit ~4 counts above zero and at 16x ~28% of their RAW pixels clip
+# before the demosaic, so they followed a 3-count black step only 82% of the way (.205); 20 counts
+# lower they follow it to 0.4%. An additive offset changes neither noise nor response; the output
+# checks (black clip, quantization) are put back on the production level (_blc_drop).
+USE_OB = True
+OB_BLC_DROP = 20
+# A bracket counts as STEPPED when one read's OB level moved by more than OB_STEP_SIGMA x its own
+# noise (ob_jit / sqrt(frames)) and more than OB_STEP_MIN linear units from the bracket's median: a
+# clamp step is ~2.8 units, the read-mean OB noise 0.1-0.2. Per-frame subtraction everywhere (the first
+# A/B, 2026-10-06 06:28-07:32) cut the refusals 11 -> 4 of 60 camera-runs but added the OB rows' own
+# row noise (~1 unit/frame on F1, 0.5 on E1) to every read when nothing stepped: on F1 the steady
+# read-to-read level went from 0.017 to 0.19 units, and the 16x/22.39x choice started to flip.
+OB_STEP_SIGMA = 3.0
+OB_STEP_MIN = 1.0       # replay of 240 camera-runs: 0.6 fired on OB-only wander (0.7-0.9), 1.0 best
+# How the OB level is used. "detect" (default): a bracket whose OB moved more than the threshold is
+# DISTURBED and re-measured like one whose night-exposure reads disagree -- nothing is corrected.
+# "correct": the reads are shifted by the OB difference. The v3 A/B (2026-10-06 08:41-09:49) showed
+# correcting HIDES disturbances from the retry: a clamp step that began inside the 28 ms read left
+# even the median read half-stepped, the correction made the 40 ms reads agree (5.8% -> 1.4%), no
+# retry ran, and the bad bracket gave an 8% 'sky changed' refusal; re-measuring is robust.
+OB_MODE = "detect"
+_blc_drop = {}                  # ip -> (production black level, its OpType) while lowered
 
 
 def _black_settle(ip, tag, min_s=BLACK_SETTLE_MIN_S, max_s=BLACK_SETTLE_MAX_S, frames=5):
@@ -263,6 +306,35 @@ def _gain_applied(r, again, ispd, exp_us=None, tol=0.03):
             (exp_us is None or re_ is None or abs(re_ - exp_us) <= tol * exp_us))
 
 
+def _ob_gate(reads, frames):
+    """Did the sensor's black clamp step during this bracket? A read whose optical-black level differs
+    from the reads' median by more than max(OB_STEP_SIGMA * noise, OB_STEP_MIN) marks the bracket as
+    stepped; the caller then re-measures it (OB_MODE "detect", the default). In OB_MODE "correct" that
+    read also has the difference removed from its mean and its noise taken from the per-frame
+    OB-referenced figure when that is the smaller (kept for comparison: correcting hid disturbances
+    from the retry). Returns the OB levels and differences (None when the camera reports no OB rows)."""
+    if not all(x.get("ob_ref") for x in reads):
+        return None
+    obs = [x["ob_lin"] for x in reads]
+    ref = sorted(obs)[len(obs) // 2]
+    noise = sorted(x.get("ob_jit") or 0.0 for x in reads)[len(reads) // 2] / math.sqrt(max(frames, 1))
+    thr = max(OB_STEP_SIGMA * noise, OB_STEP_MIN)
+    corr = []
+    stepped = False
+    for x in reads:
+        d = x["ob_lin"] - ref
+        if abs(d) > thr:
+            stepped = True
+            if OB_MODE == "correct":
+                x["mean_lin"] -= d
+                x["std_lin"] = min(x["std_lin"], x.get("std_lin_ob", x["std_lin"]))
+            corr.append(round(d, 3))
+        else:
+            corr.append(0.0)
+    return {"corr": corr, "thr": round(thr, 3), "ob": [round(o, 3) for o in obs], "stepped": stepped,
+            "mode": OB_MODE}
+
+
 def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None, tag=None):
     """One sweep step at the production ISP gain: the night exposure, EXP_STEP of it, the
     night exposure again. Returns the row (None if the camera has no noise_stats): the sky's
@@ -277,8 +349,11 @@ def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None, tag=
     hi2 = _measure(ip, again, ispd, exp_us, frames, settle_s, platform, prod_ispd=ispd, tag=dict(tag, role="hi2"))
     if lo is None or hi2 is None:
         return None
+    ob_gate = _ob_gate((hi1, lo, hi2), frames)
     r = dict(hi1)
     mh = (hi1["mean_lin"] + hi2["mean_lin"]) / 2.0
+    if "mean_lin_raw" in hi1 and "mean_lin_raw" in hi2:
+        r["mean_lin_raw"] = (hi1["mean_lin_raw"] + hi2["mean_lin_raw"]) / 2.0
     vh = (hi1["std_lin"] ** 2 + hi2["std_lin"] ** 2) / 2.0
     dm = mh - lo["mean_lin"]
     r.update(mean_lin=mh, std_lin=math.sqrt(vh), lo_mean=lo["mean_lin"], lo_std=lo["std_lin"],
@@ -295,9 +370,15 @@ def _measure_step(ip, again, ispd, exp_us, frames, settle_s, platform=None, tag=
     r["std_code"] = r["std_lin"] / (lpc if lpc else code_step(mh))
     r["prod_bg"], r["prod_std"] = mh, r["std_lin"]
     r["prod_std_code"] = r["prod_std"] / prod_code_width(mh, platform)
+    if ob_gate:
+        r["ob_gate"] = ob_gate
+        if ob_gate["stepped"] and OB_MODE == "detect":
+            r["step_drift"] = max(r.get("step_drift") or 0.0, STEP_DRIFT + 1e-6)
+            r["ob_stepped"] = True
     r["eligible"], r["why"] = eligible(r)
-    _trace(dict(tag, ev="step", ip=ip, resp=r["resp"], nef=r["nef"], step_drift=r["step_drift"],
+    _trace(dict(tag, ev="step", ip=ip, resp=r["resp"], nef=r["nef"], step_drift=r["step_drift"], ob_gate=ob_gate,
                 mean_hi1=hi1["mean_lin"], mean_lo=lo["mean_lin"], mean_hi2=hi2["mean_lin"], std=r["std_lin"],
+                ob_ref=bool(hi1.get("ob_ref")), ob_lin=hi1.get("ob_lin"), ob_jit=hi1.get("ob_jit"),
                 sky_e=r["sky_e"], eligible=r["eligible"], why=r["why"]))
     return r
 
@@ -389,7 +470,7 @@ def recommend_ispd(row, floor, platform, min_std_code=None, cap=ISPD_REC_MAX, av
     toe = TOE_CODE.get(platform, 16)
     best = None
     for f in list(range(int(floor), int(cap) + 1, 8)) + [int(cap)]:
-        bg, sd = row["mean_lin"] * f / meas, row["std_lin"] * f / meas
+        bg, sd = row.get("mean_lin_raw", row["mean_lin"]) * f / meas, row["std_lin"] * f / meas
         code = lin_to_code(bg, platform)
         sc = sd / prod_code_width(bg, platform)
         cand = {"ispd": f, "sky_code": code, "std_code": sc, "headroom_pct": 100.0 * 1024.0 / f}
@@ -409,6 +490,8 @@ def eligible(r, min_std_code=MIN_STD_CODE, min_sigma=BLACK_SIGMA):
     if r.get("gain_ok") is False:
         return False, "gain/exposure not applied (measured again %s ispd %s exp %s)" % (
             r.get("again"), r.get("ispdgain"), r.get("exp_us"))
+    if r.get("ob_stepped"):
+        return False, "black clamp stepped during the step (OB rows)"
     if r.get("step_drift") is not None and r["step_drift"] > STEP_DRIFT:
         return False, "sky moved during the step (%.1f%%)" % (100 * r["step_drift"])
     if r.get("resp") is not None and r["resp"] <= 0:
@@ -422,8 +505,9 @@ def eligible(r, min_std_code=MIN_STD_CODE, min_sigma=BLACK_SIGMA):
         # measured fine at the boosted level, but at night settings this gain's frames would
         # carry under 1.5 codes of noise: the 8-bit output itself would cost sensitivity
         return False, "night frames quantized (noise %.2f code)" % r["prod_std_code"]
-    if r["mean_lin"] < min_sigma * r["std_lin"]:
-        return False, "black clip (sky %.1f sigma)" % (r["mean_lin"] / max(r["std_lin"], 1e-9))
+    out_level = r.get("mean_lin_raw", r["mean_lin"])        # the clip is in the output, raw level
+    if out_level < min_sigma * r["std_lin"]:
+        return False, "black clip (sky %.1f sigma)" % (out_level / max(r["std_lin"], 1e-9))
     return True, ""
 
 
@@ -439,8 +523,9 @@ def screen(rows, min_sigma=BLACK_SIGMA, dip=DIP):
         if above:
             ref = sum(above) / len(above)
             sigma = ref * (r.get("resp") or r["total_gain"])
-            if r["mean_lin"] < min_sigma * sigma:
-                r["eligible"], r["why"] = False, "black clip (sky %.1f predicted sigma)" % (r["mean_lin"] / sigma)
+            out_level = r.get("mean_lin_raw", r["mean_lin"])
+            if out_level < min_sigma * sigma:
+                r["eligible"], r["why"] = False, "black clip (sky %.1f predicted sigma)" % (out_level / sigma)
                 continue
             if r["nef"] < ref * (1.0 - dip):
                 r["eligible"], r["why"] = False, "dip (nef %.0f%% below the steps above)" % (100 * (1 - r["nef"] / ref))
@@ -461,7 +546,25 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
     ispd = ispd or isp_floor(ip) or ISPD_FULL_SCALE
     out["isp_floor"] = ispd
     out["platform"] = plat
+    out["ob_ref"] = False
     try:
+        if USE_OB:
+            probe = parse_noise(send(ip, "noise_stats 2", timeout=10))
+            m = re.search(r"OpType=(\w+) levels=\[(\d+),", send(ip, "blacklevel", timeout=10) or "")
+            if probe and probe.get("ob_ref") and m:
+                base, mode = int(m.group(2)), m.group(1)
+                send_live(ip, "blacklevel %d" % (base - OB_BLC_DROP))
+                _blc_drop[ip] = (base, mode)
+                out["ob_ref"] = True
+                _trace({"cam": station.id, "ip": ip, "ev": "ob_black", "production": base, "mode": mode,
+                        "lowered_to": base - OB_BLC_DROP})
+        # the drift reference at a quiet gain, before the sweep (compared with its re-measure after)
+        ref0 = None
+        for attempt in range(1 + STEP_RETRIES):
+            ref0 = _measure_step(ip, DRIFT_GAIN, ispd, exp_us, frames, settle_s, plat,
+                                 tag={"cam": station.id, "ref": True, "step_try": attempt + 1})
+            if ref0 is None or ref0.get("step_drift") is None or ref0["step_drift"] <= STEP_DRIFT:
+                break
         for a in steps:
             # a step whose two night-exposure reads disagree caught the sky moving (a cloud edge,
             # a plane): measure it again rather than lose it -- a lost best step pushes the choice
@@ -489,15 +592,20 @@ def sweep_camera(station, exp_us, ispd=None, steps=STEPS, frames=25,
         # +-1 linear unit off -- 6% of the darkest skies (2026-10-05, LEDGER goke_black_wander).
         # measured like any step: a bracket the sensor's black clamp stepped inside is re-done
         for attempt in range(1 + STEP_RETRIES):
-            rep = _measure_step(ip, steps[0], ispd, exp_us, frames, settle_s, plat,
+            rep = _measure_step(ip, DRIFT_GAIN, ispd, exp_us, frames, settle_s, plat,
                                 tag={"cam": station.id, "final": True, "step_try": attempt + 1})
             if rep is None or rep.get("step_drift") is None or rep["step_drift"] <= STEP_DRIFT:
                 break
         if rep is not None:
-            r0 = out["rows"][0]
+            r0 = ref0 if ref0 is not None else out["rows"][0]
             out["drift"] = (abs(rep["resp"] - r0["resp"]) / r0["resp"]) if r0.get("resp") else None
         out["ok"] = True
     finally:
+        if ip in _blc_drop:                    # the production black level, exactly as found
+            base, mode = _blc_drop.pop(ip)
+            send_live(ip, "blacklevel %d" % base)
+            if mode == "AUTO":
+                send_live(ip, "blacklevel auto")
         send(ip, "ae_restore", timeout=10)     # back to the saved (RMS) state
     return out
 
@@ -776,7 +884,11 @@ if __name__ == "__main__":
     ap.add_argument("--only", help="comma-separated camera IPs to include (default: the whole pod)")
     ap.add_argument("--force", action="store_true", help="skip the sun-altitude guard (testing)")
     ap.add_argument("--apply", action="store_true", help="set the cameras and the settings JSON")
+    ap.add_argument("--no-ob", action="store_true",
+                    help="ignore the optical-black reference even where the camera provides it (control runs)")
     args = ap.parse_args()
+    if args.no_ob:
+        USE_OB = False
     stations = get_pod()
     if args.only:
         keep = set(args.only.split(","))
