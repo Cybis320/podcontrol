@@ -515,6 +515,13 @@ class App(tk.Tk):
         # a factor of two in log terms, and auto-tune now sets both.
         self.vig_coeff_lin = tk.DoubleVar(value=float(sv("vignette_coeff_linear", VIGNETTE.LINEAR_COEFF)))
         self._vig_busy = False
+        # constant-exposure colour: per-camera (R, B) gains relative to green, fitted on
+        # the overlaps with the ISP saturation undone (podcontrol.radiance.fit_chroma)
+        self.chroma_on = tk.BooleanVar(value=bool(sv("chroma_on", False)))
+        cg = saved.get("chroma_gains")
+        self.chroma_gains = {str(k): (float(v[0]), float(v[1])) for k, v in cg.items()
+                             if isinstance(v, (list, tuple)) and len(v) == 2} if isinstance(cg, dict) else {}
+        self._chroma_busy = False
         self.satu = tk.IntVar(value=int(sv("satu", 128)))
         cm = saved.get("ccm_mode")
         self.ccm_mode = tk.StringVar(value=cm if cm in ("identity", "auto", "off") else "identity")
@@ -825,6 +832,28 @@ class App(tk.Tk):
             var.trace_add("write", lambda *_: (self._vig_apply(), self._schedule_save()))
         self._vig_label()
 
+        g = group(row2, "sky colour",
+                  "Per-camera colour calibration for the constant-exposure sky view only. Nothing\n"
+                  "is sent to a camera.")
+        check(g, "colour cal", self.chroma_on, tip=
+              "Correct each camera's colour in the constant-exposure view (needs 'const exp').\n\n"
+              "The pod runs the ISP saturation at ~2x, applied in linear light before the gamma.\n"
+              "It multiplies small differences between units: on blue sky red comes out as\n"
+              "~2R - Y, so a few percent of red sensitivity becomes tens of percent of R/G, and\n"
+              "the tiles disagree in colour. This undoes the saturation, applies the camera's\n"
+              "fitted R and B gains, and re-applies the saturation. Cameras at saturation 0\n"
+              "(night) are drawn uncorrected.", padx=(0, 6))
+        self.chroma_note = lab(g, "", padx=(6, 0))
+        btn(g, "auto", self._chroma_autotune, tip=
+            "Fit each camera's R and B gains from the pod's overlapping fields, over the last\n"
+            "few minutes of saved frames. Takes ~20 s and touches no camera. Daytime only.\n\n"
+            "Only ratios between channels are fitted, so exposure, the lens flat and veiling\n"
+            "glare in a sun camera cancel and cannot pull the gains. The mask, the sun/moon/\n"
+            "flare zones, clipped and near-black pixels are left out.", padx=(6, 0))
+        self.chroma_on.trace_add("write", lambda *_: (self._chroma_label(), self._schedule_save(),
+                                                      self.view == "sky" and self._pool.submit(self._sky_now)))
+        self._chroma_label()
+
         g = group(row2, "policy")
         check(g, "sun cam votes", self.sun_votes, tip=
               "Checked: a camera with the sun in its field votes on the pod exposure like any\n"
@@ -1029,6 +1058,11 @@ class App(tk.Tk):
             except Exception:
                 pass                              # bandwidth is never worth a cycle
             self._last_poll = poll
+            try:
+                from podcontrol import radiance as _radiance
+                _radiance.note_saturation(poll)   # the colour cal needs each camera's live satu
+            except Exception:
+                pass
             sky = None
             if self.view == "sky":
                 try:
@@ -1228,7 +1262,8 @@ class App(tk.Tk):
             from podcontrol import radiance
             imgs, paths, cinfo = radiance.constant_exposure(
                 paths, list(self.history.records),
-                flat=(VIGNETTE.clamp(self.vig_coeff_lin.get()) if self.vig_on.get() else 0.0))
+                flat=(VIGNETTE.clamp(self.vig_coeff_lin.get()) if self.vig_on.get() else 0.0),
+                chroma=(self.chroma_gains if self.chroma_on.get() and self.chroma_gains else None))
             self._const_info = cinfo
             if cinfo.get("flat"):
                 vig_override = 0.0
@@ -1241,8 +1276,11 @@ class App(tk.Tk):
             own = [sid for sid in sorted(ks) if _decode.source(sid) == "table"]
             fb = [sid[-2] for sid in sorted(ks) if sid not in own]
             curves = "decode: %d/%d camera curves%s" % (len(own), len(ks), ("   pure 0.5: %s" % " ".join(fb)) if fb else "")
-            txt = "constant exposure %.0f us-x%s   k: %s" % (self._const_info["e_ref"],
+            skip = self._const_info.get("chroma_skipped") or []
+            txt = "constant exposure %.0f us-x%s%s   k: %s" % (self._const_info["e_ref"],
                    "   flat (linear)" if self._const_info.get("flat") else "",
+                   ("   colour cal%s" % (" (not %s)" % " ".join(sid[-1] for sid in skip) if skip else ""))
+                   if self._const_info.get("chroma") else "",
                    " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
             # above the renderer's own caption (time, cameras, coverage) at h - 8
             from podcontrol.skymap import _text
@@ -1394,6 +1432,54 @@ class App(tk.Tk):
             lines.append("    %-8s %.3fx" % (sid, gains[sid]))
         lines += ["", "spread %.1f%%" % spread]
         messagebox.showinfo("Sky flat field", "\n".join(lines))
+
+    def _chroma_label(self):
+        if not self.chroma_gains:
+            self.chroma_note.config(text="not fitted", fg="#6d6350")
+        elif not self.chroma_on.get():
+            self.chroma_note.config(text="off", fg="#6d6350")
+        else:
+            self.chroma_note.config(text="%d cams" % len(self.chroma_gains), fg="#c8bfa8")
+
+    def _chroma_autotune(self):
+        """Fit the per-camera chroma gains from the pod's own overlaps, in a worker thread."""
+        if self._chroma_busy:
+            return
+        self._chroma_busy = True
+        self.chroma_note.config(text="fitting…", fg="#f0a830")
+
+        def work():
+            try:
+                from podcontrol import radiance
+                sets = F.recent_sets(self.stations, want=12)
+                if len(sets) < 3:
+                    raise RuntimeError("only %d usable frame sets; needs a few minutes of"
+                                       " frames from every camera" % len(sets))
+                res = radiance.fit_chroma(self.sky_r, sets)
+            except Exception as e:
+                res = {"error": str(e)}
+            self.after(0, lambda: self._chroma_autotune_done(res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _chroma_autotune_done(self, res):
+        from tkinter import messagebox
+        self._chroma_busy = False
+        if res.get("error") or not res.get("gains"):
+            self._chroma_label()
+            messagebox.showwarning("Sky colour", "Could not fit:\n\n%s" % res.get("error", "no result"))
+            return
+        self.chroma_gains = dict(res["gains"])
+        self.chroma_on.set(True)                       # trace: label, save, redraw
+        self._chroma_label()
+        self._schedule_save()
+        lines = ["Colour mismatch between overlapping cameras (RMS, log, saturation undone):",
+                 "    %.1f%% before  ->  %.1f%% after" % (100 * res["before"], 100 * res["after"]),
+                 "over %d pair equations from %d frame sets" % (res["pairs"], res["sets"]), "",
+                 "Per-camera gains relative to green (ISP saturation):"]
+        for sid in sorted(res["gains"]):
+            r, b = res["gains"][sid]
+            lines.append("    %-8s R %.3f  B %.3f   (%.2fx)" % (sid, r, b, res["sat"][sid]))
+        messagebox.showinfo("Sky colour", "\n".join(lines))
 
     def _apply_view(self, initial=False):
         self.view_btn.config(text="View: %s" % self.view)
@@ -1585,6 +1671,8 @@ class App(tk.Tk):
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "vignette_coeff_linear": float(self.vig_coeff_lin.get()),
+             "chroma_on": bool(self.chroma_on.get()),
+             "chroma_gains": {k: [round(v[0], 5), round(v[1], 5)] for k, v in self.chroma_gains.items()},
              "colour_hold": bool(self.colour_hold.get()),
              "sun_cam_votes": bool(self.sun_votes.get()), "wb_rung_magenta_ok": bool(self.magenta_ok.get()),
              "camera_meter": bool(self.camera_meter.get()), "individual_ae": bool(self.individual_ae.get()),
