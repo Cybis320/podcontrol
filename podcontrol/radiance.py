@@ -28,7 +28,8 @@ Limits (a demo, not the product): clipped pixels stay clipped (only a lower boun
 light). The green of a raw-saturated pixel on a WB-rung camera is RMS's to repair (its
 day_highlight_rebuild, in the saved frame); fit_chroma leaves those pixels out either way,
 since a rebuilt green is itself derived from the scene's colour ratios. For display,
-highlights above ~60% of white roll off smoothly (rolloff), the same for every tile.
+highlights above ~60% of white roll off smoothly, the same for every tile, keeping each
+pixel's colour until the last ~10% before white (rolloff_colour).
 """
 import numpy as np
 
@@ -75,6 +76,35 @@ def rolloff(lin, knee=KNEE):
     captured, 50% in the merged view), this keeps their detail and the mosaic seamless."""
     over = np.maximum(lin - knee, 0.0)
     return np.where(lin <= knee, lin, knee + (1.0 - knee) * (1.0 - np.exp(-over / (1.0 - knee))))
+
+
+WHITE_START = 0.81   # linear level (= 90% of display white) where highlights start blending to white
+
+
+def rolloff_colour(lin, knee=KNEE, white=WHITE_START):
+    """rolloff for a colour (H x W x 3) frame, keeping its colour. Per channel, the shoulder
+    squeezes the brightest channel most: a bright patch lost saturation and drifted towards
+    white well below white. Here ONE value per pixel is compressed -- its largest channel,
+    so no channel can pass 1 (luma could: a saturated blue with Y under the knee has B over 1)
+    -- and all three channels are scaled by the same factor, so hue and saturation hold in
+    linear light. Only the last stretch blends to white, as real highlights do (the sun and
+    its halo): above `white` (rolled-off level) the pixel moves towards grey at its own
+    level, with weight t^2, t = (f - white) / (1 - white). Clipped input stays as wrong as
+    it came in. A 2-D (grey) frame takes the plain rolloff. In place on `lin`."""
+    if lin.ndim != 3:
+        return rolloff(lin, knee)
+    n = lin.max(axis=2)
+    hi = n > knee
+    if not hi.any():
+        return lin
+    f = rolloff(n, knee)
+    lin *= np.where(hi, f / np.maximum(n, 1e-6), 1.0)[:, :, None]
+    if white < 1.0:
+        t = np.clip((f - white) / (1.0 - white), 0.0, 1.0)
+        w = t * t
+        lin *= (1.0 - w)[:, :, None]
+        lin += (w * f)[:, :, None]
+    return lin
 
 
 _FLAT = {}          # (h, w, coeff) -> per-pixel 1/V(r); static, so built once
@@ -168,7 +198,7 @@ def scale(img, k, knee=KNEE, sid=None, flat=None, cmat=None):
             import cv2
             lin = cv2.transform(lin, cmat)
             np.maximum(lin, 0.0, out=lin)
-        return rolloff(lin, knee)
+        return rolloff_colour(lin, knee)
     if sid is not None:
         from podcontrol import decode
         return decode.to_code(_apply(decode.to_linear(img, sid)), sid)
