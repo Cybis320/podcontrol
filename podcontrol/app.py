@@ -1208,8 +1208,10 @@ class App(tk.Tk):
         static is cached in the renderer; a cycle with the same frames costs
         a few ms, a new set ~60 ms. cyc_frames / cyc_layers are this cycle's
         tile frames and overlay layers: when a camera's set frame is the very
-        file its tile shows (the usual case), its layers are reused as they
-        are, so the overlay adds no per-cycle work."""
+        file its tile shows, its layers are reused as they are. The sky shows
+        the newest slot common to all cameras (skymap.pod_frames), which is
+        usually older than the tiles' newest, so a new set costs ~0.2-0.4 s
+        here (decode + masks), once per 5 s slot."""
         r = self.sky_r
         # ensure() every cycle, not just until ready: it is how an edited mask or
         # platepar reaches the sky view. Steady state it stats two files per

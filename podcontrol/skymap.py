@@ -433,19 +433,29 @@ def small_frame(img, path, size):
     return small
 
 
+SYNC_MAX_LAG_S = 75.0   # a synced set may trail the newest frame by this much (one 50 s
+                        # flush block plus margin); a camera holding it back further
+                        # is left out of the sync and shows its own newest frame
+
+
 def pod_frames(pod, decode=True):
     """({station_id: bgr_or_None}, {station_id: path}, capture_epoch_or_None,
-    spread_s): every camera contributes its OWN newest saved frame, so the
-    composite keeps full sky coverage even when RMS has not saved the same
-    instant everywhere -- which is the normal case, not the exception: over 233
-    minutes on 2026-09-26 all six shared a 5 s slot in 0% of them, so insisting
-    on one instant meant permanently falling back to this anyway.
+    spread_s): the newest 5 s slot that EVERY camera has saved, so the six
+    tiles of the composite show one instant.
+
+    RMS now saves every camera on every aligned 5 s slot (measured 2026-10-09:
+    171 of 180 slots complete, frames within 20 ms of the boundary), but each
+    station flushes its 10-frame block at a different moment, so "each
+    camera's own newest frame" (what this used to return, when cameras shared a
+    slot 0% of the time on 2026-09-26) mixed instants up to ~45 s apart. The
+    synced set is up to one block (~50 s) old instead.
+
+    If no common slot lies within SYNC_MAX_LAG_S of the newest frame (a camera
+    stalled), the set is taken over the most cameras that do share one, and the
+    rest fall back to their own newest frame so the sky stays covered.
 
     The fourth value is the SPREAD in seconds between the oldest and newest
-    chosen frame. It replaces the old coherent flag, which was a bool that read
-    as "MIXED TIMES" on the map and left the operator guessing whether it meant
-    the cameras disagreed about their settings. A number of seconds says what it
-    is: how far apart in time the frames making up this picture were taken.
+    chosen frame: ~0 when synced, otherwise how far apart the tiles were taken.
 
     decode=False leaves the images None (compose() decodes a file only when
     its downscaled version is not cached yet)."""
@@ -457,6 +467,13 @@ def pod_frames(pod, decode=True):
             paths[st.id], ts[st.id] = p, t
     if not paths:
         return {}, {}, None, 0.0
+    newest = max(ts.values())
+    for n in range(len(paths), 0, -1):
+        slot, set_paths, _ = frames.newest_set(pod, tol_s=0.5, min_cams=n)
+        if slot is not None and newest - slot <= SYNC_MAX_LAG_S:
+            for sid, p in set_paths.items():
+                paths[sid], ts[sid] = p, slot
+            break
     imgs = {sid: (frames.imread_cached(p) if decode else None) for sid, p in paths.items()}
     newest = max(ts.values())
     return imgs, paths, newest, newest - min(ts.values())
