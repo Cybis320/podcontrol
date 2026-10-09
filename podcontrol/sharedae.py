@@ -53,6 +53,18 @@ class AEConfig:
                                 # (Goke auto range tops at 39970; night configs use 39941)
     analog_max_x = 22.0         # common-safe analog ceiling (Goke ~22x, IMX291 ~31x)
     boost_max_x = 16.0          # ISP-digital cap (IMX291 16x; Goke science night uses 2x)
+    # The sensor's analog gain is a ladder of 0.3 dB (~0.05 stop) rungs, two segments
+    # (readback on every camera, 2026-10-09: 1024*10^(0.015k) k=0..20, then
+    # 2048*10^(0.015j) j=0..60, top 15.89x), and the daemon floors any code to the
+    # rung below it. Sending the fractional gain as analog therefore moved the
+    # picture in 3.5 % jumps however fine the AE stepped (commanded median 0.009
+    # stop, applied 0.038). Below the top rung the split is now: analog = the rung
+    # at or below the need, ISP gain = the remainder (1/256 steps, ~0.005 stop);
+    # above it the ISP gain ramps to the night line's (see _li_to_exp_gain).
+    analog_rung_db = 0.3
+    isp_fill_base = 1088        # x1024: ISP gain the fill sits on. Every camera clamps ISP
+                                # up to its black-level floor (1077 / 1087 / 1088), so the
+                                # fill must start at the highest floor or a camera eats it
     target_luma = 170.0         # mean cap so a flat/featureless scene isn't over-amplified
     clip_limit = 0.00005        # AIM FOR 0% CLIP: >~100 clipped px (>=CLIP_LEVEL) -> reduce
                                 # (small floor ignores a handful of stuck hot pixels)
@@ -155,6 +167,19 @@ except Exception:
     pass
 
 
+_RUNGS = {}
+
+
+def analog_rungs(db=0.3):
+    """The sensor's analog gain ladder (x, ascending): 1024*10^(db*k/20) up to 2x,
+    then 2048*10^(db*j/20) up to 18 dB above that (15.89x)."""
+    if db not in _RUNGS:
+        lo = [10 ** (db * k / 20) for k in range(int(round(6.0 / db)) + 1)]
+        hi = [2 * 10 ** (db * j / 20) for j in range(int(round(18.0 / db)) + 1)]
+        _RUNGS[db] = sorted(r for r in lo if r < 2.0) + hi
+    return _RUNGS[db]
+
+
 def _wb_ints_from_reply(text):
     """The x256 (R, G, B) a `wb` reply reports, or None. Every wb command --
     set or read -- echoes the resulting gains, so the reply is the camera's own
@@ -248,12 +273,31 @@ class SharedAE:
         else:
             exp = exp_cap
         g = max(1.0, target / exp)                      # gain makes up the rest
-        analog = min(g, c.analog_max_x)
-        boost = min(c.boost_max_x, max(1.0, g / analog))
         if li >= self._max_li() - 1e-6:
             # the top rung IS the night line (byte-identical hand-over to RMS)
             return int(c.exp_max_us), c.analog_max_x, c.boost_max_x
-        return int(round(exp)), analog, boost
+        rungs = analog_rungs(c.analog_rung_db)
+        top = max([r for r in rungs if r <= c.analog_max_x * (1 + 1e-9)] or rungs[:1])
+        if g <= top:
+            # analog on the sensor's own rung, ISP gain fills the fraction to it
+            analog = max(r for r in rungs if r <= g * (1 + 1e-9))
+            # down to the ISP's 1/256 step: never over the need, so monotone in li
+            isp = 4 * int(c.isp_fill_base * g / analog / 4 + 1e-9)
+            return int(round(exp)), analog, max(c.isp_fill_base, isp) / 1024.0
+        # Between the top rung and the night line (dusk). The night line's analog
+        # code is sent as is (the sensor floors 16384 to 15.89x), and the ISP gain
+        # ramps, log-linear in g, from the fill base at the top rung to the night
+        # line's own ISP gain. What the sensor delivers is then continuous at both
+        # ends: the last fill rung below, and the night line itself at the latch.
+        # Sending g / analog here instead left the picture frozen (ISP under the
+        # camera's floor) for the first ~0.1 stop of this stretch.
+        g_max = c.analog_max_x * c.boost_max_x
+        night_isp = c.boost_max_x * 1024
+        isp = c.isp_fill_base
+        if night_isp > c.isp_fill_base and g_max > top:
+            u = min(1.0, math.log(g / top) / math.log(g_max / top))
+            isp = 4 * int(c.isp_fill_base * (night_isp / c.isp_fill_base) ** u / 4 + 1e-9)
+        return int(round(exp)), c.analog_max_x, max(c.isp_fill_base, isp) / 1024.0
 
     # --- seeding -----------------------------------------------------------
     def seed(self, poll):
@@ -754,7 +798,9 @@ class SharedAE:
         if not self.last:
             return None
         exp = int(self.last["exp_us"])
-        analog = int(round(self.last["analog_x"] * 1024))
+        # round UP: the daemon floors a code to the rung below, so a rung sent
+        # as round() (1097 for 1097.15) came back one whole rung lower
+        analog = int(math.ceil(self.last["analog_x"] * 1024 - 1e-6))
         boost = int(round(max(1.0, self.last["boost_x"]) * 1024))
         # pin ALL four stages: any stage left in AUTO keeps floating per camera
         # (sensor DGain went 1.0x..3.4x across the pod at the same -a/-e)
@@ -774,7 +820,9 @@ class SharedAE:
             self._wb_target = None
             self.wb_unconfirmed = []
         elif (self.wb_base and hasattr(self.pod, "wb_all")
-                and (abs(ws - self._applied_wb_scale) > 0.01 or self._wb_force)):
+                and (self.wb_ints(ws) != self.wb_ints(self._applied_wb_scale) or self._wb_force)):
+            # Push as soon as the sent integers change. The old test (scale moved
+            # > 0.01) was absolute, i.e. 0.07 stop per step at s = 0.2.
             # CONFIRM EVERY CAMERA. The scale used to be marked applied the moment
             # the broadcast returned, without reading the per-camera replies, so a
             # camera that timed out kept an older attenuation for good and nothing
