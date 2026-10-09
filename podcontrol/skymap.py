@@ -538,6 +538,19 @@ def draw_bodies(img, pod, grid, t):
               (x + 10, y - 8), 0.4, col)
 
 
+def caption(t, spread, n_used, n_total, covered, now=None):
+    """The map's caption: frame time and age, the frames' spread when they are
+    not one instant, cameras used, sky covered."""
+    if t:
+        now = time.time() if now is None else now
+        when = "%s UTC (%ds old)" % (time.strftime("%H:%M:%S", time.gmtime(t)), max(0, int(now - t)))
+    else:
+        when = "no frame time"
+    return "%s%s  %d/%d cameras%s" % (
+        when, ("  frames span %ds" % int(round(spread))) if (spread or 0) > frames.SET_SLOT_S * 1.5 else "",
+        n_used, n_total, ("  sky covered %.0f%%" % (100 * covered)) if covered is not None else "")
+
+
 class SkyRenderer:
     """The pod on one grid, with three cache levels so a cycle in which
     nothing changed costs almost nothing:
@@ -792,16 +805,14 @@ class SkyRenderer:
         x, y = lut.centre_xy
         return min(max(x - 22, 4), self.grid.w - 120), y + 4
 
-    def decorate(self, out, t=None, used=None, telem=None, drive=None, spread=0.0, covered=None,
-                 bodies=True, title=True, labels=True):
-        """Dynamic decorations, drawn in place (on top of the tints, so they
-        stay legible): each camera's id, exposure / total gain and driving
-        badge at its field centre, sun/moon markers, the caption.
-
-        `labels` is the text half of the FOV overlay and goes with `outlines`;
-        the caption stays either way, so the frame time is always readable."""
+    def label_items(self, used=None, telem=None, drive=None):
+        """[(text, (x, y), bgr, scale)]: each camera's id, exposure / total gain
+        and driving badge at its field centre, in map px, (x, y) the left end of
+        the baseline. decorate() draws them into the map; the GUI draws them on
+        its canvas instead, at screen resolution."""
         used = used if used is not None else self._used
-        for i, st in enumerate(self.pod if labels else []):
+        out = []
+        for i, st in enumerate(self.pod):
             lut = self.luts.get(st.id)
             if lut is None:
                 continue
@@ -809,38 +820,48 @@ class SkyRenderer:
             if st.id not in used:
                 col = tuple(int(v * 0.4) for v in col)
             x, y = self._label_xy(lut)
-            _text(out, st.id, (x, y), 0.42, col, 1)
+            out.append((st.id, (x, y), col, 0.42))
             tel = (telem or {}).get(st.id)
             if tel is not None:
                 if tel.get("online"):
                     gain = ((tel.get("again_x") or 1.0) * (tel.get("dgain_x") or 1.0)
                             * (tel.get("ispdgain_x") or 1.0))
-                    _text(out, "%sus  x%.2f" % (tel.get("exp_us", "?"), gain), (x, y + 14), 0.36, TEXT_COLOUR, 1)
+                    out.append(("%sus  x%.2f" % (tel.get("exp_us", "?"), gain), (x, y + 14), TEXT_COLOUR, 0.36))
                 else:
-                    _text(out, "no daemon", (x, y + 14), 0.36, DIM_COLOUR, 1)
+                    out.append(("no daemon", (x, y + 14), DIM_COLOUR, 0.36))
             d = (drive or {}).get(st.id)
             if d and d[0]:
-                _text(out, "<< DRIVING: %s" % (d[1] or ""), (x, y + 28), 0.36,
-                      DRIVE_COLOURS.get(d[1], (214, 90, 255)), 1)
+                out.append(("<< DRIVING: %s" % (d[1] or ""), (x, y + 28),
+                            DRIVE_COLOURS.get(d[1], (214, 90, 255)), 0.36))
+        return out
+
+    def decorate(self, out, t=None, used=None, telem=None, drive=None, spread=0.0, covered=None,
+                 bodies=True, title=True, labels=True):
+        """Dynamic decorations, drawn in place (on top of the tints, so they
+        stay legible): the camera labels (label_items), sun/moon markers, the
+        caption.
+
+        `labels` is the text half of the FOV overlay and goes with `outlines`;
+        the caption stays either way, so the frame time is always readable."""
+        used = used if used is not None else self._used
+        for s, xy, col, scale in (self.label_items(used, telem, drive) if labels else []):
+            _text(out, s, xy, scale, col, 1)
         if bodies:
             draw_bodies(out, self.pod, self.grid, t)
         if title:
-            if t:
-                when = "%s UTC (%ds old)" % (time.strftime("%H:%M:%S", time.gmtime(t)), max(0, int(time.time() - t)))
-            else:
-                when = "no frame time"
-            _text(out, "%s%s  %d/%d cameras%s" % (
-                when, ("  frames span %ds" % int(round(spread))) if (spread or 0) > frames.SET_SLOT_S * 1.5 else "",
-                len(used), len(self.pod),
-                ("  sky covered %.0f%%" % (100 * covered)) if covered is not None else ""),
-                  (6, self.grid.h - 8), 0.45)
+            _text(out, caption(t, spread, len(used), len(self.pod), covered), (6, self.grid.h - 8), 0.45)
 
     def render(self, imgs=None, paths=None, t=None, spread=0.0, telem=None, drive=None, layers=None,
-               show_grid=True, outlines=True, vig_coeff=None, **kw):
+               show_grid=True, outlines=True, vig_coeff=None, text=True, **kw):
         """Full render: (bgr, info). imgs/paths default to the newest complete
         set; layers (see tinted) are optional. `outlines` draws the camera
         footprints and pairs with `labels` (passed through to decorate): both
-        are the FOV overlay and are normally switched together."""
+        are the FOV overlay and are normally switched together.
+
+        text=False draws neither the camera labels nor the caption: the GUI
+        puts them on its canvas (crisp at any window size, the age ticking).
+        info then carries them as "labels" (label_items, [] when labels=False)
+        and "n_total", which with t / spread / used / covered make caption()."""
         with self._lock:
             if imgs is None:
                 imgs, paths, t, spread = pod_frames(self.pod, decode=False)
@@ -848,8 +869,12 @@ class SkyRenderer:
             base, used = self.compose(imgs, paths, show_grid, outlines, vig_coeff)
             out = (self.tinted(base, layers) if layers else base).copy()
             covered = self._weights(frozenset(used), vig_coeff)[2] if used else 0.0
+            info = {"t": t, "used": used, "spread": spread, "covered": covered, "n_total": len(self.pod)}
+            if not text:
+                info["labels"] = self.label_items(used, telem, drive) if kw.get("labels", True) else []
+                kw = dict(kw, labels=False, title=False)
             self.decorate(out, t, used, telem, drive, spread, covered, **kw)
-            return out, {"t": t, "used": used, "spread": spread, "covered": covered}
+            return out, info
 
 
 def render(pod, grid=None, imgs=None, t=None, feather_deg=2.5, mask_weight=0.02, **kw):

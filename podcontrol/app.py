@@ -604,6 +604,9 @@ class App(tk.Tk):
         self._sky_msg = None
         self._sky_img_id = None
         self._sky_photo = None
+        self._sky_meta = None               # the sky view's text (_render_sky -> _sky_text)
+        self._sky_cap_ids = ()
+        self.after(1000, self._tick_sky_caption)
         self._sky_job = None
         self._sky_wh = None                 # canvas size, for pre-scaling in the worker
         self._last_cycle = None
@@ -1269,9 +1272,10 @@ class App(tk.Tk):
             self._const_info = cinfo
             if cinfo.get("flat"):
                 vig_override = 0.0
-        bgr, _ = r.render(imgs, paths, t, spread, telem=poll, drive=drive, layers=layers,
-                          outlines=overlay_on, labels=overlay_on, bodies=overlay_on,
-                          vig_coeff=vig_override)
+        bgr, info = r.render(imgs, paths, t, spread, telem=poll, drive=drive, layers=layers,
+                             outlines=overlay_on, labels=overlay_on, bodies=overlay_on,
+                             vig_coeff=vig_override, text=False)
+        lines = []
         if self.const_exp.get() and getattr(self, "_const_info", None) and self._const_info.get("e_ref"):
             ks = self._const_info["k"]
             from podcontrol import decode as _decode
@@ -1284,13 +1288,14 @@ class App(tk.Tk):
                    ("   colour cal%s" % (" (not %s)" % " ".join(sid[-1] for sid in skip) if skip else ""))
                    if self._const_info.get("chroma") else "",
                    " ".join("%s %.2f" % (sid[-2], ks[sid]) for sid in sorted(ks)))
-            # above the renderer's own caption (time, cameras, coverage) at h - 8
-            from podcontrol.skymap import _text
-            _text(bgr, curves, (6, bgr.shape[0] - 44), 0.45)
-            _text(bgr, txt, (6, bgr.shape[0] - 26), 0.45)
+            lines = [curves, txt]                      # above the caption, on the canvas
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         wh = self._sky_wh                              # scale here, not in the Tk thread
-        return _fit_to(rgb, wh) if wh else rgb
+        # the text goes on the canvas (_fit_sky), not into the image: crisp at any
+        # window size, and the caption's age ticks every second (_tick_sky_caption)
+        meta = {"labels": info.get("labels") or [], "lines": lines, "src_w": bgr.shape[1],
+                "cap": (info["t"], info["spread"], len(info["used"]), info["n_total"], info["covered"])}
+        return {"rgb": _fit_to(rgb, wh) if wh else rgb, "meta": meta}
 
     def _sky_now(self):
         """On-demand render (the view was just switched): via the queue."""
@@ -1302,7 +1307,8 @@ class App(tk.Tk):
         self.q.put(("sky", sky))
 
     def _show_sky(self, sky):
-        """sky: an RGB array, None (nothing to show yet) or (message,)."""
+        """sky: {"rgb", "meta"} from _render_sky, None (nothing to show yet) or (message,)."""
+        self._sky_meta = None
         if isinstance(sky, tuple):
             self._sky_rgb, self._sky_msg = None, sky[0]
         elif sky is None:
@@ -1310,7 +1316,7 @@ class App(tk.Tk):
             self._sky_msg = ("no complete frame set yet" if self.sky_r.ready
                              else "building the sky map (first time: ~10 s)…")
         else:
-            self._sky_rgb, self._sky_msg = sky, None
+            self._sky_rgb, self._sky_meta, self._sky_msg = sky["rgb"], sky["meta"], None
         self._fit_sky()
 
     def _fit_sky(self):
@@ -1330,6 +1336,47 @@ class App(tk.Tk):
         else:
             c.delete("all")
             self._sky_img_id = c.create_image(x, y, anchor="nw", image=self._sky_photo)
+        self._sky_text(x, y, dw, dh)
+
+    def _sky_text(self, x, y, dw, dh):
+        """The sky view's text, on the canvas over the image at (x, y) size dw x dh:
+        camera labels at their field centres (map px scaled to the display), the
+        status lines and the caption at the bottom left. Each is drawn twice, black
+        one px down-right under the colour, for the halo the in-image text had."""
+        c = self.sky_canvas
+        c.delete("skytxt")
+        self._sky_cap_ids = ()
+        meta = self._sky_meta
+        if not meta:
+            return
+        sc = dw / float(meta["src_w"])
+        hexc = lambda bgr: "#%02x%02x%02x" % (bgr[2], bgr[1], bgr[0])
+
+        def put(px, py, s, fill, size):
+            f = (MONO, size)
+            a = c.create_text(px + 1, py + 1, text=s, fill="#000000", font=f, anchor="sw", tags="skytxt")
+            b = c.create_text(px, py, text=s, fill=fill, font=f, anchor="sw", tags="skytxt")
+            return a, b
+
+        for s, (lx, ly), col, scale in meta["labels"]:
+            put(x + lx * sc, y + ly * sc, s, hexc(col), 10 if scale >= 0.4 else 9)
+        by = y + dh - 6
+        self._sky_cap_ids = put(x + 6, by, skymap.caption(*meta["cap"]), "#ebebeb", 10)
+        for i, s in enumerate(reversed(meta["lines"])):
+            put(x + 6, by - 18 * (i + 1), s, "#ebebeb", 10)
+
+    def _tick_sky_caption(self):
+        """Once a second: refresh the caption's '(Ns old)' between renders."""
+        try:
+            meta = getattr(self, "_sky_meta", None)
+            ids = getattr(self, "_sky_cap_ids", ())
+            if meta and ids and self.view == "sky":
+                s = skymap.caption(*meta["cap"])
+                for i in ids:
+                    self.sky_canvas.itemconfig(i, text=s)
+        except Exception:
+            pass                                       # never worth stopping the tick
+        self.after(1000, self._tick_sky_caption)
 
     def _on_sky_resize(self, _e=None):
         c = self.sky_canvas
