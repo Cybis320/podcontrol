@@ -503,12 +503,15 @@ class SharedAE:
                 # Only the CLEAN sky decides whether we may brighten: saturation under a mask (the
                 # sun zone) is excluded like every other masked pixel.
                 rs = m.get("raw_sat", 0.0)
-                if rb > c.clip_limit:
-                    return min(li_f, 0.0) - min(c.max_step, max(0.05, rb * c.kp_clip)), "R/B gain clipping (WB rung)"
-                if li_f < -1e-6 or rs > c.clip_limit:
-                    # recovered (or only raw saturation left, which the rung cannot fix): hold
-                    return min(li_f, 0.0), "at target (WB rung)" if li_f < -1e-6 else "raw-saturated at the floor"
-            if rs > c.wb_rung_raw_sat_max:
+                if rs > c.clip_limit and rb <= c.clip_limit:
+                    # only raw saturation left, which the rung cannot fix: hold
+                    return min(li_f, 0.0), "raw-saturated (WB rung)" if li_f < -1e-6 else "raw-saturated at the floor"
+                # Otherwise the shared checks below (R/B clipping, hysteresis) and
+                # then the normal law. This branch used to hold on the rung
+                # UNCONDITIONALLY: on 2026-10-10 a storm took the pod to lum ~68 /
+                # peak ~175 and three cameras sat dimmed 0.8-0.94 stop on the rung
+                # for over an hour, never climbing off it.
+            elif rs > c.wb_rung_raw_sat_max:
                 # raw-saturated zones would go magenta under attenuation: stay
                 # (or go back) to s = 1 where they clip to white
                 return max(0.0, li_f), ("raw-saturated: leaving WB rung" if li_f < -1e-6
