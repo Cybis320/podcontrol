@@ -25,11 +25,16 @@ camera drive every 5 s and the pod chased up and down. Instead:
   * the pod SLEWS toward the target by at most `slew` stops per cycle (5 s,
     the RMS frame cadence): the default 0.05 stop is a 3.5% brightness change
     per frame, invisible in a 30 fps timelapse of 5 s frames;
-  * two exceptions run at `slew_fast` (1 stop/cycle): the STARTUP phase after
-    a takeover (until the pod first reaches its target) and a GROSS error --
-    a frame more than `clip_gross` clipped may move the target up to
-    `max_step_gross` stops at once, since a white frame only says "far too
-    bright" and 16 stops at 0.5 per ~50 s set took 30 min (2026-09-16).
+  * coming DOWN off clipping is fast but still smooth: no trend brake, and
+    the move runs between cycles (tick()) as `ramp_step` stops every
+    `ramp_tick_s` -- clipped highlights are lost for good, a dark frame can
+    be lifted afterwards. A GROSS error (a frame more than `clip_gross`
+    clipped) may move the target up to `max_step_gross` stops at once, since
+    a white frame only says "far too bright" (16 stops at 0.5 per ~50 s set
+    took 30 min on 2026-09-16), and the ramp carries it out;
+  * the STARTUP phase after a takeover runs at `slew_fast` (1 stop/cycle)
+    until the pod first reaches its target -- unless the takeover resumed a
+    recent setting from the history log, which needs no startup.
 
 Cross-platform: the ladder is in stops; the secondary gain stage is the ISP
 digital gain (-i) on BOTH platforms. The sensor digital gain (-d) is left at
@@ -95,12 +100,26 @@ class AEConfig:
                                 # this can only ever make the pod MORE responsive, never less.
     clip_emergency = 0.01       # clipped fraction above which an against-trend
                                 # reduction runs at the full slew (extended blow-out)
+    # Highlight protection is FAST, in small steps. A clipped pixel is lost for good, a frame
+    # a stop too dark can still be lifted afterwards; yet on 2026-10-10 a dark spell left the
+    # pod 3.7 stops up, it came back down "against the trend" at 0.015 stop/cycle and C, D
+    # and F sat blown for 15-30 min. A CLIPPING-driven descent therefore ignores the trend
+    # brake and runs between cycles (tick()) in steps of at most ramp_step every
+    # ramp_tick_s: each the size of an ordinary slew step, invisible in the 25 fps video,
+    # where the gross-error path used to jump up to slew_fast (0.4-0.75 stop pops) at once.
+    ramp_step = 0.05            # stops per apply while ramping down off clipping
+    ramp_tick_s = 1.0           # seconds between ramp applies (3 stop/min at 0.05)
+    resume_max_s = 900.0        # takeover: resume the last AE setting from the history log
+                                # when it is at most this old (a restart), corrected for the
+                                # sun's move meanwhile, instead of seeding from the cameras --
+                                # which hold RMS's own auto exposure by then (20:42 that day:
+                                # a reseed 1-3.8 stops off, then minutes of fast slewing)
     # Fast regime (2026-09-16: the pod was handed the night line at 09:00
     # local; at 0.05 stop/cycle and 0.5 stop per frame set the shared AE
     # needed 30 min to bring the 16 stops back, every frame white meanwhile).
     slew_fast = 1.0             # max stops per cycle while STARTING UP (after a takeover,
-                                # until the pod first reaches its target) or correcting a
-                                # GROSS error; the smooth `slew` applies otherwise
+                                # until the pod first reaches its target); a GROSS clipping
+                                # error is ramped (ramp_step) like any other clipping
     clip_gross = 0.10           # clipped fraction above which a frame is a gross error: it
                                 # may move the target max_step .. max_step_gross at once
                                 # (0.5 stop at 10 % clipped, 3 stops at 100 %)
@@ -229,6 +248,8 @@ class SharedAE:
         self.driver_why = None               # 'clipping' | 'headroom' | 'at target' | 'gross ...'
         self.startup = False                 # fast phase after a takeover (see step)
         self.fast = False                    # last step ran at slew_fast
+        self._clip_goal = None               # li a clipping ramp is heading for (tick())
+        self.resumed = False                 # the last takeover resumed from the history log
         self.driver_li_f = None              # light index the driver's frame was captured at
         self._sun_t = 0.0                    # epoch of the last sun update
         self.sun_rate = 0.0                  # deg/s, smoothed, for dead-reckoning the sun
@@ -310,13 +331,35 @@ class SharedAE:
         return int(round(exp)), c.analog_max_x, max(c.isp_fill_base, isp) / 1024.0
 
     # --- seeding -----------------------------------------------------------
-    def seed(self, poll):
+    def seed(self, poll, resume=None):
         """Start the ladder at the DARKEST current setting among the online
         cameras (poll = PodController.poll_all()). The camera whose own AE
         chose the least light sees the brightest scene, so starting there
         cannot blow anything out; the loop then brightens gently if allowed.
-        Returns the seeded light index, or None if nothing usable."""
+
+        resume = {"li", "t", "sun_alt"}: our own last setting from the history
+        log. When it is recent (resume_max_s) it wins over the cameras, which a
+        restart has handed to RMS's auto in between: the pod goes straight back
+        to where it was, moved by what the sun did meanwhile, and skips the
+        fast startup phase. Returns the seeded light index, or None if nothing
+        usable."""
         c = self.cfg
+        self._clip_goal = None
+        self.resumed = False
+        r = resume or {}
+        if r.get("li") is not None and r.get("t") and 0 <= time.time() - r["t"] <= c.resume_max_s:
+            li = float(r["li"])
+            if r.get("sun_alt") is not None and self.sun_alt is not None:
+                li += skybright.li_delta(r["sun_alt"], self.sun_alt)
+            self.li = self.target = max(self._min_li(), min(li, self._max_li()))
+            self._ff_alt = None
+            self.last = {}
+            self.startup = False                 # already where the frames last said
+            self.resumed = True
+            self.t_seed = time.time()
+            self.hist = [(self.t_seed, self.li)]
+            self._applied_li = None
+            return self.li
         lis = []
         for d in poll.values():
             if not d.get("online") or not d.get("exp_us"):
@@ -367,10 +410,11 @@ class SharedAE:
                 li = l
         return li if li is not None else (self.hist[0][1] if self.hist else self.li)
 
-    def takeover(self, poll):
+    def takeover(self, poll, resume=None):
         """Seed the ladder AND remember how to hand every camera back. At
         night (sun below the RMS switch) we latch immediately and touch
-        nothing: RMS's night line is in place and is exactly our top rung."""
+        nothing: RMS's night line is in place and is exactly our top rung.
+        resume: see seed(), or resume(sid) -> that, called with None here."""
         self.restore = self.pod.snapshot(poll) if hasattr(self.pod, "snapshot") else None
         # wb_base must be the UNATTENUATED white balance, because everything the
         # rung does is relative to it. Reading it from the cameras breaks on any
@@ -401,7 +445,9 @@ class SharedAE:
                     self.wb_base = (float(g[0]), float(g[1]), float(g[-1]))
                     break
         self._applied_wb_scale = 1.0
-        li = self.seed(poll)
+        if callable(resume):
+            resume = resume(None)                # the pod's own (individual AE asks per camera)
+        li = self.seed(poll, resume=resume)
         if self.sun_alt is not None and self.sun_alt < self.cfg.night_switch_deg:
             self.li = self.target = self._max_li()
             self.latched = True
@@ -678,11 +724,15 @@ class SharedAE:
                 self.startup = False         # a frame taken at THIS setting says: at target
             elif self.t_seed and time.time() - self.t_seed > c.startup_max_s:
                 self.startup = False
-        fast = gross
+        # coming down off CLIPPING (gross or not): the ramp, never the trend
+        # brake and, after startup, never a jump. "clipping" names every
+        # clip-driven need: clipping, gross clipping, R/B gain clipping.
+        clip_down = err < 0 and not self.startup and "clipping" in (self.driver_why or "")
+        fast = gross and not clip_down
         self.fast = fast
         rate = c.slew_fast if fast else c.slew
         against = braked = False
-        if not fast and self.sun_rising is not None and abs(err) > 1e-3:
+        if not fast and not clip_down and self.sun_rising is not None and abs(err) > 1e-3:
             # diurnal trend: sun rising -> the pod should need LESS light over
             # time; sun setting -> MORE. A move the other way is suspect.
             trend_up = not self.sun_rising
@@ -700,7 +750,13 @@ class SharedAE:
             if against and not (err < 0 and pod_clip > clip_escape):
                 rate = c.slew_against
                 braked = True
-        d = max(-rate, min(rate, err))
+        if clip_down:
+            # the first ramp step now, the rest by tick() between cycles
+            d = max(-c.ramp_step, err)
+            self._clip_goal = max(self._min_li(), target)
+        else:
+            d = max(-rate, min(rate, err))
+            self._clip_goal = None
         if abs(err) < 1e-3:
             d = 0.0
         # label the move by whether it was actually SLOWED, not merely by its
@@ -714,6 +770,8 @@ class SharedAE:
             reason = "reached night line -> latched"
         elif ramp is not None and ramp > self.target and d > 0:
             reason = "dusk ramp to night line \u2191"
+        elif d and clip_down:
+            reason = "slew\u2193 (clipping ramp)"
         elif d and fast:
             reason = ("slew\u2191" if d > 0 else "slew\u2193") + " (fast: %s)" % (
                 "startup" if self.startup else "gross error")
@@ -742,6 +800,34 @@ class SharedAE:
                      "wb_unconfirmed": list(self.wb_unconfirmed),
                      "changed": abs(self.li - prev) > 1e-6 or self._applied_li is None or just_latched}
         return self.last
+
+    def ramp_tick(self):
+        """Between cycles: carry a clipping ramp on by one ramp_step, at most
+        once per ramp_tick_s since the last apply. True when the light index
+        moved and the caller should apply()."""
+        c = self.cfg
+        goal = self._clip_goal
+        if goal is None or self.latched or not self.last or self._applied_li is None:
+            return False
+        if self.li <= goal + 1e-6:
+            self._clip_goal = None
+            return False
+        if time.time() - self.t_apply < c.ramp_tick_s - 0.05:
+            return False
+        self.li = max(goal, self.li - c.ramp_step, self._min_li())
+        exp, analog, boost = self._li_to_exp_gain(self.li)
+        self.last = dict(self.last, li=self.li, to_go=self.target - self.li, exp_us=exp,
+                         analog_x=analog, boost_x=boost, total_gain_x=analog * boost,
+                         wb_scale=self.wb_scale_for(self.li), changed=True)
+        return True
+
+    def tick(self, platform="imx291", timeout=5.0):
+        """The app's between-cycle hook (~every ramp_tick_s): one ramp step,
+        applied. True when something was pushed."""
+        if self.ramp_tick():
+            self.apply(platform=platform, timeout=timeout)
+            return True
+        return False
 
     def note_cameras(self, poll):
         """Call with each fresh poll, before step(). Notices RMS taking the pod
@@ -955,10 +1041,13 @@ def run(pod, meter_fn, cfg=None, on_tick=None, stop=lambda: False):
                 memtrim.trim()          # same reason as the GUI loop; ~1.3 ms
             except Exception:
                 pass
-            for _ in range(int(cfg.period_s * 10)):
+            n_tick = max(1, int(round(cfg.ramp_tick_s * 10)))
+            for i in range(int(cfg.period_s * 10)):
                 if stop():
                     break
                 time.sleep(0.1)
+                if (i + 1) % n_tick == 0:
+                    ae.tick(platform=_pod_platform(poll))   # a clipping ramp's next step
     finally:
         ae.release()
     return ae

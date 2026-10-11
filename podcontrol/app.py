@@ -33,7 +33,7 @@ from podcontrol import frames as F
 from podcontrol.frames import (frame_for, fresh_frame, luma_stats, mask_for, highlight_maps,
                                highlight_maps_cached, stats_for_path)
 from podcontrol.sharedae import SharedAE, _pod_platform, configure_from_pod, feed_sun
-from podcontrol.history import HistoryLog, make_record, draw_history
+from podcontrol.history import HistoryLog, make_record, draw_history, resume_point
 from podcontrol import settings as SETTINGS
 from podcontrol import version as VERSION
 from podcontrol import vignette as VIGNETTE
@@ -777,10 +777,10 @@ class App(tk.Tk):
              "0.05 stop is about 3.5% brightness per frame, invisible in a timelapse.\n"
              "Moves against the diurnal trend run slower still, to ride out passing clouds.")
         pair(g, "fast", self.slew_fast, 0.1, 4.0, 0.1, 4, "%.1f", tip=
-             "Maximum stops per cycle in the FAST regime, which applies only to a gross error:\n"
-             "a frame more than 10% clipped, or a dark seed just after takeover. Mild errors\n"
-             "keep the smooth slew. This is what recovers 16 stops in minutes instead of half\n"
-             "an hour when a camera is handed the night line in daylight.",
+             "Maximum stops per cycle in the FAST regime, which applies only to the startup\n"
+             "after a takeover (skipped when the AE resumes a recent setting from its log).\n"
+             "Coming down off clipping, gross or not, never jumps: it ramps in 0.05-stop steps\n"
+             "about once a second, ignoring the slow against-trend limit.",
              unit="stop/cycle", unit_pad=8)
         pair(g, "clip ≤", self.clip_pct, 0.0, 5.0, 0.01, 6, "%.3f", tip=
              "Clipped fraction the AE aims to stay under. Above it the pod asks for less light.\n"
@@ -1131,10 +1131,19 @@ class App(tk.Tk):
             # (424 MB against 315 measured over twelve cycles). ~1.3 ms, and it
             # touches nothing live, so it runs every cycle.
             MEMTRIM.trim()
-            for _ in range(int(self.interval.get() * 10)):
+            # between cycles: a clipping ramp's next small step (SharedAE.tick), so
+            # coming down off blown highlights is fast without a visible jump
+            n_tick = max(1, int(round(self.ae.cfg.ramp_tick_s * 10)))
+            for i in range(int(self.interval.get() * 10)):
                 if not self.running:
                     return
                 time.sleep(0.1)
+                last_poll = getattr(self, "_last_poll", None)
+                if (i + 1) % n_tick == 0 and self.ae_on and self.ae.t_seed and last_poll:
+                    try:
+                        self.ae.tick(platform=_pod_platform(last_poll))
+                    except Exception:
+                        pass
 
     def _drain(self):
         try:
@@ -2004,7 +2013,9 @@ class App(tk.Tk):
                 pass
             new = self._make_ae(want)
             feed_sun(new, self.pod)
-            new.takeover(self.pod.poll_all(timeout=4))
+            # carry on from the old controller's last setting, not RMS's auto in between
+            recs = list(self.history.records)
+            new.takeover(self.pod.poll_all(timeout=4), resume=lambda sid: resume_point(recs, sid))
             self.ae, self.ae_info = new, None
         threading.Thread(target=_swap, daemon=True).start()
 
@@ -2024,7 +2035,11 @@ class App(tk.Tk):
             self.ae_info = None
             def _take():
                 feed_sun(self.ae, self.pod)
-                self.ae.takeover(self.pod.poll_all(timeout=4))
+                # resume where the AE left off when the log says it drove recently (a
+                # restart): the cameras hold RMS's own auto exposure by now, not ours
+                recs = list(self.history.records)
+                self.ae.takeover(self.pod.poll_all(timeout=4),
+                                 resume=lambda sid: resume_point(recs, sid))
             threading.Thread(target=_take, daemon=True).start()
         else:
             threading.Thread(target=lambda: self.ae.release(), daemon=True).start()

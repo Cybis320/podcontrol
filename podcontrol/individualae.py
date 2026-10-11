@@ -127,9 +127,10 @@ class IndividualAE(object):
         for s in self.subs.values():
             s.update_sun(alt_deg, rising)
 
-    def takeover(self, poll):
+    def takeover(self, poll, resume=None):
+        # resume(sid): each camera resumes its OWN last setting from the history log
         for sid, s in self._each():
-            s.takeover(self._only(poll, sid))
+            s.takeover(self._only(poll, sid), resume=(resume(sid) if callable(resume) else resume))
 
     def release(self, timeout=5.0):
         out = {}
@@ -148,6 +149,10 @@ class IndividualAE(object):
 
     def apply(self, platform="imx291", timeout=5.0):
         return {sid: s.apply(platform=platform, timeout=timeout) for sid, s in self._each()}
+
+    def tick(self, platform="imx291", timeout=5.0):
+        # every camera's own clipping ramp (SharedAE.tick); only the moving ones are pushed
+        return any([s.tick(platform=platform, timeout=timeout) for s in self.subs.values()])
 
     def step(self, metering):
         infos = {sid: s.step(self._only(metering, sid)) for sid, s in self._each()}

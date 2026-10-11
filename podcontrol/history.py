@@ -88,6 +88,33 @@ class HistoryLog:
                 pass
 
 
+def resume_point(records, sid=None):
+    """The AE's last own setting in the log, for resuming after a restart:
+    {"li", "t", "sun_alt"} from the newest record the AE drove, or None. With
+    sid, that camera's own controller (individual AE) or the pod's (shared);
+    without, the pod's -- the darkest camera when the log is individual
+    (highlight priority). None when that record was at night: a takeover
+    there latches, and the night line is no place to resume a dawn from."""
+    for r in reversed(records):
+        if not r.get("ae_on") or "li" not in r:
+            continue                       # AE off, or on but not seeded yet
+        if r.get("state") == "night":
+            return None
+        cams = r.get("cams") or {}
+        if r.get("mode") == "individual":
+            if sid is not None:
+                li = (cams.get(sid) or {}).get("ae_li")
+            else:
+                lis = [c.get("ae_li") for c in cams.values() if c.get("ae_li") is not None]
+                li = min(lis) if lis else None
+        else:
+            li = r.get("li")
+        if li is None:
+            return None
+        return {"li": float(li), "t": r.get("t"), "sun_alt": r.get("sun_alt")}
+    return None
+
+
 def make_record(poll, info, metering, sun, ae_on, max_li=None, slot=None):
     """Build one history record from the app's per-cycle data."""
     cams = {}
