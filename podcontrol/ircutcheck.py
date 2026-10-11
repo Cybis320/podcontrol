@@ -215,24 +215,26 @@ def apply_swaps(stations, res):
 
 
 def format_table(res):
-    """One line per camera: the measured day and night R/G, then night/day per cycle."""
-    fmt = "%-8s %-15s %-5s %-4s %-12s %-7s %-9s %-13s %-13s %s"
+    """One line per camera: the measured day and night R/G and the night/day change (cycle means)."""
+    fmt = "%-8s %-15s %-5s %-4s %-12s %-7s %-9s %-10s %-12s %s"
     lines = [fmt % ("camera", "ip", "last", "swap", "verdict", "R/G day", "R/G night",
                     "R/G change", "green change", "notes")]
     for sid in sorted(res):
         c = res[sid]
         mean = lambda pos: [r["rg"] for r in c.get("rows", []) if r["pos"] == pos and r["rg"] is not None]
         avg = lambda xs: "%.3f" % (sum(xs) / len(xs)) if xs else "-"
-        f = lambda xs: " ".join("x%.2f" % x for x in xs) or "-"
+        f = lambda xs: "x%.2f" % (sum(xs) / len(xs)) if xs else "-"
         extra = "; ".join([x for x in [c.get("reason"), recommendation(c)] + c.get("notes", []) if x])
         lines.append(fmt % (
             sid, c.get("ip", ""), c.get("last") or "?", "-" if c.get("swap") is None else c["swap"],
             c.get("verdict"), avg(mean("day")), avg(mean("night")),
             f(c.get("rg_ratio", [])), f(c.get("g_ratio", [])), extra))
+    n = max([len(c.get("rg_ratio", [])) for c in res.values()] or [0])
     lines.append("")
     lines.append("R/G = pre-white-balance red/green. The night pulse lifts the filter, so near-infrared "
-                 "reaches the red pixels and R/G must RISE: change = night / day, one per cycle; "
-                 "correct = above x%.2f in every cycle, REVERSED = below x%.2f." % (1 + RG_STEP, 1 / (1 + RG_STEP)))
+                 "reaches the red pixels and R/G must RISE. change = night / day, mean of %d day/night cycles; "
+                 "correct = above x%.2f in every cycle, REVERSED = below x%.2f, cycles that disagree = "
+                 "inconclusive." % (n, 1 + RG_STEP, 1 / (1 + RG_STEP)))
     return "\n".join(lines)
 
 if __name__ == "__main__":
