@@ -479,6 +479,7 @@ class App(tk.Tk):
         self.ae_slot = None
         self.selected = None      # station id with an active region selection
         self.calibrating = False
+        self.ae_hold = False      # True while a measurement needs the exposure left alone (IR-cut check)
         self.q = queue.Queue()
         saved = SETTINGS.load()
         def sv(key, default):
@@ -720,6 +721,12 @@ class App(tk.Tk):
             "proposes the lowest gain that loses no sensitivity -- the darkest sky's need.\n"
             "Shows the table; nothing is saved until you click Apply, which sets the cameras\n"
             "and RMS's night line in the settings JSON. Switch AE off first.", padx=(0, 6))
+        self.ircut_btn = btn(g, "Check IR-cut", self.check_ircut,
+            "Measures which way each camera's IR-cut filter really moves: pulses day/night\n"
+            "twice (~15 s, AE held) and reads the camera's own pre-white-balance colour stats --\n"
+            "filter OUT passes near-infrared, so R/G rises. Ends at each camera's last commanded\n"
+            "position, saves nothing; a REVERSED camera can then have its own ircut_swap flag\n"
+            "flipped (on the camera, not in the settings JSON). Best in daylight.", padx=(0, 6))
         btn(g, "History", self.toggle_history,
             "Open the 12-hour chart: exposure and total gain per camera, pod luma against the\n"
             "clipping ceiling, and the clipped fraction, with night and latched shading.")
@@ -1027,7 +1034,7 @@ class App(tk.Tk):
                         lay["clip"], lay["hot"] = (highlight_maps_cached(path, img, keep, lumas[sid]["peak"])
                                                    if path else highlight_maps(img, keep, lumas[sid]["peak"]))
                 layers[sid] = lay
-            if self.ae_on and self.ae.t_seed:
+            if self.ae_on and self.ae.t_seed and not self.ae_hold:
                 # meter the pod on the newest COMPLETE frame set (one capture
                 # instant for all cameras), not six frames of different ages
                 if self.camera_meter.get():
@@ -2014,6 +2021,84 @@ class App(tk.Tk):
                 ui(fail)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def check_ircut(self):
+        """IR-cut polarity check (podcontrol.ircutcheck): measure, show the table, flip a reversed
+        camera's ircut_swap only on the operator's click. The shared AE is held meanwhile so the
+        exposure stays put (the R/G verdict does not need it; the green witness does)."""
+        from tkinter import messagebox
+        if self.calibrating:
+            messagebox.showinfo("IR-cut check", "A calibration or check is already running.", parent=self)
+            return
+        if not messagebox.askokcancel(
+                "IR-cut check",
+                "Moves every camera's IR-cut filter 5 times over ~15 s (RMS records it) and puts it\n"
+                "back where it was. AE is held meanwhile. Best in daylight: at night the sky has\n"
+                "little near-infrared and the result may be 'no movement'.\n\nRun it now?", parent=self):
+            return
+        self.calibrating = True
+        self.ae_hold = True
+        self.ircut_btn.config(text="IR-cut: checking…", state="disabled")
+        ui = lambda f: self.after(0, f)
+
+        def worker():
+            from podcontrol import ircutcheck
+            res, err = None, None
+            try:
+                done = []
+                def on_done(c):
+                    done.append(c)
+                    t = "IR-cut: %d/%d…" % (len(done), len(self.stations))
+                    ui(lambda: self.ircut_btn.config(text=t))
+                res = ircutcheck.check_pod(self.stations, on_done=on_done)
+            except Exception as e:
+                err = str(e)
+            finally:
+                self.ae_hold = False
+                self.calibrating = False
+                ui(lambda: self.ircut_btn.config(text="Check IR-cut", state="normal"))
+            if res is not None:
+                ui(lambda: self._ircut_dialog(res))
+            else:
+                ui(lambda: messagebox.showerror("IR-cut check", "Check failed:\n\n%s" % err, parent=self))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ircut_dialog(self, res):
+        from tkinter import messagebox
+        from podcontrol import ircutcheck
+        w = tk.Toplevel(self); w.title("Pod Control — IR-cut polarity"); w.configure(bg=BG)
+        rev = [s for s in self.stations if (res.get(s.id) or {}).get("verdict") == "REVERSED"
+               and (res.get(s.id) or {}).get("swap") is not None]
+        head = ("%d camera(s) REVERSED: flipping their ircut_swap fixes them on the camera itself."
+                % len(rev) if rev else "No camera to fix.")
+        tk.Label(w, text=head, bg=BG, fg="#f0a830" if rev else "#c8bfa8", anchor="w",
+                 justify="left").pack(fill="x", padx=8, pady=(8, 2))
+        txt = tk.Text(w, width=140, height=4 + len(res), font=("Courier", 9))
+        txt.insert("1.0", ircutcheck.format_table(res)); txt.config(state="disabled")
+        txt.pack(fill="both", expand=True, padx=8, pady=4)
+        row = tk.Frame(w, bg=BG); row.pack(fill="x", padx=8, pady=(2, 8))
+
+        def do_apply():
+            ab.config(state="disabled"); cb.config(state="disabled")
+            def work():
+                self.ae_hold = True
+                try:
+                    notes = ircutcheck.apply_swaps(rev, res)
+                    again = ircutcheck.check_pod(rev)          # prove it: measure the flipped cameras again
+                    msg = "\n".join(notes) + "\n\nRe-check:\n" + ircutcheck.format_table(again)
+                    self.after(0, lambda: (messagebox.showinfo("IR-cut check", msg, parent=w), w.destroy()))
+                except Exception as e:
+                    self.after(0, lambda: (messagebox.showerror("IR-cut check", "Apply failed:\n\n%s" % e, parent=w),
+                                           w.destroy()))
+                finally:
+                    self.ae_hold = False
+            threading.Thread(target=work, daemon=True).start()
+
+        ab = tk.Button(row, text=("Flip ircut_swap on %d reversed camera(s) and re-check" % len(rev))
+                       if rev else "Nothing to apply", command=do_apply, state="normal" if rev else "disabled")
+        ab.pack(side="left")
+        cb = tk.Button(row, text="Close", command=w.destroy); cb.pack(side="left", padx=6)
 
     def _night_cal_dialog(self, res):
         from tkinter import messagebox
