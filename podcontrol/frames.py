@@ -410,6 +410,37 @@ SET_MIN_CAMS = 3           # cameras needed before a slot counts as a set
 _STATS_CACHE = {}          # path -> luma stats (frames are immutable once written)
 
 
+_META_CACHE = {}         # path -> dict; frames are immutable once written
+META_CACHE_MAX = 24      # 6 cameras x a few cycles
+
+
+def frame_meta(path):
+    """The RMSP provenance record RMS embeds in a saved frame, or {}.
+
+    Carries what only the camera knows: the frame's actual coded QP, its start
+    QP, SoC temperature, colour temperature and the exact gains. The QP in
+    particular cannot be had any other way -- the daemon's `venc_qp` reports the
+    rate-control CONFIGURATION (MaxQp 51, the H.264 maximum, identical on every
+    camera and never changing), not what the encoder chose.
+
+    ~0.2 ms uncached, and a frame's record never changes, so it is cached by
+    path with the same bound as the image cache."""
+    if not path:
+        return {}
+    hit = _META_CACHE.get(path)
+    if hit is not None:
+        return hit
+    try:
+        from RMS.FrameMetadata import readImageMeta
+        m = readImageMeta(path) or {}
+    except Exception:
+        m = {}
+    if len(_META_CACHE) >= META_CACHE_MAX:
+        _META_CACHE.pop(next(iter(_META_CACHE)), None)
+    _META_CACHE[path] = m
+    return m
+
+
 def recent_rms_frames(station, max_age=SET_MAX_AGE_S):
     """[(capture_epoch, path)] newest first, within max_age, for this station."""
     now = time.time()

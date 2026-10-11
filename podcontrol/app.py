@@ -268,7 +268,7 @@ class Tile(tk.Frame):
 
     # --- rendering -----------------------------------------------------------
     def render(self, img, source, tel, luma, layers=None, overlay=True, drive=None, sig=None,
-               ae=None, mbps=None):
+               ae=None, mbps=None, meta=None):
         """drive: None, or (is_driver, why, need_stops) for the shared AE.
         ae: this camera's own controller state (individual AE) or the pod's
         (shared), for the WB rung scale -- which the poll cannot report, since
@@ -277,7 +277,7 @@ class Tile(tk.Frame):
         sig: a hashable signature of the image content + overlay settings; when
         it matches the last render (and the canvas size did not change) the
         image is left alone and only the text is refreshed."""
-        self._last = (img, source, tel, luma, layers, overlay, drive, None, ae, mbps)
+        self._last = (img, source, tel, luma, layers, overlay, drive, None, ae, mbps, meta)
         is_driver, why, need = drive if drive else (False, None, None)
         same = (sig is not None and sig == getattr(self, "_sig", None)
                 and img is not None and self._img_id is not None
@@ -375,8 +375,17 @@ class Tile(tk.Frame):
             ws = (ae or {}).get("wb_scale")
             if ws is not None:
                 line3 += "\u00d7%.2f " % ws
-        if qp and qp.get("maxqp") is not None:
-            line3 += "qp %s " % qp["maxqp"]
+        # The frame's ACTUAL coded QP, from the camera's own SEI via RMS. The
+        # daemon's venc_qp reports rate-control CONFIGURATION instead: MaxQp 51
+        # is the H.264 maximum, identical on every camera and never changing, so
+        # printing it looked like a live reading and was not one. Falls back to
+        # the configured bounds only while a camera's frames carry no QP, which
+        # is the case until its RMS capture restarts on a version that saves it.
+        live_qp = (meta or {}).get("qp")
+        if live_qp is not None:
+            line3 += "qp %d " % live_qp
+        elif qp and qp.get("maxqp") is not None:
+            line3 += "qp cap %s-%s " % (qp.get("minqp"), qp.get("maxqp"))
         sa, cm = tel.get("satu"), tel.get("ccm")
         if sa and sa.get("value") is not None:
             line3 += "satu x%.2f " % (sa["value"] / 128.0)
@@ -407,7 +416,8 @@ class Tile(tk.Frame):
             tel.get("platform", "?"), int(bright) if bright is not None else "-",
             (" clip%.2f%%" % (clip * 100)) if clip else "", masked,
             tel.get("exp_us"), gains, tel.get("iso"),
-            (("%dC" % tel["chiptemp"]) if tel.get("chiptemp") else (tel.get("optype") or "")) + net,
+            ((tel.get("optype") or "") + (("  %.0fC" % _t) if (_t := (meta or {}).get("temp_c",
+                tel.get("chiptemp"))) is not None else "")) + net,
             line3.rstrip(), line4))
 
 
@@ -1206,9 +1216,10 @@ class App(tk.Tk):
             ae_i = per.get(sid) if per else info
             ws = (ae_i or {}).get("wb_scale")
             mbps = self.bw_rates.get(sid)
+            meta = F.frame_meta(path)            # cached per path; ~0.2 ms on a new frame
             t.render(img, src, poll.get(sid), lumas.get(sid),
                      layers.get(sid), ov[0], drive, sig=(path, ov, drive, ws), ae=ae_i,
-                     mbps=mbps)
+                     mbps=mbps, meta=meta)
 
     # ---- sky view ------------------------------------------------------------
     def _render_sky(self, poll, cyc_frames=None, cyc_layers=None):
