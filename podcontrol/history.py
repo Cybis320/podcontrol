@@ -69,15 +69,23 @@ class HistoryLog:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         except OSError:
             pass
-        # keep the file from growing forever: rewrite it when it holds > 2x the window
-        try:
-            if os.path.getsize(self.path) > 2.5 * 1024 * 1024 and len(self.records) > 100:
+        # Keep the file from growing forever by rewriting it once it holds about
+        # twice the window. Counted in RECORDS, not bytes: the old rule fired on
+        # a fixed 2.5 MB, which silently assumed a record size. Widening the
+        # record with the clip breakdown pushed a full 12 h window past that
+        # threshold, so every append would have rewritten the entire file --
+        # megabytes of I/O every few seconds, for ever. A count is immune to how
+        # wide a record happens to be.
+        self._since_rewrite = getattr(self, "_since_rewrite", 0) + 1
+        if self._since_rewrite > max(100, len(self.records)):
+            try:
                 with open(self.path + ".tmp", "w") as f:
                     for r in self.records:
                         f.write(json.dumps(r, separators=(",", ":")) + "\n")
                 os.replace(self.path + ".tmp", self.path)
-        except OSError:
-            pass
+                self._since_rewrite = 0
+            except OSError:
+                pass
 
 
 def make_record(poll, info, metering, sun, ae_on, max_li=None, slot=None):
@@ -91,9 +99,25 @@ def make_record(poll, info, metering, sun, ae_on, max_li=None, slot=None):
     lums = [m["mean"] for m in (metering or {}).values() if m]
     peaks = [m.get("peak") for m in (metering or {}).values() if m and m.get("peak") is not None]
     clips = [m["clip"] for m in (metering or {}).values() if m]
+    # The clip BREAKDOWN, per camera and pod-wide. Only the total used to be
+    # logged, which is not enough to diagnose an episode afterwards: whether the
+    # WB rung was the right tool turns entirely on WHICH kind of clipping it was.
+    # The rung attenuates the WB gains, so it recovers rb_only (red/blue driven
+    # over by those gains) and can do nothing about raw green saturation. On
+    # 2026-10-12 the pod clipped at sunset and by the time it was sampled the
+    # peak had passed, so the question could not be answered at all.
+    def _mx(key):
+        v = [m.get(key) for m in (metering or {}).values() if m and m.get(key) is not None]
+        return max(v) if v else None
+    for sid, m in (metering or {}).items():
+        if sid in cams and m:
+            cams[sid].update({"clip": m.get("clip"), "rb": m.get("rb_only"),
+                              "rsat": max(m.get("raw_sat") or 0.0, m.get("raw_sat_all") or 0.0),
+                              "peak": m.get("peak"), "src": m.get("src")})
     rec = {"t": time.time(), "ae_on": bool(ae_on), "cams": cams,
            "lum": max(lums) if lums else None, "peak": max(peaks) if peaks else None,
            "clip": max(clips) if clips else None, "slot": slot,
+           "rb": _mx("rb_only"), "rsat": max(_mx("raw_sat") or 0.0, _mx("raw_sat_all") or 0.0),
            "sun_alt": sun[0] if sun else None, "max_li": max_li}
     if info:
         # individual AE: each camera's own controller state next to its exposure, so the
