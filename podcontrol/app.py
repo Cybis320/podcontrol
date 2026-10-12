@@ -617,7 +617,7 @@ class App(tk.Tk):
         # invisible and cost four hours of blind AE on 2026-10-03.
         self.bw = NETBW.Meter(self.stations)
         self.bw_rates, self.bw_total = {}, None
-        self.sky_r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE, radial=self._sky_proj_live),
+        self.sky_r = skymap.SkyRenderer(self.sky_stations, skymap.SkyGrid(SKY_SIZE, radial=self._sky_proj_live),
                                         vig_coeff=(VIGNETTE.clamp(self.vig_coeff.get())
                                                    if self.vig_on.get() else 0.0))
         self._sky_rgb = None
@@ -1275,7 +1275,7 @@ class App(tk.Tk):
         if not r.ensure():
             return ("no platepar found: the sky view needs the stations' RMS platepars",)
         overlay_on = self.overlay.get()
-        imgs, paths, t, spread = skymap.pod_frames(self.stations, decode=False)
+        imgs, paths, t, spread = skymap.pod_frames(self.sky_stations, decode=False)
         if not paths:
             return None
         layers = None
@@ -1455,7 +1455,7 @@ class App(tk.Tk):
                 if want == self._sky_proj_live:
                     return
                 old = self.sky_r
-                r = skymap.SkyRenderer(self.stations, skymap.SkyGrid(SKY_SIZE, radial=want),
+                r = skymap.SkyRenderer(self.sky_stations, skymap.SkyGrid(SKY_SIZE, radial=want),
                                        old.feather_deg, old.mask_weight, vig_coeff=old.vig_coeff)
                 r.ensure()
                 r.set_vig_coeff(old.vig_coeff)         # a flat-field change during the build
@@ -1498,7 +1498,9 @@ class App(tk.Tk):
 
         def work():
             try:
-                sets = F.recent_sets(self.stations, want=12)
+                # driven only: this solves ONE model across overlapping fields,
+                # so a camera at a different exposure poisons the fit
+                sets = F.recent_sets(self.sky_stations, want=12)
                 if len(sets) < 3:
                     raise RuntimeError("only %d usable frame sets; needs a few minutes of"
                                        " frames from every camera" % len(sets))
@@ -1553,7 +1555,9 @@ class App(tk.Tk):
         def work():
             try:
                 from podcontrol import radiance
-                sets = F.recent_sets(self.stations, want=12)
+                # driven only: this solves ONE model across overlapping fields,
+                # so a camera at a different exposure poisons the fit
+                sets = F.recent_sets(self.sky_stations, want=12)
                 if len(sets) < 3:
                     raise RuntimeError("only %d usable frame sets; needs a few minutes of"
                                        " frames from every camera" % len(sets))
@@ -1632,6 +1636,35 @@ class App(tk.Tk):
         finally:
             self._wb_sync = False
 
+    @property
+    def sky_stations(self):
+        """The stations the sky view composites, which is the DRIVEN set.
+
+        The composite blends in a straight weighted mean because the pod shares
+        one exposure; that is why it is left photometrically uncorrected, so a
+        camera that drifts shows as a seam. A station podcontrol does not drive
+        runs RMS's own AE and will not match -- measured 2026-10-12, two
+        undriven test cameras sat at gain 21.7 and 22.4 against the pod's 15.85,
+        all three stacked within a degree of the zenith. Blending those in does
+        not merely look wrong, it destroys the one diagnostic the view exists
+        for, because a seam stops meaning anything."""
+        return [s for s in self.stations if s.id in self.driven_ids]
+
+    def _rebuild_sky(self):
+        """Pool thread: swap in a renderer for the current driven set."""
+        try:
+            old = self.sky_r
+            r = skymap.SkyRenderer(self.sky_stations,
+                                   skymap.SkyGrid(SKY_SIZE, radial=self._sky_proj_live),
+                                   old.feather_deg, old.mask_weight, vig_coeff=old.vig_coeff)
+            r.ensure()
+            r.set_vig_coeff(old.vig_coeff)
+            self.sky_r = r
+            if self.view == "sky":
+                self._sky_now()
+        except Exception as e:
+            print("sky rebuild failed: %s" % e)
+
     def _apply_driven(self):
         """Push the operator's station selection into the controller.
 
@@ -1656,8 +1689,10 @@ class App(tk.Tk):
             finally:
                 self.pod._driven_ids = keep
         self.driven_ids = ids
-        if self.pod.set_driven(ids) and hasattr(self.ae, "sync_subs"):
-            self.ae.sync_subs()
+        if self.pod.set_driven(ids):
+            if hasattr(self.ae, "sync_subs"):
+                self.ae.sync_subs()
+            self._pool.submit(self._rebuild_sky)      # the composite follows too
         self._note_colour("driving %d of %d stations" % (len(ids), len(self.stations)))
 
     def _colour_quiet(self):
