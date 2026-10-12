@@ -83,6 +83,16 @@ class AEConfig:
                                 # such moves are cloud transients more often than not,
                                 # so they are taken slowly; a persistent change still
                                 # gets there in minutes (a soft "high-water mark")
+    clip_escape_x = 20          # multiple of clip_limit above which an against-trend move
+                                # runs at FULL rate. The absolute clip_emergency below was
+                                # 200x clip_limit, so a frame could sit at 96x the limit --
+                                # 0.48% of pixels, ~10k on a 1080p frame -- and still crawl
+                                # at slew_against because 0.48% is not 1%. Seen live on
+                                # 2026-10-12: peak 252 against a 234 ceiling, correcting at
+                                # 0.015 stops/cycle while the target moved under it. Scaling
+                                # to the limit keeps the two in step when the operator
+                                # changes clip_limit, and the min() with clip_emergency means
+                                # this can only ever make the pod MORE responsive, never less.
     clip_emergency = 0.01       # clipped fraction above which an against-trend
                                 # reduction runs at the full slew (extended blow-out)
     # Fast regime (2026-09-16: the pod was handed the night line at 09:00
@@ -671,7 +681,7 @@ class SharedAE:
         fast = gross
         self.fast = fast
         rate = c.slew_fast if fast else c.slew
-        against = False
+        against = braked = False
         if not fast and self.sun_rising is not None and abs(err) > 1e-3:
             # diurnal trend: sun rising -> the pod should need LESS light over
             # time; sun setting -> MORE. A move the other way is suspect.
@@ -683,12 +693,20 @@ class SharedAE:
             leaving_rung = self.li < 0 and err > 0 and (self.driver_why or "").startswith("raw-saturated")
             if leaving_rung:
                 against = False
-            if against and not (err < 0 and pod_clip > c.clip_emergency):
+            # the diurnal brake exists to ignore cloud transients, not to sit
+            # through burning highlights: darkening because pixels are clipping
+            # gets the full rate well before the old 1% emergency bar
+            clip_escape = min(c.clip_emergency, c.clip_escape_x * c.clip_limit)
+            if against and not (err < 0 and pod_clip > clip_escape):
                 rate = c.slew_against
+                braked = True
         d = max(-rate, min(rate, err))
         if abs(err) < 1e-3:
             d = 0.0
-        self._against = against and d != 0.0
+        # label the move by whether it was actually SLOWED, not merely by its
+        # direction: a clip escape runs against the trend at full rate, and
+        # calling that "slow" in the log and the tile is simply untrue
+        self._against = braked and d != 0.0
         self.li = max(self._min_li(), min(self.li + d, self._max_li()))
         just_latched = self._maybe_latch()
         exp, analog, boost = self._li_to_exp_gain(self.li)
