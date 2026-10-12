@@ -463,8 +463,17 @@ class App(tk.Tk):
         except Exception:
             pass
         self.stations = get_pod()
+        # Which stations podcontrol DRIVES. It discovers everything in the
+        # Stations directory, which is right for display but not for control: a
+        # test unit on the network was taken over simply for being there. An
+        # absent setting means all of them, so an existing install is unchanged.
+        _saved_all = SETTINGS.load()
+        _dr = _saved_all.get("driven")
+        _known = {s.id for s in self.stations}
+        self.driven_ids = (_known if not isinstance(_dr, list)
+                           else {x for x in _dr if x in _known} or _known)
         self.by_id = {s.id: s for s in self.stations}
-        self.pod = PodController(self.stations)
+        self.pod = PodController(self.stations, driven=self.driven_ids)
         # each camera's real code<->light curve (podcontrol.decode), fetched in the
         # background and refreshed every 30 min (a reflash or gamma change shows up)
         from podcontrol import decode as _decode
@@ -874,6 +883,29 @@ class App(tk.Tk):
                                                       self.view == "sky" and self._pool.submit(self._sky_now)))
         self._chroma_label()
 
+        g = group(row2, "drive",
+                  "Which stations podcontrol CONTROLS. It discovers every station in the RMS\n"
+                  "Stations directory, which is what you want for the preview but not for\n"
+                  "control: a test camera on the network gets taken over simply for being\n"
+                  "there.\n\n"
+                  "An unchecked station is still polled and still drawn -- you keep its tile and\n"
+                  "its telemetry -- but receives no exposure, white-balance or colour command,\n"
+                  "and is left out of the metering so its scene cannot drag the pod. Unchecking\n"
+                  "one hands it straight back with RMS's line for the current mode.")
+        # Label by what DISTINGUISHES the stations, not by the last two
+        # characters the rest of the UI uses: US05A1 and UST001 shorten to "A1"
+        # and "01", and on this control an ambiguous label means unchecking the
+        # wrong camera. Dropping the common prefix gives 5A1 / T001.
+        _ids = [st.id for st in self.stations]
+        _pre = os.path.commonprefix(_ids) if len(_ids) > 1 else ""
+        self.drive_vars = {}
+        for _st in self.stations:
+            _v = tk.BooleanVar(value=_st.id in self.driven_ids)
+            self.drive_vars[_st.id] = _v
+            check(g, (_st.id[len(_pre):] or _st.id[-2:]), _v,
+                  tip="Drive %s (%s)" % (_st.id, _st.ip), padx=(0, 4))
+            _v.trace_add("write", lambda *_a: (self._apply_driven(), self._schedule_save()))
+
         g = group(row2, "policy")
         check(g, "sun cam votes", self.sun_votes, tip=
               "Checked: a camera with the sun in its field votes on the pod exposure like any\n"
@@ -1054,7 +1086,10 @@ class App(tk.Tk):
                 else:
                     met, slot = F.meter_set(self.stations, allow_grab=self.allow_grab,
                                             wb_scale_fn=self.ae.wb_scale_at)
-                ctl = {sid: m for sid, m in met.items() if poll.get(sid, {}).get("online")}
+                # an undriven camera must not vote either: in shared AE its scene
+                # would drag the pod, and in individual AE it has no controller
+                ctl = {sid: m for sid, m in met.items()
+                       if poll.get(sid, {}).get("online") and sid in self.driven_ids}
                 self.ae_slot = slot
                 # RMS's dawn `auto` ends our control silently: give up the latch
                 # before stepping, or we hold the night ceiling while the
@@ -1597,6 +1632,34 @@ class App(tk.Tk):
         finally:
             self._wb_sync = False
 
+    def _apply_driven(self):
+        """Push the operator's station selection into the controller.
+
+        Stations being dropped are handed back first, with RMS's line for the
+        current mode, exactly as closing the app would. Leaving them pinned at
+        whatever podcontrol last set is the one outcome nobody wants: the point
+        of excluding a camera is to stop owning it."""
+        ids = {sid for sid, v in self.drive_vars.items() if v.get()}
+        if not ids:                       # refuse to drive nothing at all
+            self._note_colour("at least one station must stay driven")
+            for sid in self.driven_ids:
+                self.drive_vars[sid].set(True)
+            return
+        dropped = self.driven_ids - ids
+        if dropped and self.ae_on:
+            keep = self.pod._driven_ids
+            try:
+                self.pod.set_driven(dropped)          # hand back ONLY these
+                self.ae.release()
+            except Exception as e:
+                print("handing back %s failed: %s" % (",".join(sorted(dropped)), e))
+            finally:
+                self.pod._driven_ids = keep
+        self.driven_ids = ids
+        if self.pod.set_driven(ids) and hasattr(self.ae, "sync_subs"):
+            self.ae.sync_subs()
+        self._note_colour("driving %d of %d stations" % (len(ids), len(self.stations)))
+
     def _colour_quiet(self):
         """True when RMS owns colour and podcontrol must not touch it: from
         COLOUR_QUIET_MARGIN_DEG above its night switch, through the night, until
@@ -1738,6 +1801,7 @@ class App(tk.Tk):
              "satu": int(self.satu.get()), "ccm_mode": self.ccm_mode.get(),
              "vignette_on": bool(self.vig_on.get()), "vignette_coeff": float(self.vig_coeff.get()),
              "vignette_coeff_linear": float(self.vig_coeff_lin.get()),
+             "driven": sorted(self.driven_ids),
              "chroma_on": bool(self.chroma_on.get()),
              "chroma_gains": {k: [round(v[0], 5), round(v[1], 5)] for k, v in self.chroma_gains.items()},
              "colour_hold": bool(self.colour_hold.get()),

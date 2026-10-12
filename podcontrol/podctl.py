@@ -219,9 +219,38 @@ def poll(ip, timeout=5.0, full=True):
 
 
 class PodController:
-    def __init__(self, stations):
+    """The pod's cameras, split into the ones we KNOW and the ones we DRIVE.
+
+    `stations` is everything discovered, and is what gets polled: a camera we do
+    not drive is still worth showing and reading. `driven` is the subset that
+    receives commands, and every write path goes through it. The two differ
+    whenever the operator has stations on the network that podcontrol should
+    look at but not touch -- a test unit, a camera being serviced -- which
+    otherwise got taken over simply for existing in the Stations directory."""
+
+    def __init__(self, stations, driven=None):
         self.stations = list(stations)
+        self._driven_ids = None if driven is None else set(driven)
         self._pool = ThreadPoolExecutor(max_workers=max(4, 2 * len(self.stations)))
+
+    @property
+    def driven(self):
+        """The stations commands may be sent to (all of them by default)."""
+        if self._driven_ids is None:
+            return self.stations
+        return [s for s in self.stations if s.id in self._driven_ids]
+
+    def set_driven(self, ids):
+        """ids = None drives everything; a collection restricts it. Returns True
+        if the set changed, so a caller can rebuild what depends on it."""
+        new = None if ids is None else set(ids)
+        if new == self._driven_ids:
+            return False
+        self._driven_ids = new
+        return True
+
+    def drives(self, sid):
+        return self._driven_ids is None or sid in self._driven_ids
 
     def __init_cache(self):
         if not hasattr(self, "_enc_cache"):
@@ -242,13 +271,13 @@ class PodController:
         return out
 
     def _bcast(self, cmd, timeout=5.0):
-        futs = {s.id: self._pool.submit(send, s.ip, cmd, timeout) for s in self.stations}
+        futs = {s.id: self._pool.submit(send, s.ip, cmd, timeout) for s in self.driven}
         return {sid: f.result() for sid, f in futs.items()}
 
     def _bcast_live(self, cmd, timeout=5.0):
         """_bcast for state podcontrol owns only while it runs (see send_live):
         applied now, never written to the cameras' flash."""
-        futs = {s.id: self._pool.submit(send_live, s.ip, cmd, timeout) for s in self.stations}
+        futs = {s.id: self._pool.submit(send_live, s.ip, cmd, timeout) for s in self.driven}
         return {sid: f.result() for sid, f in futs.items()}
 
     def manual_all(self, again=None, dgain=None, ispdgain=None, exp_us=None, timeout=5.0):
@@ -323,7 +352,7 @@ class PodController:
         sun, every frame white, and the restarted shared AE needed 30 min to
         slew the 16 stops back down."""
         out = {}
-        for s in self.stations:
+        for s in self.driven:          # only restore what we actually took
             t = poll.get(s.id) or {}
             if t.get("online"):
                 out[s.id] = dict(t)
@@ -335,7 +364,7 @@ class PodController:
         line, else a DGain-safe auto. A snapshot entry may also be a ready
         command string (older callers)."""
         futs = {}
-        for s in self.stations:
+        for s in self.driven:          # hand back only what we drove
             tel = (snap or {}).get(s.id)
             if isinstance(tel, str):
                 cmd = tel
@@ -389,7 +418,7 @@ class PodController:
         def one(s):
             chn = venc_chn(s.ip, timeout)
             return send(s.ip, fmt.format(chn=chn), timeout) if chn is not None else None
-        futs = {s.id: self._pool.submit(one, s) for s in self.stations}
+        futs = {s.id: self._pool.submit(one, s) for s in self.driven}
         return {sid: f.result() for sid, f in futs.items()}
 
     def venc_qp_all(self, maxqp, minqp, timeout=5.0):
@@ -407,11 +436,18 @@ class PodController:
         return self._bcast_venc(cmd, timeout)
 
     def one_live(self, station_id, cmd, timeout=5.0):
-        """one() for state podcontrol owns only while it runs: never persisted."""
+        """one() for state podcontrol owns only while it runs: never persisted.
+
+        A write, so it refuses a station we are not driving: the per-camera WB
+        retry reaches for this by id and must not quietly touch a camera the
+        operator has excluded."""
+        if not self.drives(station_id):
+            return None
         st = next((s for s in self.stations if s.id == station_id), None)
         return send_live(st.ip, cmd, timeout) if st else None
 
     def one(self, station_id, cmd, timeout=5.0):
+        """Any station, driven or not: callers use this for READS (wb_read)."""
         st = next((s for s in self.stations if s.id == station_id), None)
         return send(st.ip, cmd, timeout) if st else None
 

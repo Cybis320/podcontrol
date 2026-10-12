@@ -24,8 +24,25 @@ class IndividualAE(object):
     def __init__(self, pod, cfg=None):
         self.pod = pod
         self.cfg = cfg or AEConfig()
-        self.subs = {st.id: SharedAE(PodController([st]), cfg=self.cfg) for st in pod.stations}
+        # one controller per DRIVEN camera: an excluded station gets none, so it
+        # is never metered into a decision and never sent a command
+        self.subs = {st.id: SharedAE(PodController([st]), cfg=self.cfg) for st in pod.driven}
         self.last = {}
+
+    def sync_subs(self):
+        """Match the per-camera controllers to the pod's driven set.
+
+        Called when the operator changes which stations podcontrol drives. A
+        newly driven camera gets a fresh controller and is taken over on the
+        next cycle; an excluded one has its controller dropped, so nothing
+        meters it and nothing addresses it again."""
+        want = {st.id: st for st in self.pod.driven}
+        for sid in [s for s in self.subs if s not in want]:
+            del self.subs[sid]
+        for sid, st in want.items():
+            if sid not in self.subs:
+                self.subs[sid] = SharedAE(PodController([st]), cfg=self.cfg)
+        return set(self.subs)
 
     # ---- helpers
     def _each(self):
