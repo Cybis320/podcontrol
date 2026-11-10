@@ -10,6 +10,7 @@ Shared by every CC RMS utility; this folder is an identical copy in each repo
 | rms_update_cron | cc-rms-update-cron | `~/source/CC_Utils/rms_update_cron` | cc-utils (hourly) |
 | Pod Control | podcontrol | `~/source/CC_Utils/podcontrol` | cc-utils (hourly) |
 | RMS window layout | RMS-WindowLayout | `~/source/CC_Utils/window_layout` | cc-utils (hourly) |
+| Station setup | cc-rms-station-setup | `~/source/CC_Utils/station_setup` | cc-utils (hourly) |
 | MQTT monitor | cc-rms-mqtt-monitor | `~/source/CC_Utils/MQTT_monitor` | its own root timer (15 min) |
 | Chrony Monitor | chrony_monitor | `~/source/CC_Utils/chrony_monitor` (+ root-owned `/opt/chrony_monitor`) | its own root timer (daily) |
 
